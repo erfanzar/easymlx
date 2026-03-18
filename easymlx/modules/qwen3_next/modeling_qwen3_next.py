@@ -316,11 +316,29 @@ class Qwen3NextFullAttention(nn.Module):
         return self.o_proj(attn.reshape(*lead, -1))
 
 
-class Qwen3NextLinearAttention(nn.Module):
-    """Linear attention module for Qwen3-Next.
+def _l2norm(x: mx.array, axis: int = -1, eps: float = 1e-6) -> mx.array:
+    """L2-normalize along an axis."""
+    return x * mx.rsqrt(mx.sum(x * x, axis=axis, keepdims=True) + eps)
 
-    Uses a multi-head linear attention mechanism with separate key/value head
-    counts, an optional 1-D convolution, and gated RMSNorm on the output.
+
+def _shift_conv_state_left(conv_state: mx.array, new_value: mx.array) -> mx.array:
+    """Shift conv rolling buffer left, append new token at the right."""
+    return mx.concatenate([conv_state[:, :, 1:], new_value[:, :, None]], axis=-1)
+
+
+def _manual_depthwise_conv(conv_state: mx.array, kernel: mx.array) -> mx.array:
+    """Single-step depthwise conv from cached state: sum(state * kernel, axis=-1) then silu."""
+    return nn.silu(mx.sum(conv_state.astype(mx.float32) * kernel[None, :, :].astype(mx.float32), axis=-1))
+
+
+class Qwen3NextLinearAttention(nn.Module):
+    """Linear attention module using the Gated Delta Rule (GDR).
+
+    Instead of softmax attention, this module uses a recurrent linear
+    attention mechanism with:
+    - Causal depthwise 1-D convolution for local context
+    - Gated delta rule recurrence for global context
+    - Learnable decay (A_log) and time bias (dt_bias)
 
     Attributes:
         config: Qwen3-Next configuration.
@@ -331,14 +349,6 @@ class Qwen3NextLinearAttention(nn.Module):
         key_dim: Total key dimensionality.
         value_dim: Total value dimensionality.
         conv_dim: Dimensionality for the convolution input.
-        in_proj_qkvz: Fused projection for Q, K, V, and Z (gate).
-        in_proj_ba: Projection for beta and alpha parameters.
-        out_proj: Output projection.
-        norm: Gated RMSNorm applied to the output.
-        conv1d: Optional depthwise 1-D convolution.
-        A_log: Learnable log-space parameter for state dynamics.
-        dt_bias: Bias parameter for delta-time computation.
-        attention_performer: Attention computation backend.
     """
 
     def __init__(self, config: Qwen3NextConfig):
@@ -355,12 +365,17 @@ class Qwen3NextLinearAttention(nn.Module):
         self.head_v_dim = int(config.linear_value_head_dim)
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
-        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv_dim = self.key_dim * 2 + self.num_k_heads * self.head_v_dim
+        self.d_conv = int(getattr(config, "linear_conv_kernel_dim", 4))
+        self.expand_ratio = self.num_v_heads // self.num_k_heads
 
-        qkvz_dim = self.key_dim * 2 + self.value_dim * 2
-        self.in_proj_qkvz = nn.Linear(config.hidden_size, qkvz_dim, bias=False)
-        self.in_proj_ba = nn.Linear(config.hidden_size, self.num_v_heads * 2, bias=False)
-        self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
+        self.conv_value_dim = self.num_k_heads * self.head_v_dim
+        qkv_dim = self.key_dim * 2 + self.conv_value_dim
+        self.in_proj_qkv = nn.Linear(config.hidden_size, qkv_dim, bias=False)
+        self.in_proj_z = nn.Linear(config.hidden_size, self.conv_value_dim, bias=False)
+        self.in_proj_b = nn.Linear(config.hidden_size, self.num_k_heads, bias=False)
+        self.in_proj_a = nn.Linear(config.hidden_size, self.num_k_heads, bias=False)
+        self.out_proj = nn.Linear(self.conv_value_dim, config.hidden_size, bias=False)
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
 
         conv_cls = getattr(nn, "Conv1d", None)
@@ -369,54 +384,106 @@ class Qwen3NextLinearAttention(nn.Module):
             self.conv1d = conv_cls(
                 self.conv_dim,
                 self.conv_dim,
-                kernel_size=config.linear_conv_kernel_dim,
+                kernel_size=self.d_conv,
                 groups=self.conv_dim,
                 bias=False,
             )
 
-        self.A_log = mx.zeros((self.num_v_heads,))
-        self.dt_bias = mx.ones((self.num_v_heads,))
+        self.A_log = mx.zeros((self.num_k_heads,))
+        self.dt_bias = mx.ones((self.num_k_heads,))
 
-        self.attention_performer = AttentionPerformer(scale=self.head_k_dim**-0.5)
+        self._conv_state: mx.array | None = None
+        self._recurrent_state: mx.array | None = None
 
-    def fix_query_key_value_ordering(self, mixed_qkvz: mx.array, mixed_ba: mx.array):
-        """Reorder interleaved QKVZ projections into separate tensors.
-
-        Splits the fused projection output into query, key, value, and gate
-        (Z) tensors, along with beta and alpha routing parameters.
-
-        Args:
-            mixed_qkvz: Fused QKVZ tensor of shape ``(..., qkvz_dim)``.
-            mixed_ba: Fused beta/alpha tensor of shape ``(..., num_v_heads * 2)``.
-
-        Returns:
-            A tuple of ``(query, key, value, z, beta, alpha)`` tensors.
-        """
-        lead = mixed_qkvz.shape[:-1]
-        expand_ratio = self.num_v_heads // self.num_k_heads
-        per_head_dim = 2 * self.head_k_dim + 2 * self.head_v_dim * expand_ratio
-        mixed_qkvz = mixed_qkvz.reshape(*lead, self.num_k_heads, per_head_dim)
-
-        split_sizes = [
-            self.head_k_dim,
-            self.head_k_dim,
-            expand_ratio * self.head_v_dim,
-            expand_ratio * self.head_v_dim,
-        ]
-        query, key, value, z = mx.split(
-            mixed_qkvz,
-            [split_sizes[0], split_sizes[0] + split_sizes[1], split_sizes[0] + split_sizes[1] + split_sizes[2]],
-            axis=-1,
+    def reset_state(self, batch_size: int = 1):
+        """Reset conv and recurrent states for a new generation."""
+        self._conv_state = mx.zeros((batch_size, self.conv_dim, self.d_conv))
+        self._recurrent_state = mx.zeros(
+            (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
         )
 
-        value = value.reshape(*lead, self.num_v_heads, self.head_v_dim)
-        z = z.reshape(*lead, self.num_v_heads, self.head_v_dim)
+    def _gdr_recurrent_step(
+        self,
+        query: mx.array,
+        key: mx.array,
+        value: mx.array,
+        beta: mx.array,
+        decay: mx.array,
+        recurrent_state: mx.array,
+    ) -> tuple[mx.array, mx.array]:
+        """Single-step GDR decode: O(1) per token.
 
-        mixed_ba = mixed_ba.reshape(*lead, self.num_k_heads, 2 * expand_ratio)
-        beta, alpha = mx.split(mixed_ba, [expand_ratio], axis=-1)
-        beta = beta.reshape(*lead, self.num_v_heads)
-        alpha = alpha.reshape(*lead, self.num_v_heads)
-        return query, key, value, z, beta, alpha
+        Args:
+            query: (batch, num_v_heads, head_k_dim)
+            key: (batch, num_v_heads, head_k_dim)
+            value: (batch, num_v_heads, head_v_dim)
+            beta: (batch, num_v_heads)
+            decay: (batch, num_v_heads)
+            recurrent_state: (batch, num_v_heads, head_k_dim, head_v_dim)
+
+        Returns:
+            output: (batch, 1, num_v_heads, head_v_dim)
+            new_state: (batch, num_v_heads, head_k_dim, head_v_dim)
+        """
+        state = recurrent_state.astype(mx.float32)
+        query = _l2norm(query.astype(mx.float32)) * (self.head_k_dim ** -0.5)
+        key = _l2norm(key.astype(mx.float32))
+        value = value.astype(mx.float32)
+        beta = beta.astype(mx.float32)
+        decay = decay.astype(mx.float32)
+
+        state = state * mx.exp(decay)[:, :, None, None]
+
+        kv_dot = mx.sum(state * key[:, :, :, None], axis=-2)
+        delta = (value - kv_dot) * beta[:, :, None]
+        state = state + key[:, :, :, None] * delta[:, :, None, :]
+
+        output = mx.sum(state * query[:, :, :, None], axis=-2)
+        return output[:, None, :, :].astype(self.out_proj.weight.dtype), state
+
+    def _gdr_chunked(
+        self,
+        query: mx.array,
+        key: mx.array,
+        value: mx.array,
+        beta: mx.array,
+        decay: mx.array,
+    ) -> mx.array:
+        """Chunked GDR for prefill: sequential scan over tokens.
+
+        Args:
+            query: (batch, seq_len, num_v_heads, head_k_dim)
+            key: (batch, seq_len, num_v_heads, head_k_dim)
+            value: (batch, seq_len, num_v_heads, head_v_dim)
+            beta: (batch, seq_len, num_v_heads)
+            decay: (batch, seq_len, num_v_heads)
+
+        Returns:
+            output: (batch, seq_len, num_v_heads, head_v_dim)
+        """
+        query = _l2norm(query) * (self.head_k_dim ** -0.5)
+        key = _l2norm(key)
+
+        batch_size, seq_len = query.shape[:2]
+        state = mx.zeros((batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim))
+        outputs = []
+
+        for t in range(seq_len):
+            q_t = query[:, t].astype(mx.float32)
+            k_t = key[:, t].astype(mx.float32)
+            v_t = value[:, t].astype(mx.float32)
+            b_t = beta[:, t].astype(mx.float32)
+            d_t = decay[:, t].astype(mx.float32)
+
+            state = state * mx.exp(d_t)[:, :, None, None]
+            kv_dot = mx.sum(state * k_t[:, :, :, None], axis=-2)
+            delta = (v_t - kv_dot) * b_t[:, :, None]
+            state = state + k_t[:, :, :, None] * delta[:, :, None, :]
+            o_t = mx.sum(state * q_t[:, :, :, None], axis=-2)
+            outputs.append(o_t)
+
+        self._recurrent_state = state
+        return mx.stack(outputs, axis=1).astype(self.out_proj.weight.dtype)
 
     def __call__(
         self,
@@ -426,13 +493,14 @@ class Qwen3NextLinearAttention(nn.Module):
         cache_view: CacheView | None = None,
         cache_metadata: PageMetadata | None = None,
     ) -> mx.array:
-        """Compute linear attention with gated normalization.
+        """Compute linear attention via Gated Delta Rule.
 
         Args:
-            hidden_states: Input tensor.
-            mask: Attention mask (also used to zero out padding tokens).
-            cache_view: Optional KV cache view.
-            cache_metadata: Optional paged-cache metadata.
+            hidden_states: Input tensor of shape ``(T, hidden)`` (paged) or
+                ``(batch, seq, hidden)``.
+            mask: Attention mask (used to zero padding tokens).
+            cache_view: Cache view (used for offset tracking only).
+            cache_metadata: Paged cache metadata.
 
         Returns:
             Output tensor of the same leading shape as ``hidden_states``.
@@ -444,35 +512,71 @@ class Qwen3NextLinearAttention(nn.Module):
                 token_mask = mask
             hidden_states = hidden_states * token_mask[:, :, None].astype(hidden_states.dtype)
 
-        lead = hidden_states.shape[:-1]
-        projected_qkvz = self.in_proj_qkvz(hidden_states)
-        projected_ba = self.in_proj_ba(hidden_states)
-        query, key, value, z, _beta, _alpha = self.fix_query_key_value_ordering(projected_qkvz, projected_ba)
+        is_paged = hidden_states.ndim == 2
+        if is_paged:
+            hidden_states = hidden_states[None]
 
-        query = query.reshape(*lead, self.num_k_heads, self.head_k_dim)
-        key = key.reshape(*lead, self.num_k_heads, self.head_k_dim)
-        value = value.reshape(*lead, self.num_v_heads, self.head_v_dim)
+        batch_size, seq_len, _ = hidden_states.shape
+        is_decode = seq_len == 1 and self._recurrent_state is not None
 
-        expand_ratio = self.num_v_heads // self.num_k_heads
-        if expand_ratio > 1:
-            query = mx.concatenate([query] * expand_ratio, axis=-2)
-            key = mx.concatenate([key] * expand_ratio, axis=-2)
+        qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
+        beta_raw = self.in_proj_b(hidden_states)
+        alpha_raw = self.in_proj_a(hidden_states)
 
-        attn = self.attention_performer(
-            query,
-            key,
-            value,
-            rope=None,
-            mask=mask,
-            cache_view=cache_view,
-            cache_metadata=cache_metadata,
-        )
+        conv_input = qkv
 
-        output = attn.reshape(-1, self.head_v_dim)
-        gate = z.reshape(-1, self.head_v_dim)
+        A = -mx.exp(self.A_log.astype(mx.float32))
+        alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
+        decay = A * nn.softplus(alpha_biased)
+        beta = mx.sigmoid(beta_raw)
+
+        if is_decode and self._conv_state is not None:
+            conv_x = conv_input[:, 0, :]
+            self._conv_state = _shift_conv_state_left(self._conv_state, conv_x)
+            kernel = self.conv1d.weight.squeeze(-1) if self.conv1d is not None else mx.ones((self.conv_dim, self.d_conv))
+            conv_out = _manual_depthwise_conv(self._conv_state, kernel)[:, None, :]
+        elif self.conv1d is not None:
+            padded = mx.pad(conv_input, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
+            conv_out = nn.silu(self.conv1d(padded))
+            if seq_len >= self.d_conv:
+                self._conv_state = conv_input[:, -self.d_conv:, :].transpose(0, 2, 1)
+            else:
+                self._conv_state = mx.zeros((batch_size, self.conv_dim, self.d_conv))
+                self._conv_state = mx.concatenate([
+                    self._conv_state[:, :, seq_len:],
+                    conv_input.transpose(0, 2, 1),
+                ], axis=-1)
+        else:
+            conv_out = conv_input
+
+        query = conv_out[:, :, :self.key_dim].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = conv_out[:, :, self.key_dim:self.key_dim * 2].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = conv_out[:, :, self.key_dim * 2:].reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
+
+        if is_decode and self._recurrent_state is not None:
+            output, self._recurrent_state = self._gdr_recurrent_step(
+                query[:, 0], key[:, 0], value[:, 0],
+                beta[:, 0], decay[:, 0],
+                self._recurrent_state,
+            )
+        else:
+            if self._recurrent_state is None:
+                self._recurrent_state = mx.zeros(
+                    (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
+                )
+            output = self._gdr_chunked(query, key, value, beta, decay)
+
+        output = output.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)
+        gate = z.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)
         output = self.norm(output, gate)
-        output = output.reshape(*lead, -1)
-        return self.out_proj(output)
+        output = output.reshape(batch_size, seq_len, -1)
+        output = self.out_proj(output)
+
+        if is_paged:
+            output = output[0]
+
+        return output
 
 
 class Qwen3NextMLP(nn.Module):
@@ -589,7 +693,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         if self.use_full_attention:
             self.self_attn = Qwen3NextFullAttention(config)
         else:
-            self.self_attn = Qwen3NextLinearAttention(config)
+            self.linear_attn = Qwen3NextLinearAttention(config)
 
         self.mlp = Qwen3NextSparseBlock(config) if self.use_moe else Qwen3NextMLP(config)
         self.input_layernorm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -616,7 +720,8 @@ class Qwen3NextDecoderLayer(nn.Module):
         """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = residual + self.self_attn(
+        attn = self.self_attn if self.use_full_attention else self.linear_attn
+        hidden_states = residual + attn(
             hidden_states,
             mask=mask,
             cache_view=cache_view,

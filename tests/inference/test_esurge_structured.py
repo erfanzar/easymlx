@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
 import mlx.core as mx
+import numpy as np
 from mlx.utils import tree_flatten
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel

@@ -117,13 +117,13 @@ class Qwen3VLVisionAttention(nn.Module):
         num_heads: Number of attention heads.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int, *, bias: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.scale = self.head_dim**-0.5
-        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=False)
-        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=bias)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=bias)
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         """Compute multi-head self-attention.
@@ -190,7 +190,11 @@ class Qwen3VLVisionBlock(nn.Module):
     def __init__(self, config: Qwen3VLVisionConfig):
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size)
-        self.attn = Qwen3VLVisionAttention(config.hidden_size, config.num_heads)
+        self.attn = Qwen3VLVisionAttention(
+            config.hidden_size,
+            config.num_heads,
+            bias=bool(getattr(config, "vision_attn_bias", False)),
+        )
         self.norm2 = nn.LayerNorm(config.hidden_size)
         self.mlp = Qwen3VLVisionMLP(config.hidden_size, config.intermediate_size, activation=config.hidden_act)
 

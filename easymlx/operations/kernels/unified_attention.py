@@ -55,6 +55,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 _DEFAULT_USE_METAL = _env_flag("EASYMLX_UNIFIED_ATTENTION_USE_METAL", True)
 _FORCE_REFERENCE = _env_flag("EASYMLX_UNIFIED_ATTENTION_FORCE_REFERENCE", False)
+_MAX_METAL_HEAD_DIM = 256
 
 
 @dataclass(slots=True)
@@ -122,12 +123,48 @@ def _validate_inputs(
         raise ValueError("key_cache/value_cache must be rank-4: [num_blocks, block_size, num_kv_heads, head_dim]")
     if key_cache.shape != value_cache.shape:
         raise ValueError("key_cache and value_cache must have the same shape")
+    if queries.shape[2] != key_cache.shape[3]:
+        raise ValueError("queries head_dim must match key/value cache head_dim")
+    if queries.shape[1] % key_cache.shape[2] != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads (GQA)")
     if block_tables.ndim != 2:
         raise ValueError("block_tables must be rank-2: [num_seqs, max_blocks_per_seq]")
     if kv_lens.ndim != 1 or query_start_loc.ndim != 1:
         raise ValueError("kv_lens/query_start_loc must be rank-1")
     if query_start_loc.shape[0] != block_tables.shape[0] + 1:
         raise ValueError("query_start_loc must have length num_seqs + 1")
+
+
+def _next_power_of_two(value: int) -> int:
+    """Return the next power of two greater than or equal to *value*."""
+    value = max(1, int(value))
+    return 1 << (value - 1).bit_length()
+
+
+def _floor_power_of_two(value: int) -> int:
+    """Return the greatest power of two less than or equal to *value*."""
+    value = max(1, int(value))
+    return 1 << (value.bit_length() - 1)
+
+
+def _resolve_threadgroup_size(head_dim: int, requested: int) -> int:
+    """Choose a reduction-friendly threadgroup size for the Metal kernel."""
+    requested = max(32, min(int(requested), _MAX_METAL_HEAD_DIM))
+    requested = _floor_power_of_two(requested)
+    preferred = max(32, min(_MAX_METAL_HEAD_DIM, _next_power_of_two(head_dim)))
+    return min(requested, preferred)
+
+
+def _is_single_token_decode(query_start_loc: mx.ArrayLike, total_tokens: int) -> bool:
+    """Return ``True`` when every scheduled sequence contributes exactly one token."""
+    if total_tokens <= 0:
+        return False
+    qsl = np.asarray(query_start_loc, dtype=np.int32)
+    if qsl.ndim != 1 or qsl.shape[0] != total_tokens + 1:
+        return False
+    if qsl[0] != 0:
+        return False
+    return bool(np.all(qsl[1:] - qsl[:-1] == 1))
 
 
 def _paged_attention_reference(
@@ -234,30 +271,34 @@ using namespace metal;
 
 
 _METAL_SOURCE = r"""
-    uint elem = thread_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint token_idx = threadgroup_position_in_grid.y;
+    uint q_head = threadgroup_position_in_grid.z;
+    uint tg_size = threads_per_threadgroup.x;
+
     int total_tokens = queries_shape[0];
     int num_q_heads = queries_shape[1];
     int head_dim = queries_shape[2];
     if (total_tokens <= 0 || num_q_heads <= 0 || head_dim <= 0) {
         return;
     }
-    uint elems_per_token = (uint)(num_q_heads * head_dim);
-    uint token_idx = elem / elems_per_token;
-    if (token_idx >= (uint)total_tokens) {
+    if ((int)token_idx >= total_tokens || (int)q_head >= num_q_heads) {
         return;
     }
-    uint rem = elem - token_idx * elems_per_token;
-    int q_head = (int)(rem / head_dim);
-    int dim_idx = (int)(rem - (uint)(q_head * head_dim));
 
     int num_kv_heads = key_cache_shape[2];
+    int q_base = ((int)token_idx * num_q_heads + (int)q_head) * head_dim;
     if (num_kv_heads <= 0) {
-        out[elem] = (T)0;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
         return;
     }
     int num_queries_per_kv = num_q_heads / num_kv_heads;
     if (num_queries_per_kv <= 0) {
-        out[elem] = (T)0;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
         return;
     }
     int kv_head = q_head / num_queries_per_kv;
@@ -280,14 +321,18 @@ _METAL_SOURCE = r"""
     int q_end = query_start_loc[seq_idx + 1];
     int q_len = q_end - q_start;
     if (q_len <= 0) {
-        out[elem] = (T)0;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
         return;
     }
     int q_pos = (int)token_idx - q_start;
 
     int seq_len = kv_lens[seq_idx];
     if (seq_len <= 0) {
-        out[elem] = (T)0;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
         return;
     }
 
@@ -297,7 +342,9 @@ _METAL_SOURCE = r"""
         max_k = seq_len - 1;
     }
     if (max_k < 0) {
-        out[elem] = (T)0;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
         return;
     }
 
@@ -312,42 +359,238 @@ _METAL_SOURCE = r"""
 
     int block_size = key_cache_shape[1];
     int max_blocks_per_seq = block_tables_shape[1];
-    int q_base = ((int)token_idx * num_q_heads + q_head) * head_dim;
+    threadgroup float q_shared[256];
+    threadgroup float out_shared[256];
+    threadgroup float reduce_shared[256];
+    threadgroup float alpha_shared;
+    threadgroup float p_shared;
+    threadgroup float inv_l_shared;
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        q_shared[d] = (float)queries[q_base + d];
+        out_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m = -INFINITY;
     float l = 0.0f;
-    float acc = 0.0f;
 
-    for (int kpos = start_k; kpos <= max_k; ++kpos) {
-        int block = block_tables[seq_idx * max_blocks_per_seq + (kpos / block_size)];
+    int token_stride = num_kv_heads * head_dim;
+    int start_block = start_k / block_size;
+    int end_block = max_k / block_size;
+
+    for (int block_pos = start_block; block_pos <= end_block; ++block_pos) {
+        int block = block_tables[seq_idx * max_blocks_per_seq + block_pos];
         if (block < 0) {
             continue;
         }
-        int offset = kpos - (kpos / block_size) * block_size;
-        int kv_base = ((block * block_size + offset) * num_kv_heads + kv_head) * head_dim;
 
-        float score = 0.0f;
-        for (int d = 0; d < head_dim; ++d) {
-            float qv = (float)queries[q_base + d];
-            float kv = (float)key_cache[kv_base + d];
-            score += qv * kv;
+        int offset_start = 0;
+        int offset_end = block_size - 1;
+        if (block_pos == start_block) {
+            offset_start = start_k - block_pos * block_size;
+        }
+        if (block_pos == end_block) {
+            offset_end = max_k - block_pos * block_size;
         }
 
-        float m_new = fmax(m, score);
-        float p = exp(score - m_new);
-        float alpha = exp(m - m_new);
-        float v_val = (float)value_cache[kv_base + dim_idx];
-        acc = acc * alpha + p * v_val;
-        l = l * alpha + p;
-        m = m_new;
+        int block_base = (block * block_size * num_kv_heads + kv_head) * head_dim;
+        for (int offset = offset_start; offset <= offset_end; ++offset) {
+            int kv_base = block_base + offset * token_stride;
+            float partial = 0.0f;
+
+            for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+                partial += q_shared[d] * (float)key_cache[kv_base + d];
+            }
+
+            reduce_shared[tid] = partial;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    reduce_shared[tid] += reduce_shared[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0) {
+                float score = reduce_shared[0];
+                float m_new = fmax(m, score);
+                float p = exp(score - m_new);
+                float alpha = exp(m - m_new);
+                alpha_shared = alpha;
+                p_shared = p;
+                l = l * alpha + p;
+                m = m_new;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float alpha = alpha_shared;
+            float p = p_shared;
+            for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+                out_shared[d] =
+                    out_shared[d] * alpha + p * (float)value_cache[kv_base + d];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
-    float out_val = (l <= 0.0f) ? 0.0f : (acc / l);
-    out[elem] = (T)out_val;
+    if (tid == 0) {
+        inv_l_shared = l > 0.0f ? (1.0f / l) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        out[q_base + d] = (T)(out_shared[d] * inv_l_shared);
+    }
+"""
+
+
+_METAL_DECODE_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint seq_idx = threadgroup_position_in_grid.y;
+    uint q_head = threadgroup_position_in_grid.z;
+    uint tg_size = threads_per_threadgroup.x;
+
+    int total_tokens = queries_shape[0];
+    int num_q_heads = queries_shape[1];
+    int head_dim = queries_shape[2];
+    if (total_tokens <= 0 || num_q_heads <= 0 || head_dim <= 0) {
+        return;
+    }
+    if ((int)seq_idx >= total_tokens || (int)q_head >= num_q_heads) {
+        return;
+    }
+
+    int num_kv_heads = key_cache_shape[2];
+    int q_base = ((int)seq_idx * num_q_heads + (int)q_head) * head_dim;
+    if (num_kv_heads <= 0) {
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
+        return;
+    }
+
+    int num_queries_per_kv = num_q_heads / num_kv_heads;
+    if (num_queries_per_kv <= 0) {
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
+        return;
+    }
+    int kv_head = q_head / num_queries_per_kv;
+    if (kv_head >= num_kv_heads) {
+        kv_head = num_kv_heads - 1;
+    }
+
+    int seq_len = kv_lens[seq_idx];
+    if (seq_len <= 0) {
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            out[q_base + d] = (T)0;
+        }
+        return;
+    }
+
+    int sliding_window = sliding_window_ptr[0];
+    int start_k = 0;
+    if (sliding_window > 0) {
+        int win_start = seq_len - sliding_window;
+        if (win_start > 0) {
+            start_k = win_start;
+        }
+    }
+    int max_k = seq_len - 1;
+
+    int block_size = key_cache_shape[1];
+    int max_blocks_per_seq = block_tables_shape[1];
+    threadgroup float q_shared[256];
+    threadgroup float out_shared[256];
+    threadgroup float reduce_shared[256];
+    threadgroup float alpha_shared;
+    threadgroup float p_shared;
+    threadgroup float inv_l_shared;
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        q_shared[d] = (float)queries[q_base + d];
+        out_shared[d] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    int token_stride = num_kv_heads * head_dim;
+    int start_block = start_k / block_size;
+    int end_block = max_k / block_size;
+
+    for (int block_pos = start_block; block_pos <= end_block; ++block_pos) {
+        int block = block_tables[seq_idx * max_blocks_per_seq + block_pos];
+        if (block < 0) {
+            continue;
+        }
+
+        int offset_start = 0;
+        int offset_end = block_size - 1;
+        if (block_pos == start_block) {
+            offset_start = start_k - block_pos * block_size;
+        }
+        if (block_pos == end_block) {
+            offset_end = max_k - block_pos * block_size;
+        }
+
+        int block_base = (block * block_size * num_kv_heads + kv_head) * head_dim;
+        for (int offset = offset_start; offset <= offset_end; ++offset) {
+            int kv_base = block_base + offset * token_stride;
+            float partial = 0.0f;
+
+            for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+                partial += q_shared[d] * (float)key_cache[kv_base + d];
+            }
+
+            reduce_shared[tid] = partial;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+                if (tid < stride) {
+                    reduce_shared[tid] += reduce_shared[tid + stride];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            if (tid == 0) {
+                float score = reduce_shared[0];
+                float m_new = fmax(m, score);
+                float p = exp(score - m_new);
+                float alpha = exp(m - m_new);
+                alpha_shared = alpha;
+                p_shared = p;
+                l = l * alpha + p;
+                m = m_new;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float alpha = alpha_shared;
+            float p = p_shared;
+            for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+                out_shared[d] =
+                    out_shared[d] * alpha + p * (float)value_cache[kv_base + d];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid == 0) {
+        inv_l_shared = l > 0.0f ? (1.0f / l) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        out[q_base + d] = (T)(out_shared[d] * inv_l_shared);
+    }
 """
 
 
 _METAL_KERNEL: tp.Any | None = None
+_METAL_DECODE_KERNEL: tp.Any | None = None
 
 
 def _get_metal_kernel():
@@ -374,6 +617,28 @@ def _get_metal_kernel():
             header=_METAL_HEADER,
         )
     return _METAL_KERNEL
+
+
+def _get_metal_decode_kernel():
+    """Lazily compile and cache the single-token decode Metal kernel."""
+    global _METAL_DECODE_KERNEL
+    if _METAL_DECODE_KERNEL is None:
+        _METAL_DECODE_KERNEL = mx.fast.metal_kernel(
+            name="unified_attention_paged_decode",
+            input_names=[
+                "queries",
+                "key_cache",
+                "value_cache",
+                "block_tables",
+                "kv_lens",
+                "query_start_loc",
+                "sliding_window_ptr",
+            ],
+            output_names=["out"],
+            source=_METAL_DECODE_SOURCE,
+            header=_METAL_HEADER,
+        )
+    return _METAL_DECODE_KERNEL
 
 
 def paged_attention(
@@ -416,13 +681,16 @@ def paged_attention(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if sliding_window is None:
         sliding_window = 0
+    if int(queries.shape[0]) == 0:
+        return mx.zeros_like(queries)
 
     if use_metal is None:
         use_metal = _DEFAULT_USE_METAL and not _FORCE_REFERENCE
 
-    if use_metal and not _FORCE_REFERENCE:
+    if use_metal and not _FORCE_REFERENCE and head_dim <= _MAX_METAL_HEAD_DIM:
         try:
-            kernel = _get_metal_kernel()
+            decode_fast_path = _is_single_token_decode(query_start_loc, int(queries.shape[0]))
+            kernel = _get_metal_decode_kernel() if decode_fast_path else _get_metal_kernel()
             q_scaled = queries * float(softmax_scale)
             block_tables = mx.array(block_tables, dtype=mx.int32)
             kv_lens = mx.array(kv_lens, dtype=mx.int32)
@@ -431,16 +699,15 @@ def paged_attention(
 
             total_tokens = int(q_scaled.shape[0])
             num_q_heads = int(q_scaled.shape[1])
-            head_dim = int(q_scaled.shape[2])
-            total_elems = int(total_tokens * num_q_heads * head_dim)
+            effective_threadgroup_size = _resolve_threadgroup_size(head_dim, threadgroup_size)
 
             outputs = kernel(
                 inputs=[q_scaled, key_cache, value_cache, block_tables, kv_lens, query_start_loc, sliding_window_ptr],
                 template=[("T", q_scaled.dtype)],
                 output_shapes=[q_scaled.shape],
                 output_dtypes=[q_scaled.dtype],
-                grid=(total_elems, 1, 1),
-                threadgroup=(int(threadgroup_size), 1, 1),
+                grid=(effective_threadgroup_size, total_tokens, num_q_heads),
+                threadgroup=(effective_threadgroup_size, 1, 1),
             )
             return outputs[0]
         except Exception:
@@ -474,7 +741,7 @@ class UnifiedAttention(BaseOperation):
         Returns:
             A tuple of name aliases.
         """
-        return ("unified_attention", "paged_attention", "page_attention")
+        return ("unified_attention", "paged_attention", "page_attention", "full_attention", "linear_attention")
 
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED):

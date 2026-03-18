@@ -24,6 +24,7 @@ padding, warmup precompilation, and performance tracking.
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from typing import Any
 
@@ -38,6 +39,66 @@ from .execution_types import ExecutionRequest, ExecutionResult, ExecutionUpdate,
 from .sequence_buffer import SequenceBuffer
 
 logger = get_logger("eSurgeRunner")
+
+_ENABLE_COMPILED_PAGED_FORWARD = os.getenv("EASYMLX_ESURGE_USE_COMPILED_PAGED_FORWARD", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+class _CompiledPagedCacheProxy:
+    """State-backed cache proxy for ``mx.compile`` paged forwards."""
+
+    __slots__ = ("block_size", "head_dim", "num_kv_heads", "state")
+
+    def __init__(self, cache: Any):
+        self.block_size = int(cache.block_size)
+        self.num_kv_heads = int(cache.num_kv_heads)
+        self.head_dim = int(cache.head_dim)
+        self.state = {
+            "key_cache": cache.key_cache,
+            "value_cache": cache.value_cache,
+            "block_tables": cache.block_tables,
+            "kv_lens": cache.kv_lens,
+        }
+
+    @property
+    def key_cache(self):
+        return self.state["key_cache"]
+
+    @key_cache.setter
+    def key_cache(self, value):
+        self.state["key_cache"] = value
+
+    @property
+    def value_cache(self):
+        return self.state["value_cache"]
+
+    @value_cache.setter
+    def value_cache(self, value):
+        self.state["value_cache"] = value
+
+    @property
+    def block_tables(self):
+        return self.state["block_tables"]
+
+    @block_tables.setter
+    def block_tables(self, value):
+        self.state["block_tables"] = value
+
+    @property
+    def kv_lens(self):
+        return self.state["kv_lens"]
+
+    @kv_lens.setter
+    def kv_lens(self, value):
+        self.state["kv_lens"] = value
+
+    @property
+    def num_seqs(self) -> int:
+        return int(self.block_tables.shape[0])
 
 
 def _call_with_filtered_kwargs(callable_obj: Any, /, **kwargs: Any) -> Any:
@@ -273,6 +334,7 @@ class ModelRunner:
         self._perf_iteration = 0
         self._perf_tps_ema = 0.0
         self._compiled_cache: dict[tuple[int, int], Any] = {}
+        self._compiled_forwards: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
 
         logger.debug("ModelRunner initialization complete")
 
@@ -356,14 +418,21 @@ class ModelRunner:
             cache_metadata = PageMetadata(query_start_loc=build_query_start_loc(query_lens))
 
             try:
-                out = _call_with_filtered_kwargs(
-                    self.model,
-                    input_ids=dummy_ids,
-                    cache_views=cache_views,
-                    cache_metadata=cache_metadata,
-                    return_dict=True,
-                )
-                logits = getattr(out, "logits", out)
+                compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
+                if compiled_entry is not None:
+                    self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
+                    logits = compiled_entry["fn"](dummy_ids)
+                    mx.eval(logits)
+                    self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
+                else:
+                    out = _call_with_filtered_kwargs(
+                        self.model,
+                        input_ids=dummy_ids,
+                        cache_views=cache_views,
+                        cache_metadata=cache_metadata,
+                        return_dict=True,
+                    )
+                    logits = getattr(out, "logits", out)
                 mx.eval(logits)
                 self._compiled_cache[key] = True
             except Exception as exc:
@@ -413,9 +482,77 @@ class ModelRunner:
             configured.
         """
         if not self.kv_caches:
-            return self.model.__call__
+            return None
+        if not _ENABLE_COMPILED_PAGED_FORWARD:
+            return None
 
-        return None
+        from easymlx.caching import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+
+        if not all(isinstance(c, PagedKVCache) for c in self.kv_caches):
+            return None
+        if not query_lens or any(int(query_len) != 1 for query_len in query_lens):
+            return None
+
+        signature = inspect.signature(self.model)
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+        )
+        unsupported_dynamic_kwargs = {"positions", "slot_ids", "query_lens", "multimodal", "multimodal_inputs"}
+        if accepts_kwargs or unsupported_dynamic_kwargs.intersection(signature.parameters):
+            return None
+
+        key = (tuple(int(slot_id) for slot_id in slot_ids), tuple(int(query_len) for query_len in query_lens))
+        compiled_entry = self._compiled_forwards.get(key)
+        if compiled_entry is not None:
+            return compiled_entry
+
+        cache_proxies = [_CompiledPagedCacheProxy(kv_cache) for kv_cache in self.kv_caches]
+        cache_views = [PageCache(kv_cache, slot_ids, query_lens=query_lens) for kv_cache in cache_proxies]
+        cache_metadata = PageMetadata(query_start_loc=build_query_start_loc(query_lens))
+
+        static_kwargs = {
+            name: value
+            for name, value in {
+                "cache_views": cache_views,
+                "cache_metadata": cache_metadata,
+                "return_dict": False,
+            }.items()
+            if name in signature.parameters
+        }
+        state_arrays = [cache_proxy.state for cache_proxy in cache_proxies]
+
+        def compiled_forward(input_ids: mx.array) -> mx.array:
+            output = self.model(input_ids=input_ids, **static_kwargs)
+            return getattr(output, "logits", output)
+
+        compiled_fn = mx.compile(compiled_forward, inputs=state_arrays, outputs=state_arrays)
+        compiled_entry = {"fn": compiled_fn, "state": state_arrays, "proxies": cache_proxies}
+        self._compiled_forwards[key] = compiled_entry
+        return compiled_entry
+
+    @staticmethod
+    def _refresh_compiled_cache_state(
+        compiled_entry: dict[str, Any],
+        kv_caches: list[Any],
+    ) -> None:
+        """Refresh proxy state from the live caches before a compiled call."""
+        for cache_proxy, cache in zip(compiled_entry["proxies"], kv_caches, strict=False):
+            cache_proxy.key_cache = cache.key_cache
+            cache_proxy.value_cache = cache.value_cache
+            cache_proxy.block_tables = cache.block_tables
+            cache_proxy.kv_lens = cache.kv_lens
+
+    @staticmethod
+    def _sync_compiled_cache_state(
+        compiled_entry: dict[str, Any],
+        kv_caches: list[Any],
+    ) -> None:
+        """Propagate compiled proxy state back into the live caches."""
+        for cache_proxy, cache in zip(compiled_entry["proxies"], kv_caches, strict=False):
+            cache.key_cache = cache_proxy.key_cache
+            cache.value_cache = cache_proxy.value_cache
+            cache.block_tables = cache_proxy.block_tables
+            cache.kv_lens = cache_proxy.kv_lens
 
     def _infer_page_size(self) -> int:
         """Infer the KV-cache page size from the first cache object.
@@ -754,14 +891,17 @@ class ModelRunner:
             )
 
             if not has_extra:
-                compiled_fn = self._get_compiled_forward(slot_ids, query_lens)
-                if compiled_fn is not None:
+                compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
+                if compiled_entry is not None:
                     try:
+                        self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
+                        compiled_fn = compiled_entry["fn"]
                         logits = compiled_fn(batch_token_ids)
                         mx.eval(logits)
+                        self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
                         raw_output = {"logits": logits}
                         return raw_output, _as_numpy_logits(raw_output)
-                    except ValueError:
+                    except (RuntimeError, ValueError):
                         logger.debug("Compiled forward failed, falling back to eager")
 
             from easymlx.caching import PageCache, PageMetadata, build_query_start_loc

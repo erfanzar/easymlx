@@ -23,6 +23,7 @@ This package provides concrete attention kernel implementations including:
 
 from __future__ import annotations
 
+from .gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
 from .scaled_dot_product_attention import ScaledDotProductAttention
 from .unified_attention import UnifiedAttention, UnifiedAttnConfig, UnifiedAttnMetadata, paged_attention
 from .vanilla_attention import Vanilla, VanillaAttention
@@ -30,8 +31,12 @@ from .vanilla_attention import Vanilla, VanillaAttention
 ScaledDotProductAttn = ScaledDotProductAttention
 UnifiedAttn = UnifiedAttention
 VanillaAttn = VanillaAttention
+GatedDeltaRule = GatedDeltaRuleOp
 
 __all__ = (
+    "GatedDeltaRule",
+    "GatedDeltaRuleOp",
+    "GatedDeltaRuleOutput",
     "ScaledDotProductAttention",
     "ScaledDotProductAttn",
     "UnifiedAttention",

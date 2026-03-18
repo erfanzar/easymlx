@@ -84,6 +84,18 @@ class PageCache:
         return self.cache.block_tables
 
     @property
+    def offset(self) -> int:
+        """Return the current sequence offset (max kv_len across active slots).
+
+        This is used by modules that need a position offset for things
+        like rotary embeddings or convolution state tracking.
+        """
+        if not self.slot_ids:
+            return 0
+        slot_lens = self.cache.kv_lens[self._slot_array]
+        return int(mx.max(slot_lens).item())
+
+    @property
     def block_size(self) -> int:
         """Return the block size (tokens per block) of the underlying cache."""
         return int(self.cache.block_size)
@@ -118,6 +130,7 @@ class PageCache:
             block tables and KV lengths for the selected slots.
         """
         block_size = self.cache.block_size
+        base_kv_lens = self.cache.kv_lens[self._slot_array]
 
         if self._seq_ranges:
             seq_ranges = self._seq_ranges
@@ -129,19 +142,56 @@ class PageCache:
                 qsl_list = list(qsl)
             seq_ranges = [(int(qsl_list[i]), int(qsl_list[i + 1])) for i in range(len(self.slot_ids))]
 
+        query_lens = [max(0, seq_end - seq_start) for seq_start, seq_end in seq_ranges]
+        is_single_token_decode = (
+            bool(query_lens)
+            and queries.shape[0] == len(query_lens)
+            and all(query_len == 1 for query_len in query_lens)
+        )
+
+        if is_single_token_decode:
+            token_positions = base_kv_lens.astype(mx.int32)
+            prepared_queries = queries
+            prepared_keys = keys
+            prepared_values = values
+
+            if rope is not None:
+                offsets = token_positions
+                q_batched = mx.expand_dims(queries, axis=1).transpose(0, 2, 1, 3)
+                k_batched = mx.expand_dims(keys, axis=1).transpose(0, 2, 1, 3)
+                prepared_queries = rope(q_batched, offset=offsets).transpose(0, 2, 1, 3)[:, 0]
+                prepared_keys = rope(k_batched, offset=offsets).transpose(0, 2, 1, 3)[:, 0]
+
+            block_ids = self.cache.block_tables[self._slot_array, token_positions // block_size]
+            in_block_offsets = token_positions % block_size
+            self.cache.key_cache[block_ids, in_block_offsets] = prepared_keys
+            self.cache.value_cache[block_ids, in_block_offsets] = prepared_values
+            self.cache.kv_lens[self._slot_array] = token_positions + 1
+
+            resolved_metadata = cache_metadata.with_cache_state(
+                block_tables=self.cache.block_tables[self._slot_array],
+                kv_lens=self.cache.kv_lens[self._slot_array],
+                block_size=block_size,
+            )
+            return prepared_queries, self.cache.key_cache, self.cache.value_cache, resolved_metadata
+
         query_chunks: list[mx.array] = []
+        key_chunks: list[mx.array] = []
+        value_chunks: list[mx.array] = []
+        slot_parts: list[mx.array] = []
+        position_parts: list[mx.array] = []
 
         for seq_idx, slot in enumerate(self.slot_ids):
             seq_start, seq_end = seq_ranges[seq_idx]
-            if seq_end <= seq_start:
+            num_tokens = seq_end - seq_start
+            if num_tokens <= 0:
                 continue
 
             q_chunk = queries[seq_start:seq_end]
             k_chunk = keys[seq_start:seq_end]
             v_chunk = values[seq_start:seq_end]
-            num_tokens = seq_end - seq_start
 
-            offset = self.cache.kv_lens[slot]
+            offset = base_kv_lens[seq_idx]
 
             if rope is not None:
                 q_4d = q_chunk[None].transpose(0, 2, 1, 3)
@@ -152,20 +202,36 @@ class PageCache:
                 k_chunk = k_4d
 
             query_chunks.append(q_chunk)
-
-            token_positions = offset + mx.arange(num_tokens)
-            block_ids = self.cache.block_tables[slot, token_positions // block_size]
-            in_block_offsets = token_positions % block_size
-
-            self.cache.key_cache[block_ids, in_block_offsets] = k_chunk
-            self.cache.value_cache[block_ids, in_block_offsets] = v_chunk
-            self.cache.kv_lens[slot] = offset + num_tokens
+            key_chunks.append(k_chunk)
+            value_chunks.append(v_chunk)
+            slot_parts.append(mx.full((num_tokens,), slot, dtype=mx.int32))
+            position_parts.append(offset + mx.arange(num_tokens, dtype=mx.int32))
 
         prepared_queries = (
             mx.concatenate(query_chunks, axis=0)
             if query_chunks
             else mx.zeros((0, queries.shape[1], queries.shape[2]), dtype=queries.dtype)
         )
+        prepared_keys = (
+            mx.concatenate(key_chunks, axis=0)
+            if key_chunks
+            else mx.zeros((0, keys.shape[1], keys.shape[2]), dtype=keys.dtype)
+        )
+        prepared_values = (
+            mx.concatenate(value_chunks, axis=0)
+            if value_chunks
+            else mx.zeros((0, values.shape[1], values.shape[2]), dtype=values.dtype)
+        )
+
+        if slot_parts:
+            token_slots = mx.concatenate(slot_parts, axis=0)
+            token_positions = mx.concatenate(position_parts, axis=0)
+            block_ids = self.cache.block_tables[token_slots, token_positions // block_size]
+            in_block_offsets = token_positions % block_size
+            self.cache.key_cache[block_ids, in_block_offsets] = prepared_keys
+            self.cache.value_cache[block_ids, in_block_offsets] = prepared_values
+
+        self.cache.kv_lens[self._slot_array] = base_kv_lens + mx.array(query_lens, dtype=mx.int32)
         resolved_metadata = cache_metadata.with_cache_state(
             block_tables=self.cache.block_tables[self._slot_array],
             kv_lens=self.cache.kv_lens[self._slot_array],

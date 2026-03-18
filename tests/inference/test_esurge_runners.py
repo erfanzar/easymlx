@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import mlx.core as mx
 import numpy as np
 
+from easymlx.caching import PagedKVCache
 from easymlx.inference.esurge.runners import (
     ExecutionManager,
     ExecutionRequest,
@@ -41,6 +43,26 @@ class DummyPagedModel:
             target = (int(sum(token_ids)) + int(slot_ids[index])) % self.vocab_size
             logits[index, target] = 10.0
         return {"logits": logits}
+
+
+class DummyCompiledPagedModel:
+    """MLX-native paged model that can run through the compiled runner path."""
+
+    def __init__(self, vocab_size: int = 8):
+        self.vocab_size = vocab_size
+
+    def __call__(self, input_ids=None, *, cache_views=None, cache_metadata=None, return_dict=True):
+        slot_array = cache_views[0]._slot_array
+        cache = cache_views[0].cache
+        cache.kv_lens[slot_array] = cache.kv_lens[slot_array] + 1
+
+        last_indices = (cache_metadata.query_start_loc[1:] - 1).astype(mx.int32)
+        last_tokens = mx.take(input_ids, last_indices, axis=0).astype(mx.int32)
+        logits = mx.take(mx.eye(self.vocab_size, dtype=mx.float32), last_tokens % self.vocab_size, axis=0)
+
+        if return_dict:
+            return {"logits": logits}
+        return logits
 
 
 def test_sequence_buffer_row_ops_and_page_table() -> None:
@@ -97,6 +119,49 @@ def test_model_runner_normalizes_step_updates_and_mutates_buffer() -> None:
     assert result.sampled_token_ids == [[3], [0]]
     assert buffer.get_row("req-a").output_token_ids == [3]
     assert buffer.get_row("req-b").output_token_ids == [0]
+
+
+def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch) -> None:
+    monkeypatch.setenv("EASYMLX_ESURGE_USE_COMPILED_PAGED_FORWARD", "1")
+
+    from importlib import reload
+
+    import easymlx.inference.esurge.runners.model_runner as model_runner_module
+
+    model_runner_module = reload(model_runner_module)
+
+    model = DummyCompiledPagedModel(vocab_size=6)
+    cache = PagedKVCache.allocate(
+        num_seqs=2,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=1,
+        block_size=2,
+        dtype=mx.float32,
+    )
+    runner = model_runner_module.ModelRunner(model, kv_caches=[cache], seed=0)
+
+    request = model_runner_module.ExecutionRequest(
+        step_id=11,
+        sequences=[
+            model_runner_module.ScheduledSequence(request_id="req-a", row_index=0, token_ids=[1], num_computed_tokens=0),
+            model_runner_module.ScheduledSequence(request_id="req-b", row_index=1, token_ids=[2], num_computed_tokens=0),
+        ],
+        sampling_by_request={
+            "req-a": SamplingParams(max_tokens=1, do_sample=False),
+            "req-b": SamplingParams(max_tokens=1, do_sample=False),
+        },
+    )
+
+    _raw_output, logits = runner._forward_step(request)
+    assert len(runner._compiled_forwards) == 1
+    assert logits.shape == (2, 6)
+    np.testing.assert_array_equal(np.asarray(cache.kv_lens), np.array([1, 1], dtype=np.int32))
+
+    _raw_output, logits = runner._forward_step(request)
+    assert len(runner._compiled_forwards) == 1
+    assert logits.shape == (2, 6)
+    np.testing.assert_array_equal(np.asarray(cache.kv_lens), np.array([2, 2], dtype=np.int32))
 
 
 def test_execution_manager_async_collect() -> None:

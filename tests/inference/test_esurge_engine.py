@@ -58,7 +58,7 @@ class DummyPagedModel:
     ):
         arr = np.array(input_ids, dtype=np.int32)
         if arr.ndim == 1:
-            num_tokens = arr.shape[0]
+            arr.shape[0]
             if query_lens and slot_ids:
                 num_seqs = len(slot_ids)
                 logits = np.full((num_seqs, self.vocab_size), -1e9, dtype=np.float32)

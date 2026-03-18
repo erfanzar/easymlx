@@ -21,6 +21,8 @@ easymlx.modules package
    qwen2_moe/index
    qwen2_vl/index
    qwen3/index
+   qwen3_5/index
+   qwen3_5_moe/index
    qwen3_moe/index
    qwen3_next/index
    qwen3_omni_moe/index

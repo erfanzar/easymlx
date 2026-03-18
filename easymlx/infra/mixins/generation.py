@@ -222,17 +222,30 @@ class EasyGenerationMixin:
             return TransformerCache.init_cache(cache_cfg)
 
         if recommended == "paged":
-            return [
-                PagedKVCache.allocate(
-                    num_seqs=batch_size,
-                    max_seq_len=max_length,
-                    num_kv_heads=num_kv_heads or num_heads,
-                    head_dim=head_dim,
-                    block_size=page_size,
-                    dtype=dtype,
+            caches = []
+            for layer_idx in range(num_hidden_layers):
+                layer_nkv = num_kv_heads or num_heads
+                layer_hd = head_dim
+                if layer_idx < len(cache_info.layers):
+                    layer_info = cache_info.layers[layer_idx]
+                    op_name = layer_info.operation_name
+                    if op_name in ("linear_attention", "gated_delta_rule", "gdr"):
+                        layer_nkv = getattr(config, "linear_num_value_heads", layer_nkv)
+                        layer_hd = getattr(config, "linear_value_head_dim", layer_hd)
+                        text_cfg = getattr(config, "text_config", config)
+                        layer_nkv = getattr(text_cfg, "linear_num_value_heads", layer_nkv)
+                        layer_hd = getattr(text_cfg, "linear_value_head_dim", layer_hd)
+                caches.append(
+                    PagedKVCache.allocate(
+                        num_seqs=batch_size,
+                        max_seq_len=max_length,
+                        num_kv_heads=layer_nkv,
+                        head_dim=layer_hd,
+                        block_size=page_size,
+                        dtype=dtype,
+                    )
                 )
-                for _ in range(num_hidden_layers)
-            ]
+            return caches
 
         # recommended == "hybrid"
         layer_types_raw = getattr(config, "layer_types", None)

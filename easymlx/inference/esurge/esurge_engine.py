@@ -588,6 +588,7 @@ class eSurge:
     def _initialize_runtime(self) -> None:
         """Bootstrap the model runner, scheduler, execution manager, and background thread."""
         kv_caches = self._init_paged_cache()
+        self._reset_recurrent_states()
         self._info("Initializing paged runtime with %d KV cache layers", len(kv_caches))
         supports_async_overlap = bool(getattr(self.model, "supports_async_overlap", False))
         self._runner = ModelRunner(
@@ -671,6 +672,33 @@ class eSurge:
                 f"{type(self.model).__name__} does not support paged attention. "
                 "Model must provide `init_operations_cache()` or `init_paged_cache()`."
             )
+
+    def _reset_recurrent_states(self) -> None:
+        """Reset linear attention / recurrent states on the model.
+
+        Unlike paged KV caches which are managed by the page pool,
+        recurrent states (conv_state, recurrent_state) live on the model
+        modules themselves. They must be zeroed when requests finish so
+        the next request starts clean.
+        """
+        model = self.model
+        layers = None
+        for attr in ("layers", "model.layers", "language_model.layers", "model.language_model.layers"):
+            obj = model
+            try:
+                for part in attr.split("."):
+                    obj = getattr(obj, part)
+                layers = obj
+                break
+            except AttributeError:
+                continue
+        if layers is None:
+            return
+        for layer in layers:
+            for attr_name in ("linear_attn", "recurrent", "ssm"):
+                module = getattr(layer, attr_name, None)
+                if module is not None and hasattr(module, "reset_state"):
+                    module.reset_state(batch_size=1)
 
     def _init_paged_cache(self) -> list[Any]:
         """Initialize paged KV caches via the model's cache init method.
@@ -1419,6 +1447,8 @@ class eSurge:
             if state is None:
                 continue
             state.finalize()
+        if finished_requests:
+            self._reset_recurrent_states()
         self._reconcile_terminal_states_locked()
 
     def _run_loop(self) -> None:
