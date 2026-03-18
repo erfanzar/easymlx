@@ -39,6 +39,7 @@ from easymlx.layers.linears import SwitchGLU
 from easymlx.layers.moe import TopKRouter
 from easymlx.layers.rotary import get_rope
 from easymlx.modules._base import BaseCausalLMModule
+from easymlx.operations.kernels.gated_delta_rule import GatedDeltaRuleOp
 
 from .qwen3_next_configuration import Qwen3NextConfig
 
@@ -316,11 +317,6 @@ class Qwen3NextFullAttention(nn.Module):
         return self.o_proj(attn.reshape(*lead, -1))
 
 
-def _l2norm(x: mx.array, axis: int = -1, eps: float = 1e-6) -> mx.array:
-    """L2-normalize along an axis."""
-    return x * mx.rsqrt(mx.sum(x * x, axis=axis, keepdims=True) + eps)
-
-
 def _shift_conv_state_left(conv_state: mx.array, new_value: mx.array) -> mx.array:
     """Shift conv rolling buffer left, append new token at the right."""
     return mx.concatenate([conv_state[:, :, 1:], new_value[:, :, None]], axis=-1)
@@ -377,6 +373,7 @@ class Qwen3NextLinearAttention(nn.Module):
         self.in_proj_a = nn.Linear(config.hidden_size, self.num_k_heads, bias=False)
         self.out_proj = nn.Linear(self.conv_value_dim, config.hidden_size, bias=False)
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
+        self.gdr_op = GatedDeltaRuleOp()
 
         conv_cls = getattr(nn, "Conv1d", None)
         self.conv1d = None
@@ -401,89 +398,6 @@ class Qwen3NextLinearAttention(nn.Module):
         self._recurrent_state = mx.zeros(
             (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
         )
-
-    def _gdr_recurrent_step(
-        self,
-        query: mx.array,
-        key: mx.array,
-        value: mx.array,
-        beta: mx.array,
-        decay: mx.array,
-        recurrent_state: mx.array,
-    ) -> tuple[mx.array, mx.array]:
-        """Single-step GDR decode: O(1) per token.
-
-        Args:
-            query: (batch, num_v_heads, head_k_dim)
-            key: (batch, num_v_heads, head_k_dim)
-            value: (batch, num_v_heads, head_v_dim)
-            beta: (batch, num_v_heads)
-            decay: (batch, num_v_heads)
-            recurrent_state: (batch, num_v_heads, head_k_dim, head_v_dim)
-
-        Returns:
-            output: (batch, 1, num_v_heads, head_v_dim)
-            new_state: (batch, num_v_heads, head_k_dim, head_v_dim)
-        """
-        state = recurrent_state.astype(mx.float32)
-        query = _l2norm(query.astype(mx.float32)) * (self.head_k_dim ** -0.5)
-        key = _l2norm(key.astype(mx.float32))
-        value = value.astype(mx.float32)
-        beta = beta.astype(mx.float32)
-        decay = decay.astype(mx.float32)
-
-        state = state * mx.exp(decay)[:, :, None, None]
-
-        kv_dot = mx.sum(state * key[:, :, :, None], axis=-2)
-        delta = (value - kv_dot) * beta[:, :, None]
-        state = state + key[:, :, :, None] * delta[:, :, None, :]
-
-        output = mx.sum(state * query[:, :, :, None], axis=-2)
-        return output[:, None, :, :].astype(self.out_proj.weight.dtype), state
-
-    def _gdr_chunked(
-        self,
-        query: mx.array,
-        key: mx.array,
-        value: mx.array,
-        beta: mx.array,
-        decay: mx.array,
-    ) -> mx.array:
-        """Chunked GDR for prefill: sequential scan over tokens.
-
-        Args:
-            query: (batch, seq_len, num_v_heads, head_k_dim)
-            key: (batch, seq_len, num_v_heads, head_k_dim)
-            value: (batch, seq_len, num_v_heads, head_v_dim)
-            beta: (batch, seq_len, num_v_heads)
-            decay: (batch, seq_len, num_v_heads)
-
-        Returns:
-            output: (batch, seq_len, num_v_heads, head_v_dim)
-        """
-        query = _l2norm(query) * (self.head_k_dim ** -0.5)
-        key = _l2norm(key)
-
-        batch_size, seq_len = query.shape[:2]
-        state = mx.zeros((batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim))
-        outputs = []
-
-        for t in range(seq_len):
-            q_t = query[:, t].astype(mx.float32)
-            k_t = key[:, t].astype(mx.float32)
-            v_t = value[:, t].astype(mx.float32)
-            b_t = beta[:, t].astype(mx.float32)
-            d_t = decay[:, t].astype(mx.float32)
-
-            state = state * mx.exp(d_t)[:, :, None, None]
-            kv_dot = mx.sum(state * k_t[:, :, :, None], axis=-2)
-            delta = (v_t - kv_dot) * b_t[:, :, None]
-            state = state + k_t[:, :, :, None] * delta[:, :, None, :]
-            o_t = mx.sum(state * q_t[:, :, :, None], axis=-2)
-            outputs.append(o_t)
-
-        self._recurrent_state = state
-        return mx.stack(outputs, axis=1).astype(self.out_proj.weight.dtype)
 
     def __call__(
         self,
@@ -540,32 +454,39 @@ class Qwen3NextLinearAttention(nn.Module):
             padded = mx.pad(conv_input, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
             conv_out = nn.silu(self.conv1d(padded))
             if seq_len >= self.d_conv:
-                self._conv_state = conv_input[:, -self.d_conv:, :].transpose(0, 2, 1)
+                self._conv_state = conv_input[:, -self.d_conv :, :].transpose(0, 2, 1)
             else:
                 self._conv_state = mx.zeros((batch_size, self.conv_dim, self.d_conv))
-                self._conv_state = mx.concatenate([
-                    self._conv_state[:, :, seq_len:],
-                    conv_input.transpose(0, 2, 1),
-                ], axis=-1)
+                self._conv_state = mx.concatenate(
+                    [
+                        self._conv_state[:, :, seq_len:],
+                        conv_input.transpose(0, 2, 1),
+                    ],
+                    axis=-1,
+                )
         else:
             conv_out = conv_input
 
-        query = conv_out[:, :, :self.key_dim].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        key = conv_out[:, :, self.key_dim:self.key_dim * 2].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
-        value = conv_out[:, :, self.key_dim * 2:].reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
+        query = conv_out[:, :, : self.key_dim].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = conv_out[:, :, self.key_dim : self.key_dim * 2].reshape(
+            batch_size, seq_len, self.num_k_heads, self.head_k_dim
+        )
+        value = conv_out[:, :, self.key_dim * 2 :].reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
 
-        if is_decode and self._recurrent_state is not None:
-            output, self._recurrent_state = self._gdr_recurrent_step(
-                query[:, 0], key[:, 0], value[:, 0],
-                beta[:, 0], decay[:, 0],
-                self._recurrent_state,
-            )
-        else:
-            if self._recurrent_state is None:
-                self._recurrent_state = mx.zeros(
-                    (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
-                )
-            output = self._gdr_chunked(query, key, value, beta, decay)
+        gdr_output = self.gdr_op(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            recurrent_state=self._recurrent_state,
+            use_qk_l2norm=True,
+            query_scale=self.head_k_dim**-0.5,
+            decay_is_log=True,
+            prefer_metal=True,
+        )
+        output = gdr_output.attention_outputs.astype(self.out_proj.weight.dtype)
+        self._recurrent_state = gdr_output.recurrent_state
 
         output = output.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)
         gate = z.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)

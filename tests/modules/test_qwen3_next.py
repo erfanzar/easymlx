@@ -14,9 +14,12 @@
 
 """Tests for Qwen3Next model."""
 
+import mlx.core as mx
+import numpy as np
 import pytest
 
 from easymlx.modules.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
+from easymlx.operations.kernels.gated_delta_rule import _gdr_recurrent_step_metal, _l2_normalize
 
 from .test_utils import CausalLMTester
 
@@ -66,3 +69,43 @@ class TestQwen3Next:
             max_new_tokens=8,
         )
         assert result.success, f"Qwen3Next generation failed: {result.error_message}"
+
+    def test_gdr_recurrent_metal_matches_math(self):
+        """The Metal recurrent GDR step should match the reference math."""
+        rng = np.random.default_rng(0)
+        batch = 2
+        num_heads = 3
+        head_dim = 8
+        d_state = 8
+
+        query = mx.array(rng.standard_normal((batch, num_heads, head_dim)).astype(np.float32))
+        key = mx.array(rng.standard_normal((batch, num_heads, head_dim)).astype(np.float32))
+        value = mx.array(rng.standard_normal((batch, num_heads, d_state)).astype(np.float32))
+        beta = mx.array(rng.standard_normal((batch, num_heads)).astype(np.float32))
+        decay = mx.array(rng.standard_normal((batch, num_heads)).astype(np.float32))
+        recurrent_state = mx.array(rng.standard_normal((batch, num_heads, head_dim, d_state)).astype(np.float32))
+
+        query_n = _l2_normalize(query.astype(mx.float32)) * (head_dim**-0.5)
+        key_n = _l2_normalize(key.astype(mx.float32))
+        decay_scale = mx.exp(decay.astype(mx.float32))
+
+        state_scaled = recurrent_state.astype(mx.float32) * decay_scale[:, :, None, None]
+        kv_dot = mx.sum(state_scaled * key_n[:, :, :, None], axis=-2)
+        delta = (value.astype(mx.float32) - kv_dot) * beta.astype(mx.float32)[:, :, None]
+        expected_state = state_scaled + key_n[:, :, :, None] * delta[:, :, None, :]
+        expected_output = mx.sum(expected_state * query_n[:, :, :, None], axis=-2)[:, None, :, :]
+
+        try:
+            actual_output, actual_state = _gdr_recurrent_step_metal(
+                query=query_n,
+                key=key_n,
+                value=value.astype(mx.float32),
+                beta=beta.astype(mx.float32),
+                decay_scale=decay_scale,
+                recurrent_state=recurrent_state.astype(mx.float32),
+            )
+        except RuntimeError as exc:
+            pytest.skip(f"Metal recurrent GDR kernel unavailable: {exc}")
+
+        np.testing.assert_allclose(np.asarray(actual_output), np.asarray(expected_output), atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(actual_state), np.asarray(expected_state), atol=1e-5, rtol=1e-5)

@@ -37,8 +37,10 @@ The algorithm:
 
     Decode (recurrent):
         - Single-step state update, O(1) per token
-        - h_t = decay * h_{t-1} + beta_t * (v_t outer k_t)
-        - o_t = h_t @ q_t
+        - s_t = decay_t * s_{t-1}
+        - delta_t = (v_t - <s_t, k_t>) * beta_t
+        - s_t = s_t + (k_t outer delta_t)
+        - o_t = s_t @ q_t
 
 References:
     - Qwen3Next: https://github.com/huggingface/transformers/blob/main/
@@ -48,6 +50,7 @@ References:
 from __future__ import annotations
 
 import math
+import os
 import typing as tp
 from dataclasses import dataclass
 
@@ -80,7 +83,96 @@ class GatedDeltaRuleOutput(AttentionOutput):
     recurrent_state: mx.array | None = None
 
 
-def _l2_normalize(x: mx.array, axis: int = -1, eps: float = 1e-12) -> mx.array:
+_MAX_GDR_METAL_HEAD_DIM = 128
+_ENABLE_GDR_METAL = os.getenv("EASYMLX_GDR_USE_METAL", "1").strip().lower() not in {"0", "false", "no", "off"}
+_GDR_RECURRENT_METAL_KERNEL: tp.Any | None = None
+
+_GDR_METAL_HEADER = r"""
+#include <metal_stdlib>
+using namespace metal;
+"""
+
+_GDR_RECURRENT_METAL_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint batch_idx = threadgroup_position_in_grid.y;
+    uint head_idx = threadgroup_position_in_grid.z;
+    uint tg_size = threads_per_threadgroup.x;
+
+    int batch = query_shape[0];
+    int num_heads = query_shape[1];
+    int head_dim = query_shape[2];
+    int d_state = value_shape[2];
+    if (head_dim <= 0 || d_state <= 0) {
+        return;
+    }
+    if ((int)batch_idx >= batch || (int)head_idx >= num_heads) {
+        return;
+    }
+
+    threadgroup float key_shared[128];
+    threadgroup float query_shared[128];
+    threadgroup float beta_shared;
+    threadgroup float decay_shared;
+
+    int q_base = ((int)batch_idx * num_heads + (int)head_idx) * head_dim;
+    int v_base = ((int)batch_idx * num_heads + (int)head_idx) * d_state;
+    int state_base = (((int)batch_idx * num_heads + (int)head_idx) * head_dim) * d_state;
+    int beta_base = ((int)batch_idx * num_heads + (int)head_idx);
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        key_shared[d] = (float)key[q_base + d];
+        query_shared[d] = (float)query[q_base + d];
+    }
+    if (tid == 0) {
+        beta_shared = (float)beta[beta_base];
+        decay_shared = (float)decay_scale[beta_base];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((int)tid >= d_state) {
+        return;
+    }
+
+    int value_idx = (int)tid;
+    float kv_dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        float scaled_state = (float)recurrent_state[state_base + d * d_state + value_idx] * decay_shared;
+        kv_dot += scaled_state * key_shared[d];
+    }
+
+    float delta = ((float)value[v_base + value_idx] - kv_dot) * beta_shared;
+    float out_val = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        int state_idx = state_base + d * d_state + value_idx;
+        float new_state_val = (float)recurrent_state[state_idx] * decay_shared + key_shared[d] * delta;
+        new_recurrent_state[state_idx] = new_state_val;
+        out_val += new_state_val * query_shared[d];
+    }
+    output[v_base + value_idx] = out_val;
+"""
+
+
+def _next_power_of_two(value: int) -> int:
+    """Return the next power of two greater than or equal to ``value``."""
+    value = max(1, int(value))
+    return 1 << (value - 1).bit_length()
+
+
+def _get_gdr_recurrent_metal_kernel():
+    """Lazily compile the recurrent gated-delta Metal kernel."""
+    global _GDR_RECURRENT_METAL_KERNEL
+    if _GDR_RECURRENT_METAL_KERNEL is None:
+        _GDR_RECURRENT_METAL_KERNEL = mx.fast.metal_kernel(
+            name="gated_delta_rule_recurrent",
+            input_names=["query", "key", "value", "beta", "decay_scale", "recurrent_state"],
+            output_names=["output", "new_recurrent_state"],
+            header=_GDR_METAL_HEADER,
+            source=_GDR_RECURRENT_METAL_SOURCE,
+        )
+    return _GDR_RECURRENT_METAL_KERNEL
+
+
+def _l2_normalize(x: mx.array, axis: int = -1, eps: float = 1e-6) -> mx.array:
     """L2-normalize ``x`` along ``axis``.
 
     Args:
@@ -95,6 +187,111 @@ def _l2_normalize(x: mx.array, axis: int = -1, eps: float = 1e-12) -> mx.array:
     return x / norm
 
 
+def _normalize_query_key(
+    query: mx.array,
+    key: mx.array,
+    *,
+    use_qk_l2norm: bool,
+    query_scale: float | None,
+    cast_to_float32: bool,
+) -> tuple[mx.array, mx.array]:
+    """Normalize and scale query/key tensors in float32."""
+    if cast_to_float32:
+        query = query.astype(mx.float32)
+        key = key.astype(mx.float32)
+    if use_qk_l2norm:
+        query = _l2_normalize(query, axis=-1)
+        key = _l2_normalize(key, axis=-1)
+    if query_scale is not None:
+        query = query * float(query_scale)
+    return query, key
+
+
+def _apply_beta(delta: mx.array, beta: mx.array) -> mx.array:
+    """Apply beta gating to the delta update."""
+    beta = beta.astype(mx.float32)
+    if beta.ndim == 2:
+        return delta * beta[:, :, None]
+    if beta.ndim == 3 and beta.shape[-1] == delta.shape[-1]:
+        return delta * beta
+    raise ValueError("beta must be shaped [batch, heads] or [batch, heads, value_dim].")
+
+
+def _decay_scale_to_state(
+    decay: mx.array | None,
+    state: mx.array,
+    *,
+    decay_is_log: bool,
+) -> mx.array | None:
+    """Broadcast decay to recurrent-state shape."""
+    if decay is None:
+        return None
+
+    decay = decay.astype(mx.float32)
+    if decay_is_log:
+        decay = mx.exp(decay)
+
+    if decay.ndim == 1 and decay.shape[0] == state.shape[1]:
+        return decay[None, :, None, None]
+    if decay.ndim == 2:
+        if decay.shape == (state.shape[0], state.shape[1]):
+            return decay[:, :, None, None]
+        if decay.shape == (state.shape[1], state.shape[2]):
+            return decay[None, :, :, None]
+    if decay.ndim == 3 and decay.shape == state.shape[:3]:
+        return decay[:, :, :, None]
+    raise ValueError("Unsupported decay shape for gated delta rule state update.")
+
+
+def _scalar_decay_scale_for_metal(
+    decay: mx.array | None,
+    *,
+    batch_size: int,
+    num_heads: int,
+    decay_is_log: bool,
+) -> mx.array | None:
+    """Return [batch, heads] decay scales when the recurrent Metal path can use them."""
+    if decay is None:
+        return mx.ones((batch_size, num_heads), dtype=mx.float32)
+
+    decay = decay.astype(mx.float32)
+    if decay_is_log:
+        decay = mx.exp(decay)
+
+    if decay.ndim == 1 and decay.shape[0] == num_heads:
+        return mx.broadcast_to(decay[None, :], (batch_size, num_heads))
+    if decay.ndim == 2 and decay.shape == (batch_size, num_heads):
+        return decay
+    return None
+
+
+def _gdr_recurrent_step_metal(
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    beta: mx.array,
+    decay_scale: mx.array,
+    recurrent_state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Metal recurrent gated-delta update for normalized float32 inputs."""
+    head_dim = int(query.shape[-1])
+    d_state = int(value.shape[-1])
+    if head_dim <= 0 or head_dim > _MAX_GDR_METAL_HEAD_DIM or d_state <= 0 or d_state > _MAX_GDR_METAL_HEAD_DIM:
+        raise ValueError("Unsupported head or state dimension for GDR Metal kernel.")
+
+    tg_size = min(_MAX_GDR_METAL_HEAD_DIM, _next_power_of_two(max(head_dim, d_state)))
+    kernel = _get_gdr_recurrent_metal_kernel()
+    output_shape = (query.shape[0], query.shape[1], value.shape[2])
+    output, new_state = kernel(
+        inputs=[query, key, value, beta, decay_scale, recurrent_state],
+        grid=(tg_size, int(query.shape[0]), int(query.shape[1])),
+        threadgroup=(tg_size, 1, 1),
+        output_shapes=[output_shape, recurrent_state.shape],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return output[:, None, :, :], new_state
+
+
 def _recurrent_step(
     query: mx.array,
     key: mx.array,
@@ -103,23 +300,32 @@ def _recurrent_step(
     decay: mx.array | None,
     recurrent_state: mx.array | None,
     use_qk_l2norm: bool = True,
+    query_scale: float | None = None,
+    decay_is_log: bool = False,
+    prefer_metal: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Single recurrent step for decode (seq_len == 1).
 
     Computes the gated delta rule update for a single token:
-        h_t = decay * h_{t-1} + beta_t * (v_t outer k_t)
-        o_t = h_t @ q_t
+        s_t = decay_t * s_{t-1}
+        delta_t = (v_t - <s_t, k_t>) * beta_t
+        s_t = s_t + k_t outer delta_t
+        o_t = s_t @ q_t
 
     Args:
         query: Query tensor ``[batch, 1, num_heads, head_dim]``.
         key: Key tensor ``[batch, 1, num_heads, head_dim]``.
         value: Value tensor ``[batch, 1, num_heads, d_state]``.
-        beta: Gating tensor ``[batch, 1, num_heads]`` (scalar per head)
-            or ``[batch, 1, num_heads, head_dim]``.
-        decay: Optional decay factors ``[num_heads, head_dim]`` or ``None``.
+        beta: Gating tensor ``[batch, 1, num_heads]`` or
+            ``[batch, 1, num_heads, d_state]``.
+        decay: Optional decay terms. Supports multiplicative decay or
+            per-token log-decay depending on ``decay_is_log``.
         recurrent_state: Previous recurrent state
             ``[batch, num_heads, head_dim, d_state]`` or ``None``.
         use_qk_l2norm: Whether to L2-normalize query and key.
+        query_scale: Optional scale applied after query normalization.
+        decay_is_log: Whether ``decay`` should be exponentiated first.
+        prefer_metal: Whether to try the recurrent Metal fast path.
 
     Returns:
         Tuple of (output ``[batch, 1, num_heads, d_state]``,
@@ -128,53 +334,53 @@ def _recurrent_step(
     batch, _, num_heads, head_dim = query.shape
     d_state = value.shape[-1]
 
-    # Squeeze the length-1 sequence dim: [B, H, D]
-    q = query[:, 0]  # [B, H, head_dim]
-    k = key[:, 0]  # [B, H, head_dim]
-    v = value[:, 0]  # [B, H, d_state]
-
-    if use_qk_l2norm:
-        q = _l2_normalize(q, axis=-1)
-        k = _l2_normalize(k, axis=-1)
-
-    # beta: [B, 1, H, ...] -> [B, H] or [B, H, head_dim]
-    b = beta[:, 0]
-    if b.ndim == 2:
-        # scalar per head: [B, H] -> [B, H, 1, 1] for broadcasting
-        b = b[:, :, None, None]
-    elif b.ndim == 3:
-        # per-dim: [B, H, head_dim] -> [B, H, head_dim, 1]
-        b = b[:, :, :, None]
-
-    # Outer product: v_t (x) k_t -> [B, H, head_dim, d_state]
-    # k: [B, H, head_dim] -> [..., head_dim, 1]
-    # v: [B, H, d_state]  -> [..., 1, d_state]
-    outer = k[:, :, :, None] * v[:, :, None, :]  # [B, H, head_dim, d_state]
-
-    # Initialize state if needed
     if recurrent_state is None:
         recurrent_state = mx.zeros(
             (batch, num_heads, head_dim, d_state),
-            dtype=query.dtype,
+            dtype=mx.float32,
         )
 
-    # State update: h_t = decay * h_{t-1} + beta * outer
-    new_state = recurrent_state
+    q, k = _normalize_query_key(
+        query[:, 0],
+        key[:, 0],
+        use_qk_l2norm=use_qk_l2norm,
+        query_scale=query_scale,
+        cast_to_float32=True,
+    )
+    v = value[:, 0].astype(mx.float32)
+    b = beta[:, 0].astype(mx.float32)
+    state = recurrent_state.astype(mx.float32)
+    decay_t = None
     if decay is not None:
-        # decay: [H, head_dim] -> [1, H, head_dim, 1]
-        d = decay[None, :, :, None]
-        new_state = d * new_state
-    new_state = new_state + b * outer
+        decay_t = decay[:, 0] if decay.ndim >= 3 else decay
 
-    # Output: o_t = h_t @ q_t -> sum over head_dim
-    # new_state: [B, H, head_dim, d_state], q: [B, H, head_dim]
-    # -> einsum "bhkd,bhk->bhd"
-    output = mx.sum(new_state * q[:, :, :, None], axis=2)  # [B, H, d_state]
+    if prefer_metal and _ENABLE_GDR_METAL and b.ndim == 2:
+        decay_scale = _scalar_decay_scale_for_metal(
+            decay_t,
+            batch_size=batch,
+            num_heads=num_heads,
+            decay_is_log=decay_is_log,
+        )
+        if decay_scale is not None:
+            try:
+                return _gdr_recurrent_step_metal(
+                    query=q,
+                    key=k,
+                    value=v,
+                    beta=b,
+                    decay_scale=decay_scale,
+                    recurrent_state=state,
+                )
+            except (RuntimeError, ValueError):
+                pass
 
-    # Restore sequence dim: [B, 1, H, d_state]
-    output = output[:, None, :, :]
-
-    return output, new_state
+    decay_scale_state = _decay_scale_to_state(decay_t, state, decay_is_log=decay_is_log)
+    scaled_state = state if decay_scale_state is None else state * decay_scale_state
+    kv_dot = mx.sum(scaled_state * k[:, :, :, None], axis=-2)
+    delta = _apply_beta(v - kv_dot, b)
+    new_state = scaled_state + k[:, :, :, None] * delta[:, :, None, :]
+    output = mx.sum(new_state * q[:, :, :, None], axis=-2)
+    return output[:, None, :, :], new_state
 
 
 def _chunked_forward(
@@ -186,6 +392,8 @@ def _chunked_forward(
     recurrent_state: mx.array | None,
     use_qk_l2norm: bool = True,
     chunk_size: int = 64,
+    query_scale: float | None = None,
+    decay_is_log: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """Chunked forward pass for prefill (seq_len > 1).
 
@@ -198,12 +406,15 @@ def _chunked_forward(
         key: Key tensor ``[batch, seq_len, num_heads, head_dim]``.
         value: Value tensor ``[batch, seq_len, num_heads, d_state]``.
         beta: Gating tensor ``[batch, seq_len, num_heads]`` or
-            ``[batch, seq_len, num_heads, head_dim]``.
-        decay: Optional decay factors ``[num_heads, head_dim]`` or ``None``.
+            ``[batch, seq_len, num_heads, d_state]``.
+        decay: Optional decay terms. Supports multiplicative decay or
+            per-token log-decay depending on ``decay_is_log``.
         recurrent_state: Optional initial state
             ``[batch, num_heads, head_dim, d_state]``.
         use_qk_l2norm: Whether to L2-normalize query and key.
         chunk_size: Number of tokens per chunk (default 64).
+        query_scale: Optional scale applied after query normalization.
+        decay_is_log: Whether ``decay`` should be exponentiated first.
 
     Returns:
         Tuple of (output ``[batch, seq_len, num_heads, d_state]``,
@@ -212,37 +423,23 @@ def _chunked_forward(
     batch, seq_len, num_heads, head_dim = query.shape
     d_state = value.shape[-1]
 
-    if use_qk_l2norm:
-        query = _l2_normalize(query, axis=-1)
-        key = _l2_normalize(key, axis=-1)
+    query, key = _normalize_query_key(
+        query,
+        key,
+        use_qk_l2norm=use_qk_l2norm,
+        query_scale=query_scale,
+        cast_to_float32=False,
+    )
 
-    # Prepare beta shape
-    if beta.ndim == 3:
-        # [B, T, H] -> [B, T, H, 1, 1] for broadcasting with outer product
-        beta_expanded = beta[:, :, :, None, None]
-    else:
-        # [B, T, H, head_dim] -> [B, T, H, head_dim, 1]
-        beta_expanded = beta[:, :, :, :, None]
-
-    # Prepare decay
-    if decay is not None:
-        # [H, head_dim] -> [1, H, head_dim, 1]
-        decay_bcast = decay[None, :, :, None]
-    else:
-        decay_bcast = None
-
-    # Initialize state
     if recurrent_state is None:
         state = mx.zeros(
             (batch, num_heads, head_dim, d_state),
-            dtype=query.dtype,
+            dtype=mx.float32,
         )
     else:
-        state = recurrent_state
+        state = recurrent_state.astype(mx.float32)
 
-    # Collect outputs for all chunks
     output_chunks: list[mx.array] = []
-
     num_chunks = math.ceil(seq_len / chunk_size)
     for c in range(num_chunks):
         start = c * chunk_size
@@ -252,40 +449,28 @@ def _chunked_forward(
         q_c = query[:, start:end]  # [B, chunk_len, H, head_dim]
         k_c = key[:, start:end]
         v_c = value[:, start:end]
-        b_c = beta_expanded[:, start:end]
-
-        # Sequential scan within the chunk
         chunk_outputs: list[mx.array] = []
         for t in range(chunk_len):
-            k_t = k_c[:, t]  # [B, H, head_dim]
-            v_t = v_c[:, t]  # [B, H, d_state]
-            q_t = q_c[:, t]  # [B, H, head_dim]
+            q_t = q_c[:, t].astype(mx.float32)
+            k_t = k_c[:, t].astype(mx.float32)
+            v_t = v_c[:, t].astype(mx.float32)
+            b_t = beta[:, start + t].astype(mx.float32)
+            d_t = None
+            if decay is not None:
+                d_t = decay[:, start + t] if decay.ndim >= 3 else decay
 
-            # beta for this timestep
-            if beta.ndim == 3:
-                b_t = b_c[:, t]  # [B, H, 1, 1]
-            else:
-                b_t = b_c[:, t]  # [B, H, head_dim, 1]
-
-            # Outer product: [B, H, head_dim, d_state]
-            outer = k_t[:, :, :, None] * v_t[:, :, None, :]
-
-            # State update
-            if decay_bcast is not None:
-                state = decay_bcast * state
-            state = state + b_t * outer
-
-            # Output: sum over head_dim
-            o_t = mx.sum(state * q_t[:, :, :, None], axis=2)  # [B, H, d_state]
+            decay_scale_state = _decay_scale_to_state(d_t, state, decay_is_log=decay_is_log)
+            scaled_state = state if decay_scale_state is None else state * decay_scale_state
+            kv_dot = mx.sum(scaled_state * k_t[:, :, :, None], axis=-2)
+            delta = _apply_beta(v_t - kv_dot, b_t)
+            state = scaled_state + k_t[:, :, :, None] * delta[:, :, None, :]
+            o_t = mx.sum(state * q_t[:, :, :, None], axis=-2)
             chunk_outputs.append(o_t)
 
-        # Stack chunk outputs: [B, chunk_len, H, d_state]
         chunk_out = mx.stack(chunk_outputs, axis=1)
         output_chunks.append(chunk_out)
 
-    # Concatenate all chunks: [B, seq_len, H, d_state]
     output = mx.concatenate(output_chunks, axis=1)
-
     return output, state
 
 
@@ -303,13 +488,15 @@ class GatedDeltaRuleOp(BaseOperation):
 
     The state update rule is::
 
-        h_t = decay * h_{t-1} + beta_t * (v_t outer k_t)
-        o_t = h_t @ q_t
+        s_t = decay_t * s_{t-1}
+        delta_t = (v_t - <s_t, k_t>) * beta_t
+        s_t = s_t + (k_t outer delta_t)
+        o_t = s_t @ q_t
 
     Where:
         - ``beta_t`` is a learned gating signal.
-        - ``decay`` is an optional forgetting factor.
-        - ``v_t outer k_t`` is the outer product.
+        - ``decay_t`` is an optional forgetting factor.
+        - ``k_t outer delta_t`` is the rank-1 state update.
 
     Registered under the names ``"gated_delta_rule"`` and ``"gdr"``.
 
@@ -367,6 +554,9 @@ class GatedDeltaRuleOp(BaseOperation):
         recurrent_state: mx.array | None = None,
         use_qk_l2norm: bool = True,
         chunk_size: int = 64,
+        query_scale: float | None = None,
+        decay_is_log: bool = False,
+        prefer_metal: bool = True,
         **kwargs: tp.Any,
     ) -> GatedDeltaRuleOutput:
         """Forward pass for gated delta rule attention.
@@ -380,8 +570,9 @@ class GatedDeltaRuleOp(BaseOperation):
             value: Value tensor ``[batch, seq_len, num_heads, d_state]``.
             beta: Gating tensor. Shape is either
                 ``[batch, seq_len, num_heads]`` (scalar gate per head) or
-                ``[batch, seq_len, num_heads, head_dim]`` (per-dim gate).
-            decay: Optional decay factors ``[num_heads, head_dim]``.
+                ``[batch, seq_len, num_heads, d_state]`` (per-value gate).
+            decay: Optional decay terms. Supports per-token scalar decay
+                for Qwen-style GDR or multiplicative broadcast decay.
             conv_state: Optional convolution state passed through for
                 external conv management ``[batch, d_inner, d_conv]``.
             recurrent_state: Optional recurrent state
@@ -389,6 +580,12 @@ class GatedDeltaRuleOp(BaseOperation):
             use_qk_l2norm: Whether to L2-normalize query and key
                 (default ``True``).
             chunk_size: Chunk size for prefill mode (default 64).
+            query_scale: Optional scale applied after query
+                normalization.
+            decay_is_log: Whether ``decay`` should be exponentiated before
+                applying it to the recurrent state.
+            prefer_metal: Whether to try the recurrent Metal fast path for
+                decode.
             **kwargs: Additional keyword arguments (ignored).
 
         Returns:
@@ -428,6 +625,9 @@ class GatedDeltaRuleOp(BaseOperation):
                 decay=decay,
                 recurrent_state=recurrent_state,
                 use_qk_l2norm=use_qk_l2norm,
+                query_scale=query_scale,
+                decay_is_log=decay_is_log,
+                prefer_metal=prefer_metal,
             )
         else:
             outputs, new_recurrent_state = _chunked_forward(
@@ -439,6 +639,8 @@ class GatedDeltaRuleOp(BaseOperation):
                 recurrent_state=recurrent_state,
                 use_qk_l2norm=use_qk_l2norm,
                 chunk_size=chunk_size,
+                query_scale=query_scale,
+                decay_is_log=decay_is_log,
             )
 
         return GatedDeltaRuleOutput(
@@ -459,6 +661,9 @@ class GatedDeltaRuleOp(BaseOperation):
         recurrent_state: mx.array | None = None,
         use_qk_l2norm: bool = True,
         chunk_size: int = 64,
+        query_scale: float | None = None,
+        decay_is_log: bool = False,
+        prefer_metal: bool = True,
         **kwargs: tp.Any,
     ) -> GatedDeltaRuleOutput:
         """Execute the gated delta rule operation.
@@ -475,6 +680,12 @@ class GatedDeltaRuleOp(BaseOperation):
             recurrent_state: Optional recurrent state.
             use_qk_l2norm: Whether to L2-normalize query and key.
             chunk_size: Chunk size for prefill mode.
+            query_scale: Optional scale applied after query
+                normalization.
+            decay_is_log: Whether ``decay`` should be exponentiated before
+                applying it to the recurrent state.
+            prefer_metal: Whether to try the recurrent Metal fast path for
+                decode.
             **kwargs: Additional keyword arguments forwarded.
 
         Returns:
@@ -491,6 +702,9 @@ class GatedDeltaRuleOp(BaseOperation):
             recurrent_state=recurrent_state,
             use_qk_l2norm=use_qk_l2norm,
             chunk_size=chunk_size,
+            query_scale=query_scale,
+            decay_is_log=decay_is_log,
+            prefer_metal=prefer_metal,
             **kwargs,
         )
 
