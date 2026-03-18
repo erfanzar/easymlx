@@ -1,0 +1,103 @@
+[project]
+name = "easymlx"
+version = "0.0.1"
+description = "Inference Only version of EasyDeL on Metal accelerators"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.135.1",
+    "mlx>=0.31.1",
+    "pydantic>=2.12.5",
+    "transformers>=4.57.3",
+]
+
+
+[project.optional-dependencies]
+server = ["fastapi>=0.100.0"]
+tests = ["fastapi>=0.100.0"]
+
+[tool.uv.build-backend]
+module-name = "easymlx"
+module-root = "."
+
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+"easymlx" = ["py.typed"]
+
+
+[tool.black]
+line-length = 121
+target-version = ["py313"]
+preview = true
+
+[tool.ruff]
+line-length = 121
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
+ignore = [
+    "F722",   # Forward annotations needed for jaxtyping
+    "B008",   # Do not perform function calls in argument defaults
+    "UP015",  # Unnecessary open mode
+    "A005",   # Module-level shadowing
+    "UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
+    "E501",   # Line too long (handled by formatter)
+    "RUF001", # Ruff's own complexity check - handled by other tools
+    "RUF002", # Ruff's own complexity check - handled by other tools
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402", "F401"]
+"**/modeling_*.py" = ["UP037", "F821"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+exclude = ["easymlx/"]
+
+[tool.basedpyright]
+reportAssignmentType = "none"
+reportUnknownVariableType = "none"
+reportPrivateUsage = "none"
+reportOptionalCall = "none"
+reportUnknownMemberType = "none"
+reportGeneralTypeIssues = "none"
+reportArgumentType = "none"
+enableTypeIgnoreComments = true
+reportMissingTypeArgument = "none"
+reportUnknownParameterType = "none"
+reportAny = "none"
+reportCallIssue = "none"
+reportUnknownArgumentType = "none"
+reportRedeclaration = "none"
+reportIgnoreCommentWithoutRule = "none"
+reportUnnecessaryIsInstance = "none"
+reportUnusedCallResult = "none"
+reportUnknownLambdaType = "none"
+reportUnannotatedClassAttribute = "none"
+reportImplicitStringConcatenation = "none"
+reportMissingParameterType = "none"
+reportImplicitOverride = "none"
+reportImplicitAbstractClass = "none"
+reportExplicitAny = "none"
+reportIncompatibleMethodOverride = "none"
+reportIndexIssue = "none"
+reportAttributeAccessIssue = "none"
+reportUnreachable = "none"
+reportOptionalMemberAccess = "none"
+reportOperatorIssue = "none"
+reportUninitializedInstanceVariable = "none"
+reportIncompatibleVariableOverride = "none"
+reportPrivateImportUsage = "none"
+reportUnusedParameter = "none"
+
+[tool.pytest.ini_options]
+markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

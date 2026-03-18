@@ -1,0 +1,13 @@
+/* EasyMLX custom styles */
+
+:root {
+    --pst-font-size-base: 16px;
+}
+
+.highlight pre {
+    border-radius: 6px;
+}
+
+dt {
+    font-weight: 600;
+}
