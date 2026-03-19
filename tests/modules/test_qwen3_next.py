@@ -22,8 +22,8 @@ from easymlx.modules.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
 from easymlx.modules.qwen3_next.modeling_qwen3_next import Qwen3NextLinearAttention
 from easymlx.operations.kernels.gated_delta_rule import (
     _gdr_chunked_forward_metal,
-    _gdr_recurrent_step_metal_fused_logdecay,
     _gdr_recurrent_step_metal,
+    _gdr_recurrent_step_metal_fused_logdecay,
     _l2_normalize,
 )
 
@@ -99,7 +99,7 @@ class TestQwen3Next:
         attn.reset_state(batch_size=1)
         assert mx.issubdtype(attn._conv_state.dtype, mx.floating)
 
-        hidden_states = mx.array(np.random.standard_normal((1, 1, config.hidden_size)).astype(np.float16))
+        hidden_states = mx.array(np.random.default_rng(42).standard_normal((1, 1, config.hidden_size)).astype(np.float16))
         output = attn(hidden_states)
         mx.eval(output)
 
@@ -142,7 +142,7 @@ class TestQwen3Next:
         dummy_op = _DummyDecodeOp()
         attn.gdr_op = dummy_op
 
-        hidden_states = mx.array(np.random.standard_normal((1, 1, config.hidden_size)).astype(np.float16))
+        hidden_states = mx.array(np.random.default_rng(42).standard_normal((1, 1, config.hidden_size)).astype(np.float16))
         output = attn(hidden_states)
         mx.eval(output, attn._recurrent_state)
 
