@@ -22,6 +22,7 @@ from easymlx.modules.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
 from easymlx.modules.qwen3_next.modeling_qwen3_next import Qwen3NextLinearAttention
 from easymlx.operations.kernels.gated_delta_rule import (
     _gdr_chunked_forward_metal,
+    _gdr_recurrent_step_metal_fused_logdecay,
     _gdr_recurrent_step_metal,
     _l2_normalize,
 )
@@ -105,6 +106,53 @@ class TestQwen3Next:
         assert mx.issubdtype(output.dtype, mx.floating)
         assert output.shape == hidden_states.shape
 
+    def test_linear_attention_decode_uses_step_decode(self):
+        """Single-token decode should bypass the generic GDR wrapper path."""
+        config = Qwen3NextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            max_position_embeddings=128,
+            head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+        )
+        attn = Qwen3NextLinearAttention(config)
+        attn.reset_state(batch_size=1)
+
+        class _DummyDecodeOp:
+            def __init__(self):
+                self.called = False
+
+            def step_decode(self, *, query, key, value, beta, decay=None, recurrent_state=None, **_kwargs):
+                self.called = True
+                batch_size, seq_len, num_heads, head_dim = query.shape
+                value_dim = value.shape[-1]
+                next_state = mx.ones((batch_size, num_heads, head_dim, value_dim), dtype=mx.float32)
+                return mx.zeros((batch_size, seq_len, num_heads, value_dim), dtype=mx.float32), next_state
+
+            def __call__(self, *args, **kwargs):
+                raise AssertionError("decode path should use step_decode")
+
+        dummy_op = _DummyDecodeOp()
+        attn.gdr_op = dummy_op
+
+        hidden_states = mx.array(np.random.standard_normal((1, 1, config.hidden_size)).astype(np.float16))
+        output = attn(hidden_states)
+        mx.eval(output, attn._recurrent_state)
+
+        assert dummy_op.called is True
+        assert output.shape == hidden_states.shape
+        np.testing.assert_allclose(
+            np.asarray(attn._recurrent_state),
+            np.ones((1, config.linear_num_key_heads, config.linear_key_head_dim, config.linear_value_head_dim)),
+        )
+
     def test_gdr_recurrent_metal_matches_math(self):
         """The Metal recurrent GDR step should match the reference math."""
         rng = np.random.default_rng(0)
@@ -141,6 +189,48 @@ class TestQwen3Next:
             )
         except RuntimeError as exc:
             pytest.skip(f"Metal recurrent GDR kernel unavailable: {exc}")
+
+        np.testing.assert_allclose(np.asarray(actual_output), np.asarray(expected_output), atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(np.asarray(actual_state), np.asarray(expected_state), atol=1e-5, rtol=1e-5)
+
+    def test_gdr_recurrent_fused_logdecay_metal_matches_math(self):
+        """The fused recurrent GDR kernel should match the reference math."""
+        rng = np.random.default_rng(7)
+        batch = 2
+        num_heads = 3
+        head_dim = 8
+        d_state = 8
+
+        query = mx.array(rng.standard_normal((batch, num_heads, head_dim)).astype(np.float32))
+        key = mx.array(rng.standard_normal((batch, num_heads, head_dim)).astype(np.float32))
+        value = mx.array(rng.standard_normal((batch, num_heads, d_state)).astype(np.float32))
+        beta = mx.array(rng.standard_normal((batch, num_heads)).astype(np.float32))
+        log_decay = mx.array(rng.standard_normal((batch, num_heads)).astype(np.float32))
+        recurrent_state = mx.array(rng.standard_normal((batch, num_heads, head_dim, d_state)).astype(np.float32))
+
+        query_scale = head_dim**-0.5
+        query_n = _l2_normalize(query.astype(mx.float32)) * query_scale
+        key_n = _l2_normalize(key.astype(mx.float32))
+        decay_scale = mx.exp(log_decay.astype(mx.float32))
+
+        state_scaled = recurrent_state.astype(mx.float32) * decay_scale[:, :, None, None]
+        kv_dot = mx.sum(state_scaled * key_n[:, :, :, None], axis=-2)
+        delta = (value.astype(mx.float32) - kv_dot) * beta.astype(mx.float32)[:, :, None]
+        expected_state = state_scaled + key_n[:, :, :, None] * delta[:, :, None, :]
+        expected_output = mx.sum(expected_state * query_n[:, :, :, None], axis=-2)[:, None, :, :]
+
+        try:
+            actual_output, actual_state = _gdr_recurrent_step_metal_fused_logdecay(
+                query=query.astype(mx.float32),
+                key=key.astype(mx.float32),
+                value=value.astype(mx.float32),
+                beta=beta.astype(mx.float32),
+                log_decay=log_decay.astype(mx.float32),
+                query_scale=query_scale,
+                recurrent_state=recurrent_state.astype(mx.float32),
+            )
+        except RuntimeError as exc:
+            pytest.skip(f"Metal fused recurrent GDR kernel unavailable: {exc}")
 
         np.testing.assert_allclose(np.asarray(actual_output), np.asarray(expected_output), atol=1e-5, rtol=1e-5)
         np.testing.assert_allclose(np.asarray(actual_state), np.asarray(expected_state), atol=1e-5, rtol=1e-5)

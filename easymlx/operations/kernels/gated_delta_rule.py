@@ -52,6 +52,7 @@ from __future__ import annotations
 import math
 import typing as tp
 from dataclasses import dataclass
+from functools import lru_cache
 
 import mlx.core as mx
 
@@ -123,6 +124,95 @@ _GDR_RECURRENT_METAL_SOURCE = r"""
     if (tid == 0) {
         beta_shared = (float)beta[beta_base];
         decay_shared = (float)decay_scale[beta_base];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if ((int)tid >= d_state) {
+        return;
+    }
+
+    int value_idx = (int)tid;
+    float kv_dot = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        float scaled_state = (float)recurrent_state[state_base + d * d_state + value_idx] * decay_shared;
+        kv_dot += scaled_state * key_shared[d];
+    }
+
+    float delta = ((float)value[v_base + value_idx] - kv_dot) * beta_shared;
+    float out_val = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        int state_idx = state_base + d * d_state + value_idx;
+        float new_state_val = (float)recurrent_state[state_idx] * decay_shared + key_shared[d] * delta;
+        new_recurrent_state[state_idx] = new_state_val;
+        out_val += new_state_val * query_shared[d];
+    }
+    output[v_base + value_idx] = out_val;
+"""
+
+_GDR_RECURRENT_FUSED_LOGDECAY_METAL_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint batch_idx = threadgroup_position_in_grid.y;
+    uint head_idx = threadgroup_position_in_grid.z;
+    uint tg_size = threads_per_threadgroup.x;
+
+    int batch = query_shape[0];
+    int num_heads = query_shape[1];
+    int head_dim = query_shape[2];
+    int d_state = value_shape[2];
+    if (head_dim <= 0 || d_state <= 0) {
+        return;
+    }
+    if ((int)batch_idx >= batch || (int)head_idx >= num_heads) {
+        return;
+    }
+
+    threadgroup float key_shared[128];
+    threadgroup float query_shared[128];
+    threadgroup float query_norm_sums[128];
+    threadgroup float key_norm_sums[128];
+    threadgroup float beta_shared;
+    threadgroup float decay_shared;
+    threadgroup float query_scale_shared;
+    threadgroup float key_scale_shared;
+
+    int q_base = ((int)batch_idx * num_heads + (int)head_idx) * head_dim;
+    int v_base = ((int)batch_idx * num_heads + (int)head_idx) * d_state;
+    int state_base = (((int)batch_idx * num_heads + (int)head_idx) * head_dim) * d_state;
+    int beta_base = ((int)batch_idx * num_heads + (int)head_idx);
+
+    float query_sq = 0.0f;
+    float key_sq = 0.0f;
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        float q_val = (float)query[q_base + d];
+        float k_val = (float)key[q_base + d];
+        query_shared[d] = q_val;
+        key_shared[d] = k_val;
+        query_sq += q_val * q_val;
+        key_sq += k_val * k_val;
+    }
+    query_norm_sums[tid] = query_sq;
+    key_norm_sums[tid] = key_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = tg_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            query_norm_sums[tid] += query_norm_sums[tid + stride];
+            key_norm_sums[tid] += key_norm_sums[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        beta_shared = (float)beta[beta_base];
+        decay_shared = exp((float)log_decay[beta_base]);
+        query_scale_shared = (float)query_scale[0] * rsqrt(query_norm_sums[0] + 1e-6f);
+        key_scale_shared = rsqrt(key_norm_sums[0] + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+        query_shared[d] *= query_scale_shared;
+        key_shared[d] *= key_scale_shared;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -232,6 +322,14 @@ _GDR_RECURRENT_METAL_KERNEL = mx.fast.metal_kernel(
     source=_GDR_RECURRENT_METAL_SOURCE,
 )
 
+_GDR_RECURRENT_FUSED_LOGDECAY_METAL_KERNEL = mx.fast.metal_kernel(
+    name="gated_delta_rule_recurrent_fused_logdecay",
+    input_names=["query", "key", "value", "beta", "log_decay", "query_scale", "recurrent_state"],
+    output_names=["output", "new_recurrent_state"],
+    header=_GDR_METAL_HEADER,
+    source=_GDR_RECURRENT_FUSED_LOGDECAY_METAL_SOURCE,
+)
+
 _GDR_CHUNKED_METAL_KERNEL = mx.fast.metal_kernel(
     name="gated_delta_rule_chunked",
     input_names=["query", "key", "value", "beta", "decay_scale", "recurrent_state"],
@@ -254,6 +352,12 @@ def _l2_normalize(x: mx.array, axis: int = -1, eps: float = 1e-6) -> mx.array:
     """
     norm = mx.sqrt(mx.sum(x * x, axis=axis, keepdims=True) + eps)
     return x / norm
+
+
+@lru_cache(maxsize=32)
+def _float32_scalar_ptr(value: float) -> mx.array:
+    """Return a cached 1-element float32 MLX array."""
+    return mx.array([float(value)], dtype=mx.float32)
 
 
 def _normalize_query_key(
@@ -334,6 +438,24 @@ def _scalar_decay_scale_for_metal(
     return None
 
 
+def _scalar_log_decay_for_metal(
+    decay: mx.array | None,
+    *,
+    batch_size: int,
+    num_heads: int,
+) -> mx.array | None:
+    """Return raw log-decay terms for the fused recurrent Metal path."""
+    if decay is None:
+        return mx.zeros((batch_size, num_heads), dtype=mx.float32)
+
+    decay = decay.astype(mx.float32)
+    if decay.ndim == 1 and decay.shape[0] == num_heads:
+        return mx.broadcast_to(decay[None, :], (batch_size, num_heads))
+    if decay.ndim == 2 and decay.shape == (batch_size, num_heads):
+        return decay
+    return None
+
+
 def _scalar_token_decay_scale_for_metal(
     decay: mx.array | None,
     *,
@@ -381,6 +503,33 @@ def _gdr_recurrent_step_metal(
     output_shape = (query.shape[0], query.shape[1], value.shape[2])
     output, new_state = kernel(
         inputs=[query, key, value, beta, decay_scale, recurrent_state],
+        grid=(tg_size, int(query.shape[0]), int(query.shape[1])),
+        threadgroup=(tg_size, 1, 1),
+        output_shapes=[output_shape, recurrent_state.shape],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return output[:, None, :, :], new_state
+
+
+def _gdr_recurrent_step_metal_fused_logdecay(
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    beta: mx.array,
+    log_decay: mx.array,
+    query_scale: float,
+    recurrent_state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Metal recurrent gated-delta update with fused q/k norm and log-decay exp."""
+    head_dim = int(query.shape[-1])
+    d_state = int(value.shape[-1])
+    if head_dim <= 0 or head_dim > _MAX_GDR_METAL_HEAD_DIM or d_state <= 0 or d_state > _MAX_GDR_METAL_HEAD_DIM:
+        raise ValueError("Unsupported head or state dimension for fused GDR Metal kernel.")
+
+    tg_size = min(_MAX_GDR_METAL_HEAD_DIM, _next_power_of_two(max(head_dim, d_state)))
+    output_shape = (query.shape[0], query.shape[1], value.shape[2])
+    output, new_state = _GDR_RECURRENT_FUSED_LOGDECAY_METAL_KERNEL(
+        inputs=[query, key, value, beta, log_decay, _float32_scalar_ptr(float(query_scale)), recurrent_state],
         grid=(tg_size, int(query.shape[0]), int(query.shape[1])),
         threadgroup=(tg_size, 1, 1),
         output_shapes=[output_shape, recurrent_state.shape],
@@ -464,13 +613,8 @@ def _recurrent_step(
             dtype=mx.float32,
         )
 
-    q, k = _normalize_query_key(
-        query[:, 0],
-        key[:, 0],
-        use_qk_l2norm=use_qk_l2norm,
-        query_scale=query_scale,
-        cast_to_float32=True,
-    )
+    q_raw = query[:, 0]
+    k_raw = key[:, 0]
     v = value[:, 0].astype(mx.float32)
     b = beta[:, 0].astype(mx.float32)
     state = recurrent_state.astype(mx.float32)
@@ -479,6 +623,33 @@ def _recurrent_step(
         decay_t = decay[:, 0] if decay.ndim >= 3 else decay
 
     if prefer_metal and b.ndim == 2:
+        if use_qk_l2norm and query_scale is not None and decay_is_log:
+            log_decay = _scalar_log_decay_for_metal(
+                decay_t,
+                batch_size=batch,
+                num_heads=num_heads,
+            )
+            if log_decay is not None:
+                try:
+                    return _gdr_recurrent_step_metal_fused_logdecay(
+                        query=q_raw,
+                        key=k_raw,
+                        value=v,
+                        beta=b,
+                        log_decay=log_decay,
+                        query_scale=float(query_scale),
+                        recurrent_state=state,
+                    )
+                except (RuntimeError, ValueError):
+                    pass
+
+        q, k = _normalize_query_key(
+            q_raw,
+            k_raw,
+            use_qk_l2norm=use_qk_l2norm,
+            query_scale=query_scale,
+            cast_to_float32=True,
+        )
         decay_scale = _scalar_decay_scale_for_metal(
             decay_t,
             batch_size=batch,
@@ -497,6 +668,14 @@ def _recurrent_step(
                 )
             except (RuntimeError, ValueError):
                 pass
+    else:
+        q, k = _normalize_query_key(
+            q_raw,
+            k_raw,
+            use_qk_l2norm=use_qk_l2norm,
+            query_scale=query_scale,
+            cast_to_float32=True,
+        )
 
     decay_scale_state = _decay_scale_to_state(decay_t, state, decay_is_log=decay_is_log)
     scaled_state = state if decay_scale_state is None else state * decay_scale_state
@@ -779,7 +958,7 @@ class GatedDeltaRuleOp(BaseOperation):
         is_inference = seq_len == 1
 
         if is_inference:
-            outputs, new_recurrent_state = _recurrent_step(
+            outputs, new_recurrent_state = self._step_decode_prepared(
                 query=query,
                 key=key,
                 value=value,
@@ -811,6 +990,103 @@ class GatedDeltaRuleOp(BaseOperation):
             attention_weights=None,
             conv_state=conv_state,
             recurrent_state=new_recurrent_state,
+        )
+
+    @staticmethod
+    def _step_decode_prepared(
+        *,
+        query: mx.array,
+        key: mx.array,
+        value: mx.array,
+        beta: mx.array,
+        decay: mx.array | None,
+        recurrent_state: mx.array | None,
+        use_qk_l2norm: bool,
+        query_scale: float | None,
+        decay_is_log: bool,
+        prefer_metal: bool,
+    ) -> tuple[mx.array, mx.array]:
+        """Run the recurrent decode math assuming inputs are already coerced."""
+        if int(query.shape[1]) != 1:
+            raise ValueError("step_decode expects seq_len == 1.")
+        return _recurrent_step(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            recurrent_state=recurrent_state,
+            use_qk_l2norm=use_qk_l2norm,
+            query_scale=query_scale,
+            decay_is_log=decay_is_log,
+            prefer_metal=prefer_metal,
+        )
+
+    def step_decode(
+        self,
+        query: mx.array,
+        key: mx.array,
+        value: mx.array,
+        beta: mx.array,
+        decay: mx.array | None = None,
+        recurrent_state: mx.array | None = None,
+        use_qk_l2norm: bool = True,
+        query_scale: float | None = None,
+        decay_is_log: bool = False,
+        prefer_metal: bool | None = None,
+    ) -> tuple[mx.array, mx.array]:
+        """Run the recurrent single-token decode step without output wrapping.
+
+        Args:
+            query: Query tensor ``[batch, 1, num_heads, head_dim]``.
+            key: Key tensor ``[batch, 1, num_heads, head_dim]``.
+            value: Value tensor ``[batch, 1, num_heads, d_state]``.
+            beta: Gating tensor ``[batch, 1, num_heads]`` or
+                ``[batch, 1, num_heads, d_state]``.
+            decay: Optional decay factors for the recurrent state.
+            recurrent_state: Previous recurrent state.
+            use_qk_l2norm: Whether to L2-normalize query and key.
+            query_scale: Optional query scale after normalization.
+            decay_is_log: Whether ``decay`` should be exponentiated first.
+            prefer_metal: Whether to prefer the Metal recurrent kernel.
+
+        Returns:
+            Tuple ``(outputs, recurrent_state)`` for the decode step.
+        """
+        if prefer_metal is None:
+            prefer_metal = self.use_metal
+
+        runtime_dtype = mx.float32
+        if self.metadata is not None and self.metadata.runtime_dtype is not None:
+            runtime_dtype = self.metadata.runtime_dtype
+
+        query = query.astype(runtime_dtype)
+        key = key.astype(runtime_dtype)
+        value = value.astype(runtime_dtype)
+        beta = beta.astype(runtime_dtype)
+
+        if beta.ndim == 4 and beta.shape[-1] == 1:
+            beta = beta[..., 0]
+
+        if decay is not None:
+            decay = decay.astype(runtime_dtype)
+            if decay.ndim == 4 and decay.shape[-1] == 1:
+                decay = decay[..., 0]
+
+        if recurrent_state is not None:
+            recurrent_state = recurrent_state.astype(runtime_dtype)
+
+        return self._step_decode_prepared(
+            query=query,
+            key=key,
+            value=value,
+            beta=beta,
+            decay=decay,
+            recurrent_state=recurrent_state,
+            use_qk_l2norm=use_qk_l2norm,
+            query_scale=query_scale,
+            decay_is_log=decay_is_log,
+            prefer_metal=prefer_metal,
         )
 
     def __call__(

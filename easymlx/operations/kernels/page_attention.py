@@ -2435,7 +2435,9 @@ def paged_attention(
         kernel = (
             _METAL_DECODE_HEAD256_KERNEL
             if use_head256_decode
-            else _METAL_DECODE_KERNEL if decode_fast_path else _METAL_KERNEL
+            else _METAL_DECODE_KERNEL
+            if decode_fast_path
+            else _METAL_KERNEL
         )
         block_tables = _ensure_mx_array(block_tables, dtype=mx.int32)
         kv_lens = _ensure_mx_array(kv_lens, dtype=mx.int32)

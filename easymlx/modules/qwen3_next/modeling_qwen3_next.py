@@ -86,6 +86,11 @@ def _resolve_module_activation_dtype(module: nn.Module, fallback: mx.Dtype) -> m
     return mx.float16
 
 
+def sanitize_qwen3_next_projection_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Return Qwen3-Next weights unchanged."""
+    return weights
+
+
 class Qwen3NextRMSNorm(nn.Module):
     """RMSNorm with ``(1 + weight)`` scaling.
 
@@ -311,7 +316,9 @@ def _shift_conv_state_left(conv_state: mx.array, new_value: mx.array) -> mx.arra
 
 def _manual_depthwise_conv(conv_state: mx.array, kernel: mx.array) -> mx.array:
     """Single-step depthwise conv from cached state: sum(state * kernel, axis=-1) then silu."""
-    return nn.silu(mx.sum(conv_state.astype(mx.float32) * kernel[None, :, :].astype(mx.float32), axis=-1))
+    state = conv_state if conv_state.dtype == mx.float32 else conv_state.astype(mx.float32)
+    kernel = kernel if kernel.dtype == mx.float32 else kernel.astype(mx.float32)
+    return nn.silu(mx.sum(state * kernel[None, :, :], axis=-1))
 
 
 class Qwen3NextLinearAttention(nn.Module):
@@ -361,6 +368,8 @@ class Qwen3NextLinearAttention(nn.Module):
         self.out_proj = nn.Linear(self.conv_value_dim, config.hidden_size, bias=False)
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.gdr_op = GatedDeltaRuleOp()
+        self._decode_query_scale = float(self.head_k_dim**-0.5)
+        self._decode_identity_conv_kernel = mx.ones((self.conv_dim, self.d_conv), dtype=mx.float32)
 
         conv_cls = getattr(nn, "Conv1d", None)
         self.conv1d = None
@@ -378,6 +387,30 @@ class Qwen3NextLinearAttention(nn.Module):
 
         self._conv_state: mx.array | None = None
         self._recurrent_state: mx.array | None = None
+        self._decode_decay_base: mx.array | None = None
+        self._decode_dt_bias: mx.array | None = None
+        self._decode_conv_kernel: mx.array | None = None
+
+    def _refresh_decode_cache(self) -> None:
+        """Refresh decode-only tensors that stay constant within a generation."""
+        self._decode_decay_base = -mx.exp(self.A_log.astype(mx.float32))
+        self._decode_dt_bias = self.dt_bias.astype(mx.float32)
+        if self.conv1d is None:
+            self._decode_conv_kernel = self._decode_identity_conv_kernel
+            return
+        kernel = self.conv1d.weight.squeeze(-1)
+        if kernel.dtype != mx.float32:
+            kernel = kernel.astype(mx.float32)
+        self._decode_conv_kernel = kernel
+
+    def _ensure_decode_cache(self) -> tuple[mx.array, mx.array, mx.array]:
+        """Return cached decode invariants, refreshing them if needed."""
+        if self._decode_decay_base is None or self._decode_dt_bias is None or self._decode_conv_kernel is None:
+            self._refresh_decode_cache()
+        assert self._decode_decay_base is not None
+        assert self._decode_dt_bias is not None
+        assert self._decode_conv_kernel is not None
+        return self._decode_decay_base, self._decode_dt_bias, self._decode_conv_kernel
 
     def reset_state(self, batch_size: int = 1):
         """Reset conv and recurrent states for a new generation."""
@@ -390,6 +423,7 @@ class Qwen3NextLinearAttention(nn.Module):
             (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
             dtype=mx.float32,
         )
+        self._refresh_decode_cache()
 
     def __call__(
         self,
@@ -431,18 +465,18 @@ class Qwen3NextLinearAttention(nn.Module):
         alpha_raw = self.in_proj_a(hidden_states)
 
         conv_input = qkv
-
-        A = -mx.exp(self.A_log.astype(mx.float32))
-        alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
-        decay = A * nn.softplus(alpha_biased)
         beta = mx.sigmoid(beta_raw.astype(mx.float32))
 
         if is_decode and self._conv_state is not None:
+            decode_decay_base, decode_dt_bias, decode_conv_kernel = self._ensure_decode_cache()
+            alpha_biased = alpha_raw.astype(mx.float32) + decode_dt_bias
+            decay = decode_decay_base * nn.softplus(alpha_biased)
             conv_x = conv_input[:, 0, :]
             self._conv_state = _shift_conv_state_left(self._conv_state, conv_x)
-            kernel = self.conv1d.weight.squeeze(-1) if self.conv1d is not None else mx.ones((self.conv_dim, self.d_conv))
-            conv_out = _manual_depthwise_conv(self._conv_state, kernel)[:, None, :]
+            conv_out = _manual_depthwise_conv(self._conv_state, decode_conv_kernel)[:, None, :]
         elif self.conv1d is not None:
+            alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
+            decay = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(alpha_biased)
             padded = mx.pad(conv_input, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
             conv_out = nn.silu(self.conv1d(padded))
             if seq_len >= self.d_conv:
@@ -460,6 +494,8 @@ class Qwen3NextLinearAttention(nn.Module):
                     axis=-1,
                 )
         else:
+            alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
+            decay = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(alpha_biased)
             conv_out = conv_input
 
         if conv_out.dtype != mx.float32:
@@ -471,20 +507,34 @@ class Qwen3NextLinearAttention(nn.Module):
         )
         value = conv_out[:, :, self.key_dim * 2 :].reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
 
-        gdr_output = self.gdr_op(
-            query=query,
-            key=key,
-            value=value,
-            beta=beta,
-            decay=decay,
-            recurrent_state=self._recurrent_state,
-            use_qk_l2norm=True,
-            query_scale=self.head_k_dim**-0.5,
-            decay_is_log=True,
-            prefer_metal=True,
-        )
-        output = gdr_output.attention_outputs
-        self._recurrent_state = gdr_output.recurrent_state
+        if is_decode:
+            output, self._recurrent_state = self.gdr_op.step_decode(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=self._recurrent_state,
+                use_qk_l2norm=True,
+                query_scale=self._decode_query_scale,
+                decay_is_log=True,
+                prefer_metal=True,
+            )
+        else:
+            gdr_output = self.gdr_op(
+                query=query,
+                key=key,
+                value=value,
+                beta=beta,
+                decay=decay,
+                recurrent_state=self._recurrent_state,
+                use_qk_l2norm=True,
+                query_scale=self._decode_query_scale,
+                decay_is_log=True,
+                prefer_metal=True,
+            )
+            output = gdr_output.attention_outputs
+            self._recurrent_state = gdr_output.recurrent_state
 
         output = self.norm(output, z)
         out_proj_input_dtype = _resolve_module_activation_dtype(self.out_proj, hidden_states.dtype)

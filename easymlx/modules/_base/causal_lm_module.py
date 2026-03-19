@@ -248,6 +248,22 @@ class BaseCausalLMModule[ModelT: nn.Module, ConfigT: EasyMLXBaseConfig](EasyMLXB
             return CausalLMOutput(logits=logits)
         return logits
 
+    def decode_step(
+        self,
+        input_ids: mx.ArrayLike,
+        *,
+        cache_views: list[CacheView] | None = None,
+        cache_metadata: PageMetadata | None = None,
+    ) -> mx.array:
+        """Run the raw next-token logits path with a fixed decode signature."""
+        hidden_states = self.base_model(
+            input_ids,
+            cache_views=cache_views,
+            cache_metadata=cache_metadata,
+        )
+        hidden_states = self._extract_last_tokens(hidden_states, cache_metadata)
+        return self.compute_lm_logits(hidden_states)
+
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         """Filter out rotary embedding frequencies and tied LM head weights.
 

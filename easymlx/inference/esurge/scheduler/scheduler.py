@@ -31,6 +31,7 @@ from ..config import CacheConfig, Config, SchedulerConfig
 from ..core.interface import CacheGroupsConfig
 from ..core.manager import CacheManager
 from ..core.utils import prompt_token_hash
+from ..engine_types import FinishReason
 from ..request import EngineRequest, EngineRequestStatus
 from .output import ScheduledRequest, SchedulerStepOutput
 from .request_queue import SchedulingPolicy, create_request_queue
@@ -160,11 +161,11 @@ class Scheduler:
             return False
         if request_id in self.running:
             request.mark_canceled()
-            self._finalize_request(request, reason="canceled")
+            self._finalize_request(request, reason=FinishReason.CANCELED)
             return True
         if self.waiting.remove(request_id):
             request.mark_canceled()
-            self._finalize_request(request, reason="canceled")
+            self._finalize_request(request, reason=FinishReason.CANCELED)
             return True
         return False
 
@@ -399,7 +400,7 @@ class Scheduler:
 
         for request in self._iter_running():
             if request.canceled:
-                self._finalize_request(request, reason="canceled")
+                self._finalize_request(request, reason=FinishReason.CANCELED)
                 continue
             if budget.available <= 0:
                 break
@@ -467,7 +468,7 @@ class Scheduler:
         """
         self.running.pop(request.request_id, None)
         if (
-            reason not in {"canceled", "error"}
+            reason not in {FinishReason.CANCELED, FinishReason.ERROR}
             and self._prefix_caching_enabled
             and request.total_prompt_tokens > 0
             and request.cache_state.prefix_hash
@@ -481,9 +482,9 @@ class Scheduler:
                 )
         self.cache_manager.release_request(request.request_id)
         self._release_row(request.request_id)
-        if reason == "canceled":
+        if reason == FinishReason.CANCELED:
             request.mark_canceled()
-        elif reason == "error":
+        elif reason == FinishReason.ERROR:
             if request.failure_reason is None:
                 request.mark_failed("unknown")
         else:
@@ -533,7 +534,7 @@ class Scheduler:
 
             if request.request_id in failed_requests:
                 request.mark_failed(failed_requests[request.request_id])
-                self._finalize_request(request, reason="error")
+                self._finalize_request(request, reason=FinishReason.ERROR)
                 finished.append(request)
                 continue
 
@@ -549,12 +550,12 @@ class Scheduler:
                 eos_token = request.sampling_params.eos_token_id
             generated = sampled_token_ids.get(request.request_id, [])
             if generated and eos_token is not None and int(generated[-1]) == int(eos_token):
-                self._finalize_request(request, reason="eos")
+                self._finalize_request(request, reason=FinishReason.EOS)
                 finished.append(request)
                 continue
 
             if request.remaining_prefill_tokens == 0 and request.remaining_generation_budget <= 0:
-                self._finalize_request(request, reason="length")
+                self._finalize_request(request, reason=FinishReason.LENGTH)
                 finished.append(request)
                 continue
 

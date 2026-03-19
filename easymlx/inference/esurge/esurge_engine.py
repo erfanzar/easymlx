@@ -41,11 +41,12 @@ from easymlx.infra.factory import TaskType, registry
 from easymlx.workers.loggers import get_logger
 
 from .config import CacheConfig, Config, SchedulerConfig
+from .engine_types import FinishReason
 from .outputs import CompletionOutput, RequestOutput
 from .request import EngineRequest, EngineRequestStatus
 from .runners import ExecutionManager, ExecutionRequest, ExecutionResult, ModelRunner, ScheduledSequence, SequenceBuffer
 from .sampling_params import SamplingParams
-from .scheduler import AsyncScheduler, Scheduler, SchedulerStepOutput
+from .scheduler import AsyncScheduler, ScheduledRequest, Scheduler, SchedulerStepOutput
 from .utils import (
     normalize_chat_template_messages,
     normalize_chat_template_tools,
@@ -156,7 +157,7 @@ def _apply_stop_strings(
     if earliest is None or matched_stop is None:
         return text, None
     cutoff = earliest + len(matched_stop) if include_stop_str_in_output else earliest
-    return text[:cutoff], "stop"
+    return text[:cutoff], FinishReason.STOP
 
 
 def _normalize_eos_token_ids(eos_token_id: int | list["int"] | tuple[int, ...] | None) -> set["int"]:
@@ -915,8 +916,8 @@ class eSurge:
                 visible_text = result.content or visible_text
 
         effective_finish_reason = finish_reason or stop_reason
-        if tool_calls and effective_finish_reason in {None, "eos", "stop", "length"}:
-            effective_finish_reason = "tool_calls"
+        if tool_calls and effective_finish_reason in {None, FinishReason.EOS, FinishReason.STOP, FinishReason.LENGTH}:
+            effective_finish_reason = FinishReason.TOOL_CALLS
 
         return {
             "text": visible_text,
@@ -1354,11 +1355,11 @@ class eSurge:
 
         last_token = int(sampled_token_ids[-1])
         if last_token in state.eos_token_ids:
-            return "eos"
+            return FinishReason.EOS
 
         total_generated = len(state.generated_token_ids) + len(sampled_token_ids)
         if total_generated >= state.request.max_new_tokens:
-            return "length"
+            return FinishReason.LENGTH
 
         has_stop_strings = bool(state.stop)
         has_tool_parser = state.tool_parser_instance is not None
@@ -1373,7 +1374,7 @@ class eSurge:
         if has_stop_strings:
             for stop_str in state.stop:
                 if stop_str in tail_text:
-                    return "stop"
+                    return FinishReason.STOP
 
         if has_tool_parser:
             candidate_generated = list(state.generated_token_ids) + [int(t) for t in sampled_token_ids]
@@ -1387,7 +1388,7 @@ class eSurge:
                 reasoning_parser=state.reasoning_parser_instance,
             )
             if parsed["tool_calls"]:
-                return "tool_calls"
+                return FinishReason.TOOL_CALLS
 
         return None
 
@@ -1521,7 +1522,7 @@ class eSurge:
                     self._paused or self._scheduler is None or not self._scheduler.has_pending_work()
                 ):
                     self._reconcile_terminal_states_locked()
-                    self._work_cv.wait(timeout=0.001)
+                    self._work_cv.wait(timeout=0.05)
 
                 if self._shutdown.is_set():
                     break
@@ -1536,7 +1537,9 @@ class eSurge:
                     continue
                 self._step_counter += 1
                 execution_request = self._build_execution_request(step_output)
-                dispatch = self._dispatch_distributed_step(step_output) if self._distributed_controller is not None else None
+                dispatch = (
+                    self._dispatch_distributed_step(step_output) if self._distributed_controller is not None else None
+                )
 
             execution_error: BaseException | None = None
             result: ExecutionResult | None = None
@@ -1655,7 +1658,156 @@ class eSurge:
             len(prompts_list),
             max_tokens,
         )
-        return self._generate_with_background(prompts, sampling_params=sampling_params, **generate_kwargs)
+        if len(prompts_list) == 1 and not self._paused:
+            output = self._generate_sync(
+                prompts_list[0],
+                sampling_params=sampling_params,
+                **generate_kwargs,
+            )
+            if output is not None:
+                return [output]
+        return self._generate_with_background(prompts_list, sampling_params=sampling_params, **generate_kwargs)
+
+    # ------------------------------------------------------------------
+    # Shared sync-path helper methods
+    # ------------------------------------------------------------------
+
+    def _sync_validate_preconditions(
+        self,
+        sampling_params: SamplingParams | None,
+    ) -> tuple[ModelRunner, "Scheduler"] | None:
+        """Validate that the sync fast path can be used.
+
+        Returns:
+            A ``(runner, scheduler)`` tuple if preconditions are met,
+            ``None`` otherwise.
+        """
+        if sampling_params is not None and sampling_params.n != 1:
+            raise NotImplementedError("n>1 sampling is not supported in easymlx eSurge.")
+        runner = self._runner
+        scheduler = self._scheduler
+        if runner is None or scheduler is None:
+            return None
+        return runner, scheduler
+
+    def _sync_prepare_kwargs(
+        self,
+        sampling_params: SamplingParams | None,
+        **generate_kwargs: Any,
+    ) -> tuple[dict[str, Any], int, set[int]]:
+        """Build generation kwargs, max_new_tokens, and EOS set for sync paths.
+
+        Returns:
+            A 3-tuple of ``(gen_kwargs, max_new_tokens, eos_token_ids)``.
+        """
+        gen_kwargs = self._resolve_generation_kwargs(sampling_params, **generate_kwargs)
+        max_new_tokens = int(gen_kwargs.get("max_new_tokens", sampling_params.max_tokens if sampling_params else 16))
+        if self.auto_cap_new_tokens:
+            max_new_tokens = max(1, min(max_new_tokens, self.max_model_len - self.reserve_tokens))
+        gen_kwargs["max_new_tokens"] = max_new_tokens
+        if gen_kwargs.get("eos_token_id") is None:
+            gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        if gen_kwargs.get("pad_token_id") is None:
+            gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id or gen_kwargs.get("eos_token_id")
+        eos_set = _normalize_eos_token_ids(gen_kwargs.get("eos_token_id"))
+        return gen_kwargs, max_new_tokens, eos_set
+
+    def _sync_execute_step(
+        self,
+        runner: "ModelRunner",
+        execution_request: ExecutionRequest,
+        step_output: "SchedulerStepOutput",
+    ) -> tuple[Any, np.ndarray]:
+        """Run one forward step, optionally dispatching to distributed workers."""
+        dispatch = self._dispatch_distributed_step(step_output) if self._distributed_controller is not None else None
+        raw_output, logits = runner._forward_step(execution_request)
+        self._verify_distributed_step(dispatch, raw_output)
+        return raw_output, logits
+
+    def _sync_sample_token(
+        self,
+        raw_output: Any,
+        logits: np.ndarray,
+        runner: "ModelRunner",
+        greedy_sampling: bool,
+        sampling_params: SamplingParams | None,
+    ) -> int:
+        """Sample a single token from logits."""
+        if greedy_sampling:
+            return int(np.argmax(logits[0]))
+        return runner.sample_next_token(logits[0], sampling_params=sampling_params)
+
+    def _sync_check_stop_reason(
+        self,
+        token_id: int,
+        state: "_RuntimeRequestState",
+        request: EngineRequest,
+    ) -> str | None:
+        """Check whether generation should stop after a token.
+
+        Only decodes the tail when stop strings are configured.
+        """
+        if token_id in state.eos_token_ids:
+            return FinishReason.EOS
+        if len(request.generated_token_ids) >= request.max_new_tokens:
+            return FinishReason.LENGTH
+        if state.stop:
+            tail_text = self.tokenizer.decode(request.generated_token_ids[-64:], skip_special_tokens=True)
+            for stop_str in state.stop:
+                if stop_str in tail_text:
+                    return FinishReason.STOP
+        return None
+
+    def _sync_decode_step_output(
+        self,
+        token_id: int,
+        row_index: int,
+        request: EngineRequest,
+        scheduler: "Scheduler",
+    ) -> "SchedulerStepOutput":
+        """Build a single-token decode SchedulerStepOutput."""
+        scheduled = ScheduledRequest(
+            request_id=request.request_id,
+            row_index=row_index,
+            token_ids=[int(token_id)],
+            is_prefill=False,
+            num_tokens=1,
+            page_ids=list(request.cache_state.page_ids),
+            cache_group=request.cache_state.cache_group,
+            prefix_cache_hit=request.cache_state.prefix_cache_hit,
+        )
+        return SchedulerStepOutput(
+            scheduled=[scheduled],
+            num_scheduled=1,
+            num_running=1,
+            token_budget_remaining=max(int(getattr(scheduler, "max_num_scheduled_tokens", 1)) - 1, 0),
+            decode_only=True,
+        )
+
+    def _sync_finalize(
+        self,
+        *,
+        paused_for_sync: bool,
+        runtime_state_added: bool,
+        request_id: str,
+        runner: "ModelRunner",
+        scheduler: "Scheduler",
+    ) -> None:
+        """Shared cleanup for sync generate and stream paths."""
+        if runtime_state_added:
+            with self._work_cv:
+                self._runtime_states.pop(request_id, None)
+        if runner.sequence_buffer.has_request(request_id):
+            runner.detach_request(request_id)
+        runner.compact_rows()
+        self._reset_recurrent_states()
+        if paused_for_sync:
+            with self._work_cv:
+                self._paused = False
+                scheduler.resume()
+                self._work_cv.notify_all()
+
+    # ------------------------------------------------------------------
 
     def _generate_sync(
         self,
@@ -1663,7 +1815,7 @@ class eSurge:
         sampling_params: SamplingParams | None = None,
         **generate_kwargs: Any,
     ) -> RequestOutput | None:
-        """Synchronous single-request fast path — no thread, no locks.
+        """Synchronous single-request fast path with no per-step worker overhead.
 
         Bypasses the background scheduling loop entirely for single-request
         generation. Runs prefill + decode in a tight Python loop on the
@@ -1673,168 +1825,347 @@ class eSurge:
         initialized), in which case the caller should fall back to the
         background loop.
         """
-        if self._runner is None or self._scheduler is None or self._execution_manager is None:
+        preconditions = self._sync_validate_preconditions(sampling_params)
+        if preconditions is None:
+            return None
+        runner, scheduler = preconditions
+
+        gen_kwargs, max_new_tokens, _ = self._sync_prepare_kwargs(sampling_params, **generate_kwargs)
+
+        states = self._build_requests([prompt], gen_kwargs, max_new_tokens=max_new_tokens)
+        if not states:
             return None
 
-        import numpy as np
+        state = states[0]
+        request = state.request
+        request_id = request.request_id
+        if request.max_new_tokens <= 0:
+            request.mark_finished(FinishReason.LENGTH)
+            return self._state_to_request_output(state)
 
-        gen_kwargs = self._resolve_generation_kwargs(sampling_params, **generate_kwargs)
-        max_new_tokens = int(gen_kwargs.get("max_new_tokens", sampling_params.max_tokens if sampling_params else 16))
-        if self.auto_cap_new_tokens:
-            max_new_tokens = max(1, min(max_new_tokens, self.max_model_len - self.reserve_tokens))
+        greedy_sampling = request.sampling_params is None or not bool(request.sampling_params.do_sample)
 
-        eos_token_id = gen_kwargs.get("eos_token_id", self.tokenizer.eos_token_id)
-        eos_set: set[int] = set()
-        if isinstance(eos_token_id, int):
-            eos_set.add(eos_token_id)
-        elif isinstance(eos_token_id, (list, tuple)):
-            eos_set.update(int(e) for e in eos_token_id)
-
-        stop_strings: list[str] = gen_kwargs.get("stop", []) or []
-        if sampling_params and sampling_params.stop:
-            stop_strings = list(sampling_params.stop)
-
-        input_ids = self.tokenizer.encode(prompt)
-        if not input_ids:
-            return None
-
-        runner = self._runner
-        scheduler = self._scheduler
-
-        request_id = f"sync_{id(self)}_{time.time()}"
-        from easymlx.inference.esurge.request import EngineRequest
-        if sampling_params is not None:
-            sp_copy = SamplingParams(
-                max_tokens=max_new_tokens,
-                temperature=sampling_params.temperature,
-                top_p=sampling_params.top_p,
-                top_k=sampling_params.top_k,
-                do_sample=sampling_params.do_sample,
-                stop=sampling_params.stop,
-            )
-        else:
-            sp_copy = SamplingParams(max_tokens=max_new_tokens)
-        engine_request = EngineRequest(
-            request_id=request_id,
-            prompt=prompt,
-            prompt_token_ids=list(input_ids),
-            sampling_params=sp_copy,
-        )
-
-        scheduler.add_request(engine_request)
-        runner.bind_request(engine_request, 0)
-
-        generated_token_ids: list[int] = []
+        paused_for_sync = False
+        runtime_state_added = False
+        request_added = False
+        row_index: int | None = None
+        sequence: ScheduledSequence | None = None
+        execution_request: ExecutionRequest | None = None
         finish_reason: str | None = None
-        t_start = time.time()
-        np.random.default_rng()
+        pending_decode_token: int | None = None
 
-        step = 0
-        while len(generated_token_ids) < max_new_tokens:
-            step_output = scheduler.schedule()
-            if not step_output.scheduled:
-                break
+        try:
+            with self._work_cv:
+                if self._shutdown.is_set() or self._paused or self._runtime_states or scheduler.has_pending_work():
+                    return None
+                self._paused = True
+                scheduler.pause()
+                paused_for_sync = True
 
-            entry = step_output.scheduled[0]
-            seq = ScheduledSequence(
+            with self._work_cv:
+                self._runtime_states[request_id] = state
+                runtime_state_added = True
+            scheduler.add_request(request)
+            request_added = True
+
+            while pending_decode_token is None and finish_reason is None:
+                step_output = scheduler.schedule()
+                if not step_output.scheduled:
+                    if request.remaining_generation_budget <= 0:
+                        finish_reason = FinishReason.LENGTH
+                        break
+                    raise RuntimeError("Scheduler produced no work for synchronous generation.")
+
+                entry = step_output.scheduled[0]
+                row_index = int(entry.row_index)
+                if sequence is None:
+                    runner.bind_request(request, row_index)
+                    sequence = ScheduledSequence(
+                        request_id=request_id,
+                        row_index=row_index,
+                        token_ids=[int(token_id) for token_id in entry.token_ids],
+                        num_computed_tokens=int(request.num_computed_tokens),
+                        page_ids=tuple(int(page_id) for page_id in entry.page_ids),
+                        meta={"is_prefill": entry.is_prefill},
+                    )
+                    execution_request = ExecutionRequest(
+                        step_id=0,
+                        mode="prefill" if entry.is_prefill else "decode",
+                        sequences=[sequence],
+                    )
+                else:
+                    sequence.token_ids[:] = [int(token_id) for token_id in entry.token_ids]
+                    object.__setattr__(sequence, "num_computed_tokens", int(request.num_computed_tokens))
+                    if tuple(int(page_id) for page_id in entry.page_ids) != sequence.page_ids:
+                        object.__setattr__(sequence, "page_ids", tuple(int(page_id) for page_id in entry.page_ids))
+                    execution_request.mode = "prefill" if entry.is_prefill else "decode"
+
+                assert execution_request is not None
+                self._step_counter += 1
+                execution_request.step_id = self._step_counter
+                execution_request.multimodal = self._prepare_multimodal_batch(step_output) if entry.is_prefill else None
+
+                raw_output, logits = self._sync_execute_step(runner, execution_request, step_output)
+
+                request.consume_computed_tokens(entry.num_tokens)
+                runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
+
+                if entry.is_prefill and request.remaining_prefill_tokens > 0:
+                    continue
+
+                sampled_token = self._sync_sample_token(
+                    raw_output, logits, runner, greedy_sampling, request.sampling_params
+                )
+                request.append_generated_token(sampled_token)
+                runner.sequence_buffer.append_output_tokens(request_id, [sampled_token])
+                state.note_generated_tokens([sampled_token])
+                finish_reason = self._sync_check_stop_reason(sampled_token, state, request)
+                if finish_reason is None:
+                    pending_decode_token = sampled_token
+
+            while pending_decode_token is not None and finish_reason is None:
+                if sequence is None or execution_request is None or row_index is None:
+                    raise RuntimeError("Synchronous decode state was not initialized.")
+
+                decode_step = self._sync_decode_step_output(pending_decode_token, row_index, request, scheduler)
+                sequence.token_ids[:] = [int(pending_decode_token)]
+                object.__setattr__(sequence, "num_computed_tokens", int(request.num_computed_tokens))
+                execution_request.mode = "decode"
+                execution_request.multimodal = None
+                self._step_counter += 1
+                execution_request.step_id = self._step_counter
+
+                raw_output, logits = self._sync_execute_step(runner, execution_request, decode_step)
+
+                request.consume_computed_tokens(1)
+                runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
+
+                sampled_token = self._sync_sample_token(
+                    raw_output, logits, runner, greedy_sampling, request.sampling_params
+                )
+                request.append_generated_token(sampled_token)
+                runner.sequence_buffer.append_output_tokens(request_id, [sampled_token])
+                state.note_generated_tokens([sampled_token])
+                finish_reason = self._sync_check_stop_reason(sampled_token, state, request)
+                pending_decode_token = None if finish_reason is not None else sampled_token
+
+            if finish_reason is None:
+                if request.remaining_generation_budget <= 0:
+                    finish_reason = FinishReason.LENGTH
+                elif request.finished_reason is not None:
+                    finish_reason = request.finished_reason
+                else:
+                    raise RuntimeError("Synchronous generation exited without a finish reason.")
+
+            if request_added and not request.is_finished:
+                scheduler._finalize_request(request, reason=finish_reason)
+            return self._state_to_request_output(state)
+        except BaseException as exc:
+            if request_added and not request.is_finished:
+                request.mark_failed(str(exc))
+                scheduler._finalize_request(request, reason=FinishReason.ERROR)
+            raise
+        finally:
+            self._sync_finalize(
+                paused_for_sync=paused_for_sync,
+                runtime_state_added=runtime_state_added,
                 request_id=request_id,
-                row_index=entry.row_index,
-                token_ids=list(entry.token_ids),
-                num_computed_tokens=engine_request.num_computed_tokens,
-                page_ids=entry.page_ids,
-                meta={"is_prefill": entry.is_prefill},
-            )
-            is_prefill = entry.is_prefill
-            mode = "prefill" if is_prefill else "decode"
-
-            exec_request = ExecutionRequest(
-                step_id=step,
-                mode=mode,
-                sequences=[seq],
-                sampling_by_request={request_id: sampling_params} if sampling_params else {},
-                page_table=runner.sequence_buffer.page_table(),
+                runner=runner,
+                scheduler=scheduler,
             )
 
-            result = self._execution_manager.execute(exec_request)
+    def _stream_sync(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams | None = None,
+        **generate_kwargs: Any,
+    ) -> Iterator[RequestOutput] | None:
+        """Synchronous single-request streaming fast path.
 
-            if result.updates:
-                update = result.updates[0]
-                new_tokens = list(update.sampled_token_ids) if update.sampled_token_ids else []
-                generated_token_ids.extend(new_tokens)
-                engine_request.generated_token_ids.extend(new_tokens)
-                engine_request.num_computed_tokens = (update.num_computed_tokens or engine_request.num_computed_tokens)
-                runner.sequence_buffer.append_output_tokens(request_id, new_tokens)
-                runner.sequence_buffer.set_num_computed_tokens(request_id, engine_request.num_computed_tokens)
+        Uses the same direct-runner path as :meth:`_generate_sync`, but
+        yields incremental :class:`RequestOutput` updates after each
+        token. Returns ``None`` when the fast path cannot be used.
+        """
+        preconditions = self._sync_validate_preconditions(sampling_params)
+        if preconditions is None:
+            return None
+        runner, scheduler = preconditions
 
-                sampled_ids = {request_id: new_tokens}
-                stop_reason: str | None = None
+        gen_kwargs, max_new_tokens, _ = self._sync_prepare_kwargs(sampling_params, **generate_kwargs)
 
-                if new_tokens and new_tokens[-1] in eos_set:
-                    stop_reason = "eos"
-                elif len(generated_token_ids) >= max_new_tokens:
-                    stop_reason = "length"
-                elif stop_strings:
-                    tail = self.tokenizer.decode(generated_token_ids[-64:], skip_special_tokens=True)
-                    for s in stop_strings:
-                        if s in tail:
-                            stop_reason = "stop"
-                            break
+        states = self._build_requests([prompt], gen_kwargs, max_new_tokens=max_new_tokens)
+        if not states:
+            return None
 
-                scheduler.update_from_model_output(
-                    step_output,
-                    sampled_token_ids=sampled_ids,
-                    stop_reasons={request_id: stop_reason},
+        state = states[0]
+        request = state.request
+        request_id = request.request_id
+
+        greedy_sampling = request.sampling_params is None or not bool(request.sampling_params.do_sample)
+
+        def _check_tool_call_stop() -> str | None:
+            if state.tool_parser_instance is None:
+                return None
+            parsed = self._parse_text_output(
+                state.decoded_text(self.tokenizer),
+                stop=state.stop,
+                finish_reason=None,
+                gen_kwargs=state.gen_kwargs,
+                tool_parser=state.tool_parser_instance,
+                reasoning_parser=state.reasoning_parser_instance,
+            )
+            return FinishReason.TOOL_CALLS if parsed["tool_calls"] else None
+
+        def _iterator() -> Iterator[RequestOutput]:
+            paused_for_sync = False
+            runtime_state_added = False
+            request_added = False
+            row_index: int | None = None
+            sequence: ScheduledSequence | None = None
+            execution_request: ExecutionRequest | None = None
+            pending_decode_token: int | None = None
+
+            try:
+                if request.max_new_tokens <= 0:
+                    request.mark_finished(FinishReason.LENGTH)
+                    yield self._state_to_request_output(state, incremental=True, consume=True)
+                    return
+
+                with self._work_cv:
+                    if self._shutdown.is_set() or self._paused or self._runtime_states or scheduler.has_pending_work():
+                        return
+                    self._paused = True
+                    scheduler.pause()
+                    paused_for_sync = True
+
+                with self._work_cv:
+                    self._runtime_states[request_id] = state
+                    runtime_state_added = True
+                scheduler.add_request(request)
+                request_added = True
+
+                while True:
+                    if request.is_finished:
+                        if not state.last_emitted_finished:
+                            yield self._state_to_request_output(state, incremental=True, consume=True)
+                        break
+
+                    if pending_decode_token is None:
+                        step_output = scheduler.schedule()
+                        if not step_output.scheduled:
+                            if request.remaining_generation_budget <= 0:
+                                scheduler._finalize_request(request, reason=FinishReason.LENGTH)
+                                continue
+                            raise RuntimeError("Scheduler produced no work for synchronous streaming generation.")
+
+                        entry = step_output.scheduled[0]
+                        row_index = int(entry.row_index)
+                        if sequence is None:
+                            runner.bind_request(request, row_index)
+                            sequence = ScheduledSequence(
+                                request_id=request_id,
+                                row_index=row_index,
+                                token_ids=[int(token_id) for token_id in entry.token_ids],
+                                num_computed_tokens=int(request.num_computed_tokens),
+                                page_ids=tuple(int(page_id) for page_id in entry.page_ids),
+                                meta={"is_prefill": entry.is_prefill},
+                            )
+                            execution_request = ExecutionRequest(
+                                step_id=0,
+                                mode="prefill" if entry.is_prefill else "decode",
+                                sequences=[sequence],
+                            )
+                        else:
+                            sequence.token_ids[:] = [int(token_id) for token_id in entry.token_ids]
+                            object.__setattr__(sequence, "num_computed_tokens", int(request.num_computed_tokens))
+                            if tuple(int(page_id) for page_id in entry.page_ids) != sequence.page_ids:
+                                object.__setattr__(
+                                    sequence, "page_ids", tuple(int(page_id) for page_id in entry.page_ids)
+                                )
+                            execution_request.mode = "prefill" if entry.is_prefill else "decode"
+
+                        assert execution_request is not None
+                        self._step_counter += 1
+                        execution_request.step_id = self._step_counter
+                        execution_request.multimodal = (
+                            self._prepare_multimodal_batch(step_output) if entry.is_prefill else None
+                        )
+
+                        raw_output, logits = self._sync_execute_step(runner, execution_request, step_output)
+
+                        if request.is_finished:
+                            continue
+
+                        request.consume_computed_tokens(entry.num_tokens)
+                        runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
+
+                        if entry.is_prefill and request.remaining_prefill_tokens > 0:
+                            continue
+
+                        sampled_token = self._sync_sample_token(
+                            raw_output, logits, runner, greedy_sampling, request.sampling_params
+                        )
+                    else:
+                        if sequence is None or execution_request is None or row_index is None:
+                            raise RuntimeError("Synchronous decode state was not initialized.")
+
+                        decode_step = self._sync_decode_step_output(pending_decode_token, row_index, request, scheduler)
+                        sequence.token_ids[:] = [int(pending_decode_token)]
+                        object.__setattr__(sequence, "num_computed_tokens", int(request.num_computed_tokens))
+                        execution_request.mode = "decode"
+                        execution_request.multimodal = None
+                        self._step_counter += 1
+                        execution_request.step_id = self._step_counter
+
+                        raw_output, logits = self._sync_execute_step(runner, execution_request, decode_step)
+
+                        if request.is_finished:
+                            continue
+
+                        request.consume_computed_tokens(1)
+                        runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
+                        sampled_token = self._sync_sample_token(
+                            raw_output, logits, runner, greedy_sampling, request.sampling_params
+                        )
+
+                    if request.is_finished:
+                        continue
+
+                    request.append_generated_token(sampled_token)
+                    runner.sequence_buffer.append_output_tokens(request_id, [sampled_token])
+                    state.note_generated_tokens([sampled_token])
+
+                    stop_reason = self._sync_check_stop_reason(sampled_token, state, request)
+                    if stop_reason is None:
+                        stop_reason = _check_tool_call_stop()
+
+                    if stop_reason is not None:
+                        scheduler._finalize_request(request, reason=stop_reason)
+                        pending_decode_token = None
+                    else:
+                        pending_decode_token = sampled_token
+
+                    yield self._state_to_request_output(state, incremental=True, consume=True)
+
+            except GeneratorExit:
+                raise
+            except BaseException as exc:
+                if request_added and not request.is_finished:
+                    request.mark_failed(str(exc))
+                    scheduler._finalize_request(request, reason=FinishReason.ERROR)
+                raise
+            finally:
+                if request_added and not request.is_finished:
+                    scheduler._finalize_request(request, reason=FinishReason.CANCELED)
+                self._sync_finalize(
+                    paused_for_sync=paused_for_sync,
+                    runtime_state_added=runtime_state_added,
+                    request_id=request_id,
+                    runner=runner,
+                    scheduler=scheduler,
                 )
 
-                if stop_reason is not None:
-                    finish_reason = stop_reason
-                    break
-            else:
-                scheduler.update_from_model_output(step_output, sampled_token_ids={})
-
-            step += 1
-
-        self._reset_recurrent_states()
-        runner.detach_request(request_id)
-        runner.compact_rows()
-
-        elapsed = max(time.time() - t_start, 1e-6)
-        num_gen = len(generated_token_ids)
-        tps = float(num_gen) / elapsed if num_gen else 0.0
-
-        raw_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
-        parsed = self._parse_text_output(
-            raw_text,
-            stop=stop_strings,
-            finish_reason=finish_reason,
-            gen_kwargs=gen_kwargs,
-            tool_parser=self._new_tool_parser() if self.tool_parser_name else None,
-            reasoning_parser=self._new_reasoning_parser() if self.reasoning_parser_name else None,
-        )
-
-        text = str(parsed["text"])
-        completion = CompletionOutput(
-            index=0,
-            text=text,
-            token_ids=generated_token_ids,
-            finish_reason=parsed["finish_reason"] or finish_reason,
-            tool_calls=parsed.get("tool_calls"),
-            reasoning_content=parsed.get("reasoning_content"),
-        )
-        return RequestOutput(
-            request_id=request_id,
-            outputs=[completion],
-            prompt=prompt,
-            prompt_token_ids=list(input_ids),
-            finished=True,
-            accumulated_text=text,
-            tokens_per_second=tps,
-            num_generated_tokens=num_gen,
-            time_spent_generating=elapsed,
-            processing_time=elapsed,
-            reasoning_content=parsed.get("reasoning_content"),
-            tool_calls=parsed.get("tool_calls"),
-        )
+        return _iterator()
 
     def stream(
         self,
@@ -1873,6 +2204,16 @@ class eSurge:
             gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
         if gen_kwargs.get("pad_token_id") is None:
             gen_kwargs["pad_token_id"] = self.tokenizer.pad_token_id or gen_kwargs.get("eos_token_id")
+
+        if len(prompts_list) == 1 and not self._paused:
+            iterator = self._stream_sync(
+                prompts_list[0],
+                sampling_params=sampling_params,
+                **generate_kwargs,
+            )
+            if iterator is not None:
+                yield from iterator
+                return
 
         states = self._build_requests(prompts_list, gen_kwargs, max_new_tokens=max_new_tokens)
         if not states:

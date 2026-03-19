@@ -28,7 +28,10 @@ from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import CausalLMOutput, EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.modules._base import BaseCausalLMModule
-from easymlx.modules.qwen3_next.modeling_qwen3_next import Qwen3NextModel
+from easymlx.modules.qwen3_next.modeling_qwen3_next import (
+    Qwen3NextModel,
+    sanitize_qwen3_next_projection_weights,
+)
 from easymlx.modules.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLModel,
     Qwen3VLVisionBlock,
@@ -168,6 +171,10 @@ class Qwen3_5ForCausalLM(BaseCausalLMModule[Qwen3_5TextModel, Qwen3_5TextConfig]
             base_model_class=Qwen3_5TextModel,
             tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
         )
+
+    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+        """Map legacy split Qwen3.5 text projections into fused Qwen3-Next modules."""
+        return super().sanitize(sanitize_qwen3_next_projection_weights(weights))
 
 
 @register_module(task_type=TaskType.BASE_MODULE, config=Qwen3_5Config, model_type="qwen3_5")
@@ -324,7 +331,7 @@ class Qwen3_5ForConditionalGeneration(EasyMLXBaseModule):
             if new_key.endswith("conv1d.weight") and value.ndim == 3:
                 value = value.transpose(0, 2, 1)
             sanitized[new_key] = value
-        return sanitized
+        return sanitize_qwen3_next_projection_weights(sanitized)
 
     @property
     def visual(self):
@@ -390,6 +397,31 @@ class Qwen3_5ForConditionalGeneration(EasyMLXBaseModule):
         if return_dict:
             return CausalLMOutput(logits=logits)
         return logits
+
+    def decode_step(
+        self,
+        input_ids: mx.array,
+        *,
+        cache_views: list[CacheView] | None = None,
+        cache_metadata: PageMetadata | None = None,
+    ) -> mx.array:
+        """Run the multimodal decode path with a fixed text-only signature."""
+        hidden_states = self.model(
+            input_ids,
+            cache_views=cache_views,
+            cache_metadata=cache_metadata,
+        )
+
+        if hidden_states.ndim == 2 and cache_metadata is not None:
+            qsl = cache_metadata.query_start_loc
+            if not isinstance(qsl, mx.array):
+                qsl = mx.array(list(qsl), dtype=mx.int32)
+            last_indices = (qsl[1:].astype(mx.int32) - 1).astype(mx.int32)
+            hidden_states = mx.take(hidden_states, last_indices, axis=0)
+
+        if self._tie_word_embeddings:
+            return self.model.language_model.embed_tokens.as_linear(hidden_states)
+        return self.lm_head(hidden_states)
 
 
 __all__ = (

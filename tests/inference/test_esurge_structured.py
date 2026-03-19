@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+import threading
+import time
 
 import mlx.core as mx
 import numpy as np
@@ -26,7 +27,8 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from easymlx.inference.esurge import SamplingParams, eSurge
+from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
+from easymlx.inference.esurge.runners.model_runner import ModelRunner
 from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 
 
@@ -46,23 +48,49 @@ class _DummyPagedCache:
 class DummyModel:
     """Paged-compatible dummy that emits a fixed token sequence then EOS."""
 
-    def __init__(self, append_tokens: list[int], *, vocab_size: int = 16, eos_token_id: int = 1):
+    def __init__(
+        self,
+        append_tokens: list[int],
+        *,
+        vocab_size: int = 16,
+        eos_token_id: int = 1,
+        sleep_s: float = 0.0,
+        return_mx_logits: bool = False,
+    ):
         self.append_tokens = list(append_tokens)
         self.vocab_size = vocab_size
         self._eos = eos_token_id
         self._step: dict[int, int] = {}
+        self.sleep_s = float(sleep_s)
+        self.return_mx_logits = bool(return_mx_logits)
+        self.multimodal_log: list[object | None] = []
 
     def init_paged_cache(self, *, num_seqs: int, **_kwargs):
         return [_DummyPagedCache(num_seqs)]
 
-    def __call__(self, input_ids, *, cache_views=None, cache_metadata=None, query_lens=None, slot_ids=None, return_dict=True, **_kwargs):
+    def __call__(
+        self,
+        input_ids,
+        *,
+        cache_views=None,
+        cache_metadata=None,
+        query_lens=None,
+        slot_ids=None,
+        return_dict=True,
+        **_kwargs,
+    ):
+        if self.sleep_s > 0.0:
+            time.sleep(self.sleep_s)
         arr = np.array(input_ids, dtype=np.int32)
         num_seqs = len(query_lens) if query_lens else arr.shape[0]
         logits = np.full((num_seqs, self.vocab_size), -1e9, dtype=np.float32)
+        self.multimodal_log.append(_kwargs.get("multimodal") or _kwargs.get("multimodal_inputs"))
         offset = 0
         for row in range(num_seqs):
             qlen = int(query_lens[row]) if query_lens else (arr.shape[1] if arr.ndim > 1 else arr.shape[0])
             sid = int(slot_ids[row]) if slot_ids else row
+            if cache_views and int(cache_views[0].cache.kv_lens[sid]) == 0:
+                self._step[sid] = 0
             if cache_views:
                 cache_views[0].cache.kv_lens[sid] += qlen
             step = self._step.get(sid, 0)
@@ -73,9 +101,64 @@ class DummyModel:
             self._step[sid] = step + 1
             logits[row, next_token] = 0.0
             offset += qlen
+        result_logits = mx.array(logits) if self.return_mx_logits else logits
         if return_dict:
-            return type("Out", (), {"logits": logits})()
-        return logits
+            return type("Out", (), {"logits": result_logits})()
+        return result_logits
+
+
+class _DecodeStepOnlyModel(DummyModel):
+    def __init__(self, append_tokens: list[int], *, vocab_size: int = 16, eos_token_id: int = 1):
+        super().__init__(append_tokens, vocab_size=vocab_size, eos_token_id=eos_token_id, return_mx_logits=True)
+        self.decode_calls = 0
+        self.forward_calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.forward_calls += 1
+        raise AssertionError("decode_step path should bypass __call__")
+
+    def decode_step(self, input_ids, *, cache_views=None, cache_metadata=None):
+        del cache_views, cache_metadata
+        self.decode_calls += 1
+        arr = np.array(input_ids, dtype=np.int32)
+        batch_size = arr.shape[0] if arr.ndim > 1 else 1
+        logits = np.full((batch_size, self.vocab_size), -1e9, dtype=np.float32)
+        logits[:, self.append_tokens[0]] = 0.0
+        return mx.array(logits)
+
+
+class FakeDistributedController:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.started = 0
+        self.dispatched = 0
+        self.verified = 0
+        self.shutdowns = 0
+
+    def start(self) -> None:
+        self.started += 1
+
+    def dispatch_step(self, scheduler_output) -> dict[str, int]:
+        self.dispatched += 1
+        return {"count": len(scheduler_output.scheduled)}
+
+    def verify_step(self, dispatch, model_output) -> None:
+        assert dispatch["count"] >= 1
+        assert model_output is not None
+        self.verified += 1
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+class FakeMultimodalPreprocessor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def prepare_batch(self, *, requests, runtime_states, step_output):
+        self.calls += 1
+        assert len(requests) == len(runtime_states) == len(step_output.scheduled)
+        return {"kind": "fake-mm", "request_ids": [request.request_id for request in requests]}
 
 
 def _build_tokenizer() -> PreTrainedTokenizerFast:
@@ -119,22 +202,17 @@ def _flatten_params(model: LlamaForCausalLM) -> dict[str, mx.array]:
     return tree_flatten(model.parameters(), destination={})
 
 
-def _save_test_tokenizer(path: Path) -> None:
-    vocab = {
-        "<pad>": 0,
-        "<eos>": 1,
-        "<unk>": 2,
-        **{f"tok{i}": i for i in range(3, 32)},
-    }
-    tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
-    tok.pre_tokenizer = Whitespace()
-    hf_tok = PreTrainedTokenizerFast(
-        tokenizer_object=tok,
-        pad_token="<pad>",
-        eos_token="<eos>",
-        unk_token="<unk>",
+def _sync_test_config(*, prefix: bool = False) -> Config:
+    return Config(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=1,
+            max_num_batched_tokens=8,
+            max_model_len=32,
+            chunked_prefill_enabled=True,
+            long_prefill_token_threshold=2,
+        ),
+        cache_config=CacheConfig(num_pages=32, page_size=2, enable_prefix_caching=prefix),
     )
-    hf_tok.save_pretrained(str(path))
 
 
 def test_esurge_extracts_reasoning_content():
@@ -153,6 +231,23 @@ def test_esurge_extracts_reasoning_content():
     assert output.outputs[0].text == "answer"
     assert output.outputs[0].reasoning_content == "plan"
     assert output.reasoning_content == "plan"
+
+
+def test_model_runner_exposes_decode_step_helper():
+    model = _DecodeStepOnlyModel([5])
+    runner = ModelRunner(
+        model,
+        max_model_len=16,
+        max_num_batched_tokens=8,
+        max_num_seqs=1,
+        use_compiled_forward=True,
+    )
+    raw_logits = runner._call_decode_step(input_ids=mx.array([[3]], dtype=mx.int32))
+
+    assert callable(runner._decode_step_fn)
+    assert model.decode_calls == 1
+    assert model.forward_calls == 0
+    np.testing.assert_array_equal(np.asarray(raw_logits).argmax(axis=-1), np.array([5]))
 
 
 def test_esurge_extracts_tool_calls():
@@ -174,25 +269,159 @@ def test_esurge_extracts_tool_calls():
     assert output.outputs[0].tool_calls[0]["function"]["name"] == "lookup"
 
 
-def test_esurge_from_pretrained_auto_converts_local_repo(tmp_path: Path):
-    model = _tiny_llama()
-    source_dir = tmp_path / "raw-hf"
-    cache_dir = tmp_path / "converted-cache"
-    source_dir.mkdir()
-
-    model.config.save_pretrained(str(source_dir))
-    mx.save_safetensors(str(source_dir / "model.safetensors"), _flatten_params(model))
-    _save_test_tokenizer(source_dir)
-
-    engine = eSurge.from_pretrained(
-        str(source_dir),
-        converted_cache_dir=str(cache_dir),
-        max_model_len=32,
-        max_num_seqs=2,
-        reserve_tokens=4,
+def test_esurge_sync_path_handles_stop_strings() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5]),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
     )
-    output = engine.generate("tok3 tok4", SamplingParams(max_tokens=1))[0]
 
-    assert engine.tokenizer is not None
-    assert engine.model.name_or_path.startswith(str(cache_dir))
+    try:
+        output = engine.generate("hello", SamplingParams(max_tokens=2, stop=["answer"]))[0]
+    finally:
+        engine.close()
+
+    assert output.outputs[0].finish_reason == "stop"
+    assert output.outputs[0].token_ids == [5]
+    assert output.outputs[0].text == ""
+
+
+def test_esurge_sync_path_greedy_samples_mx_logits() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5], return_mx_logits=True),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+    )
+
+    try:
+        output = engine.generate("hello", SamplingParams(max_tokens=1))[0]
+    finally:
+        engine.close()
+
     assert output.finished is True
+    assert output.outputs[0].token_ids == [5]
+    assert output.outputs[0].text.strip() == "answer"
+
+
+def test_esurge_sync_path_respects_pause_resume() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5], sleep_s=0.02),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+    )
+    result: dict[str, object] = {}
+
+    try:
+        engine.pause()
+
+        def _run() -> None:
+            result["output"] = engine.generate("hello", SamplingParams(max_tokens=1))
+
+        thread = threading.Thread(target=_run)
+        thread.start()
+        time.sleep(0.05)
+        assert thread.is_alive() is True
+
+        engine.resume()
+        thread.join(timeout=2.0)
+        assert thread.is_alive() is False
+        assert result["output"][0].finished is True
+    finally:
+        engine.close()
+
+
+def test_esurge_sync_path_prefix_cache_hits_on_repeated_prompt() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5]),
+        tokenizer=tokenizer,
+        config=_sync_test_config(prefix=True),
+        reserve_tokens=2,
+    )
+
+    try:
+        engine.generate("hello", SamplingParams(max_tokens=1))
+        engine.generate("hello", SamplingParams(max_tokens=1))
+        assert engine._scheduler is not None
+        stats = engine._scheduler.cache_manager.stats()
+    finally:
+        engine.close()
+
+    assert stats["prefix_hits"] >= 1
+
+
+def test_esurge_sync_stream_is_incremental() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5]),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+    )
+
+    try:
+        outputs = list(engine.stream("hello", SamplingParams(max_tokens=2)))
+    finally:
+        engine.close()
+
+    assert len(outputs) >= 1
+    assert outputs[0].delta_text.strip() == "answer"
+    assert outputs[-1].finished is True
+
+
+def test_esurge_sync_stream_abort_request() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([5, 5, 5], sleep_s=0.01),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+    )
+
+    try:
+        iterator = engine.stream("hello", SamplingParams(max_tokens=4))
+        first = next(iterator)
+        assert first.request_id
+        assert engine.abort_request(first.request_id) is True
+        rest = list(iterator)
+    finally:
+        engine.close()
+
+    assert rest
+    assert rest[-1].finished is True
+    assert rest[-1].outputs[0].finish_reason == "canceled"
+
+
+def test_esurge_sync_path_wires_distributed_and_multimodal_seams() -> None:
+    tokenizer = _build_tokenizer()
+    model = DummyModel([5])
+    controller = FakeDistributedController()
+    multimodal = FakeMultimodalPreprocessor()
+    engine = eSurge(
+        model,
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+        distributed_controller=controller,
+        multimodal_preprocessor=multimodal,
+        multimodal_payload={"kind": "fake"},
+    )
+
+    try:
+        output = engine.generate("hello", SamplingParams(max_tokens=1))[0]
+    finally:
+        engine.close()
+
+    assert output.finished is True
+    assert controller.started == 1
+    assert controller.dispatched >= 1
+    assert controller.verified >= 1
+    assert controller.shutdowns == 1
+    assert multimodal.calls >= 1
+    assert model.multimodal_log[-1] is not None

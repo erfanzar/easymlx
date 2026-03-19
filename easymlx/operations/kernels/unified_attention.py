@@ -1445,13 +1445,17 @@ def paged_attention(
                 kernel = (
                     _METAL_DECODE_HEAD256_FP8_KERNEL
                     if use_head256_decode
-                    else _METAL_DECODE_FP8_KERNEL if decode_fast_path else _METAL_FP8_KERNEL
+                    else _METAL_DECODE_FP8_KERNEL
+                    if decode_fast_path
+                    else _METAL_FP8_KERNEL
                 )
             else:
                 kernel = (
                     _METAL_DECODE_HEAD256_KERNEL
                     if use_head256_decode
-                    else _METAL_DECODE_KERNEL if decode_fast_path else _METAL_KERNEL
+                    else _METAL_DECODE_KERNEL
+                    if decode_fast_path
+                    else _METAL_KERNEL
                 )
             block_tables = _ensure_mx_array(block_tables, dtype=mx.int32)
             kv_lens = _ensure_mx_array(kv_lens, dtype=mx.int32)
@@ -1609,11 +1613,7 @@ class UnifiedAttention(BaseOperation):
         # instead of dequantizing in Python.
         runtime_k_scale: mx.array | None = None
         runtime_v_scale: mx.array | None = None
-        if (
-            cache_view is not None
-            and getattr(cache_view, "cache_dtype_is_fp8", False)
-            and key.dtype == mx.uint8
-        ):
+        if cache_view is not None and getattr(cache_view, "cache_dtype_is_fp8", False) and key.dtype == mx.uint8:
             runtime_k_scale = getattr(cache_view, "k_scales", None)
             runtime_v_scale = getattr(cache_view, "v_scales", None)
             if runtime_k_scale is None or runtime_v_scale is None:

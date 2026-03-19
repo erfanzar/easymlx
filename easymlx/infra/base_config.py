@@ -106,9 +106,7 @@ class EasyMLXBaseConfig(PretrainedConfig):
             raise EasyMLXConfigError(f"Unsupported attn_mechanism={self.attn_mechanism!r}")
         valid_cache_dtypes = ("auto", "float16", "bfloat16", "float32", "fp8")
         if self.cache_dtype not in valid_cache_dtypes:
-            raise EasyMLXConfigError(
-                f"Unsupported cache_dtype={self.cache_dtype!r}; supported: {valid_cache_dtypes}"
-            )
+            raise EasyMLXConfigError(f"Unsupported cache_dtype={self.cache_dtype!r}; supported: {valid_cache_dtypes}")
 
     @property
     def mlx_dtype(self) -> mx.Dtype:

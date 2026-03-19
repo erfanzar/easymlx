@@ -24,4 +24,27 @@ from .outputs import CompletionOutput, RequestOutput
 from .request import EngineRequest, EngineRequestStatus
 from .sampling_params import SamplingParams
 
-__all__ = ("CompletionOutput", "EngineRequest", "EngineRequestStatus", "RequestOutput", "SamplingParams")
+
+class FinishReason:
+    """Lightweight string constants for generation finish reasons.
+
+    These replace hardcoded string literals across the eSurge engine,
+    scheduler, and related modules.
+    """
+
+    EOS = "eos"
+    LENGTH = "length"
+    STOP = "stop"
+    ERROR = "error"
+    CANCELED = "canceled"
+    TOOL_CALLS = "tool_calls"
+
+
+__all__ = (
+    "CompletionOutput",
+    "EngineRequest",
+    "EngineRequestStatus",
+    "FinishReason",
+    "RequestOutput",
+    "SamplingParams",
+)

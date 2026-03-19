@@ -39,6 +39,9 @@ from .sequence_buffer import SequenceBuffer
 
 logger = get_logger("eSurgeRunner")
 
+_MLX_NO_PRIMITIVE_MSG = "without a primitive"
+_CACHE_MAXSIZE = 64
+
 
 class _CompiledPagedCacheProxy:
     """State-backed cache proxy for ``mx.compile`` paged forwards."""
@@ -160,9 +163,9 @@ def _as_numpy_logits(output: Any) -> np.ndarray:
     logits = getattr(output, "logits", output)
     if isinstance(logits, dict):
         logits = logits.get("logits", logits)
+    if isinstance(logits, mx.array) and logits.ndim == 3:
+        logits = logits[:, -1, :]
     if isinstance(logits, mx.array):
-        if logits.ndim == 3:
-            logits = logits[:, -1, :]
         if logits.dtype == mx.bfloat16 or not mx.issubdtype(logits.dtype, mx.floating):
             logits = logits.astype(mx.float32)
         array = np.array(logits)
@@ -175,6 +178,60 @@ def _as_numpy_logits(output: Any) -> np.ndarray:
     if array.ndim == 1:
         return np.expand_dims(array, axis=0)
     raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}")
+
+
+def _argmax_token_ids(output: Any) -> np.ndarray:
+    """Return greedy token IDs from a raw model output.
+
+    Extracts the final-step logits and performs argmax on-device when
+    possible, transferring only the resulting token IDs back to host.
+
+    Args:
+        output: Raw model output (object with ``.logits``, dict, or
+            array).
+
+    Returns:
+        A 1-D integer NumPy array of sampled token IDs.
+
+    Raises:
+        RuntimeError: If the resulting logits have an unsupported
+            number of dimensions.
+    """
+    logits = getattr(output, "logits", output)
+    if isinstance(logits, dict):
+        logits = logits.get("logits", logits)
+    if isinstance(logits, mx.array):
+        if logits.ndim == 3:
+            logits = logits[:, -1, :]
+        try:
+            token_ids = mx.argmax(logits, axis=-1)
+            mx.eval(token_ids)
+            array = np.asarray(token_ids, dtype=np.int64)
+        except RuntimeError as exc:
+            if _MLX_NO_PRIMITIVE_MSG not in str(exc):
+                raise
+            array = np.asarray(logits)
+            if array.ndim == 2:
+                array = np.argmax(array, axis=-1)
+            elif array.ndim == 1:
+                array = np.asarray([int(np.argmax(array))], dtype=np.int64)
+            else:
+                raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}") from exc
+    else:
+        array = np.asarray(logits)
+        if array.ndim == 3:
+            array = array[:, -1, :]
+        if array.ndim == 2:
+            array = np.argmax(array, axis=-1)
+        elif array.ndim == 1:
+            array = np.asarray([int(np.argmax(array))], dtype=np.int64)
+        else:
+            raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}")
+    if array.ndim == 0:
+        return np.asarray([int(array)], dtype=np.int64)
+    if array.ndim == 1:
+        return array.astype(np.int64, copy=False)
+    raise RuntimeError(f"Unsupported token-id shape from runner: {array.shape}")
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -329,6 +386,35 @@ class ModelRunner:
         self._rng = np.random.default_rng(seed)
         self._page_size = self._infer_page_size()
         self.log_it = logger.info if verbose else logger.debug
+        self._model_signature = inspect.signature(self.model)
+        self._model_param_names = frozenset(self._model_signature.parameters)
+        self._model_accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in self._model_signature.parameters.values()
+        )
+        self._decode_step_fn = getattr(self.model, "decode_step", None)
+        self._decode_step_signature = inspect.signature(self._decode_step_fn) if callable(self._decode_step_fn) else None
+        self._decode_step_param_names = (
+            frozenset(self._decode_step_signature.parameters) if self._decode_step_signature is not None else frozenset()
+        )
+        self._decode_step_accepts_kwargs = bool(
+            self._decode_step_signature is not None
+            and any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in self._decode_step_signature.parameters.values()
+            )
+        )
+        self._compiled_forward_blocked = bool(
+            self._model_accepts_kwargs
+            or {"positions", "slot_ids", "query_lens", "multimodal", "multimodal_inputs"}.intersection(
+                self._model_param_names
+            )
+        )
+        self._cache_views = list(self.kv_caches)
+        self._page_cache_view_cls: type[Any] | None = None
+        self._page_metadata_cls: type[Any] | None = None
+        self._build_query_start_loc_fn: Any | None = None
+        self._query_start_loc_cache: dict[tuple[int, ...], Any] = {}
+        self._single_token_decode_metadata: dict[int, Any] = {}
 
         logger.debug(
             "Initializing ModelRunner with max_model_len=%d, max_num_seqs=%d",
@@ -354,8 +440,84 @@ class ModelRunner:
         self._perf_tps_ema = 0.0
         self._compiled_cache: dict[tuple[int, int], Any] = {}
         self._compiled_forwards: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
+        self._failed_compiled_forward_keys: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
 
         logger.debug("ModelRunner initialization complete")
+
+    def _ensure_paged_helpers(self) -> tuple[type[Any], type[Any], Any]:
+        """Resolve paged-cache helper types/functions once and cache them."""
+        if (
+            self._page_cache_view_cls is None
+            or self._page_metadata_cls is None
+            or self._build_query_start_loc_fn is None
+        ):
+            from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
+
+            self._page_cache_view_cls = PageCacheView
+            self._page_metadata_cls = PageMetadata
+            self._build_query_start_loc_fn = build_query_start_loc
+        assert self._page_cache_view_cls is not None
+        assert self._page_metadata_cls is not None
+        assert self._build_query_start_loc_fn is not None
+        return self._page_cache_view_cls, self._page_metadata_cls, self._build_query_start_loc_fn
+
+    def _filter_model_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Filter model kwargs using the cached model signature."""
+        if self._model_accepts_kwargs:
+            return kwargs
+        return {name: value for name, value in kwargs.items() if name in self._model_param_names}
+
+    def _call_model(self, **kwargs: Any) -> Any:
+        """Invoke the model using cached signature filtering."""
+        return self.model(**self._filter_model_kwargs(kwargs))
+
+    def _call_decode_step(self, **kwargs: Any) -> mx.array:
+        """Invoke the model's fixed-signature decode entrypoint."""
+        if not callable(self._decode_step_fn):
+            raise AttributeError("Model does not expose decode_step().")
+        if self._decode_step_accepts_kwargs:
+            return self._decode_step_fn(**kwargs)
+        return self._decode_step_fn(
+            **{name: value for name, value in kwargs.items() if name in self._decode_step_param_names}
+        )
+
+    def _query_start_loc_for(self, query_lens: tuple[int, ...]) -> Any:
+        """Return cached cumulative query offsets for a query-length tuple."""
+        cached = self._query_start_loc_cache.get(query_lens)
+        if cached is not None:
+            return cached
+        _, _, build_query_start_loc = self._ensure_paged_helpers()
+        cached = build_query_start_loc(query_lens)
+        if len(self._query_start_loc_cache) >= _CACHE_MAXSIZE:
+            oldest_key = next(iter(self._query_start_loc_cache))
+            del self._query_start_loc_cache[oldest_key]
+        self._query_start_loc_cache[query_lens] = cached
+        return cached
+
+    def _page_metadata_for(self, query_lens: tuple[int, ...], slot_ids: tuple[int, ...]) -> Any:
+        """Build or reuse paged-attention metadata for the given decode shape."""
+        _, page_metadata_cls, _ = self._ensure_paged_helpers()
+        is_single_token_decode = all(int(query_len) == 1 for query_len in query_lens)
+        if is_single_token_decode and len(slot_ids) == 1:
+            slot_id = int(slot_ids[0])
+            cached = self._single_token_decode_metadata.get(slot_id)
+            if cached is not None:
+                return cached
+            cached = page_metadata_cls(
+                query_start_loc=self._query_start_loc_for(query_lens),
+                is_single_token_decode=True,
+                slot_ids=slot_ids,
+            )
+            if len(self._single_token_decode_metadata) >= _CACHE_MAXSIZE:
+                oldest_key = next(iter(self._single_token_decode_metadata))
+                del self._single_token_decode_metadata[oldest_key]
+            self._single_token_decode_metadata[slot_id] = cached
+            return cached
+        return page_metadata_cls(
+            query_start_loc=self._query_start_loc_for(query_lens),
+            is_single_token_decode=is_single_token_decode,
+            slot_ids=slot_ids,
+        )
 
     def _get_token_buckets(self) -> list[int]:
         """Generate token-length buckets: powers of 2 from 1 up to max_num_batched_tokens.
@@ -409,10 +571,10 @@ class ModelRunner:
         req_buckets = self.max_num_seq_buckets
         pairs = self._get_feasible_compile_pairs(token_buckets, req_buckets)
 
-        from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
+        page_cache_view_cls, page_metadata_cls, _ = self._ensure_paged_helpers()
         from easymlx.workers.loggers import ProgressLogger
 
-        if not all(isinstance(c, (PageCacheView, PageCacheView)) for c in self.kv_caches):
+        if not all(isinstance(c, page_cache_view_cls) for c in self.kv_caches):
             self.log_it("Skipping warmup: KV caches are not PageCacheView instances")
             return
 
@@ -433,9 +595,9 @@ class ModelRunner:
             dummy_ids = mx.zeros((num_tokens,), dtype=mx.int32)
             slot_ids = list(range(num_reqs))
             query_lens = self._distribute_tokens(num_tokens, num_reqs)
-            cache_views = list(self.kv_caches)
-            cache_metadata = PageMetadata(
-                query_start_loc=build_query_start_loc(query_lens),
+            cache_views = self._cache_views
+            cache_metadata = page_metadata_cls(
+                query_start_loc=self._query_start_loc_for(tuple(query_lens)),
                 is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
                 slot_ids=tuple(slot_ids),
             )
@@ -448,8 +610,7 @@ class ModelRunner:
                     mx.eval(logits)
                     self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
                 else:
-                    out = _call_with_filtered_kwargs(
-                        self.model,
+                    out = self._call_model(
                         input_ids=dummy_ids,
                         cache_views=cache_views,
                         cache_metadata=cache_metadata,
@@ -459,6 +620,12 @@ class ModelRunner:
                 mx.eval(logits)
                 self._compiled_cache[key] = True
             except Exception as exc:
+                compile_key = (
+                    tuple(int(slot_id) for slot_id in slot_ids),
+                    tuple(int(query_len) for query_len in query_lens),
+                )
+                self._compiled_forwards.pop(compile_key, None)
+                self._failed_compiled_forward_keys.add(compile_key)
                 logger.warning("Warmup failed for (%d, %d): %s", num_tokens, num_reqs, exc)
 
             for cache in self.kv_caches:
@@ -509,43 +676,37 @@ class ModelRunner:
         if not self.use_compiled_forward:
             return None
 
-        from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
+        page_cache_view_cls, page_metadata_cls, _ = self._ensure_paged_helpers()
 
-        if not all(isinstance(c, (PageCacheView, PageCacheView)) for c in self.kv_caches):
+        if not all(isinstance(c, page_cache_view_cls) for c in self.kv_caches):
             return None
         if not query_lens or any(int(query_len) != 1 for query_len in query_lens):
             return None
-
-        signature = inspect.signature(self.model)
-        accepts_kwargs = any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
-        )
-        unsupported_dynamic_kwargs = {"positions", "slot_ids", "query_lens", "multimodal", "multimodal_inputs"}
-        if accepts_kwargs or unsupported_dynamic_kwargs.intersection(signature.parameters):
+        if self._compiled_forward_blocked:
             return None
 
         key = (tuple(int(slot_id) for slot_id in slot_ids), tuple(int(query_len) for query_len in query_lens))
+        if key in self._failed_compiled_forward_keys:
+            return None
         compiled_entry = self._compiled_forwards.get(key)
         if compiled_entry is not None:
             return compiled_entry
 
         cache_proxies = [_CompiledPagedCacheProxy(kv_cache) for kv_cache in self.kv_caches]
         cache_views = list(cache_proxies)
-        cache_metadata = PageMetadata(
-            query_start_loc=build_query_start_loc(query_lens),
+        cache_metadata = page_metadata_cls(
+            query_start_loc=self._query_start_loc_for(tuple(int(query_len) for query_len in query_lens)),
             is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
             slot_ids=tuple(int(s) for s in slot_ids),
         )
 
-        static_kwargs = {
-            name: value
-            for name, value in {
+        static_kwargs = self._filter_model_kwargs(
+            {
                 "cache_views": cache_views,
                 "cache_metadata": cache_metadata,
                 "return_dict": False,
-            }.items()
-            if name in signature.parameters
-        }
+            }
+        )
         state_arrays = [cache_proxy.state for cache_proxy in cache_proxies]
 
         def compiled_forward(input_ids: mx.array) -> mx.array:
@@ -705,6 +866,7 @@ class ModelRunner:
         if not valid_ids:
             return
         mx.array(valid_ids, dtype=mx.int32)
+        touched_caches: list[mx.array] = []
         for cache in self.kv_caches:
             key_cache = getattr(cache, "key_cache", None)
             value_cache = getattr(cache, "value_cache", None)
@@ -722,7 +884,13 @@ class ModelRunner:
                 page_key_cache[filtered] = 0
             if page_value_cache is not None:
                 page_value_cache[filtered] = 0
-        mx.eval(*[c.key_cache for c in self.kv_caches if hasattr(c, "key_cache")])
+            touched_caches.append(key_cache)
+        if touched_caches:
+            try:
+                mx.eval(*touched_caches)
+            except RuntimeError as exc:
+                if _MLX_NO_PRIMITIVE_MSG not in str(exc):
+                    raise
 
     def _assign_row_mapping(
         self,
@@ -803,6 +971,10 @@ class ModelRunner:
     def detach_request(self, request_id: str) -> int | None:
         """Detach a request from the sequence buffer and clear its cache row.
 
+        Also clears the failed-compiled-forward key set so that
+        previously failed compilation keys can be retried for new
+        requests.
+
         Args:
             request_id: The request to detach.
 
@@ -815,6 +987,7 @@ class ModelRunner:
         row_index = self.sequence_buffer.get_row_index(request_id)
         self.sequence_buffer.remove_sequence(request_id)
         self._clear_row_mapping(row_index)
+        self._failed_compiled_forward_keys.clear()
         return row_index
 
     def _move_cache_row(self, from_index: int, to_index: int) -> None:
@@ -906,19 +1079,72 @@ class ModelRunner:
             positions.append(list(range(start, start + len(sequence.token_ids))))
         return positions
 
-    def _forward_step(self, request: ExecutionRequest) -> tuple[Any, np.ndarray]:
-        """Execute a single model forward pass for the given execution request.
+    def _forward_step_raw(self, request: ExecutionRequest) -> Any:
+        """Execute a single model forward pass and return the raw output."""
+        if len(request.sequences) == 1:
+            sequence = request.sequences[0]
+            query_len = len(sequence.token_ids)
+            query_lens = [query_len]
+            slot_ids = [int(sequence.row_index)]
+            positions = [list(range(int(sequence.num_computed_tokens), int(sequence.num_computed_tokens) + query_len))]
+            multimodal = request.multimodal
+            extra = dict(request.extra)
+            extra.pop("kv_caches", None)
+            has_extra = multimodal is not None or extra
 
-        Constructs the input tensors, cache views, and metadata, then
-        invokes the model callable.
+            logger.debug(
+                "Forward step: batch_size=1, query_lens=%s, paged_cache=%s",
+                query_lens,
+                bool(self.kv_caches),
+            )
 
-        Args:
-            request: The :class:`ExecutionRequest` describing this step.
+            if self.kv_caches:
+                batch_token_ids = mx.array(np.asarray(sequence.token_ids, dtype=np.int32))
 
-        Returns:
-            A ``(raw_output, logits)`` tuple where *logits* is a 2-D
-            NumPy array of shape ``(batch_size, vocab_size)``.
-        """
+                if not has_extra:
+                    compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
+                    if compiled_entry is not None:
+                        try:
+                            self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
+                            compiled_fn = compiled_entry["fn"]
+                            logits = compiled_fn(batch_token_ids)
+                            mx.eval(logits)
+                            self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
+                            raw_output = {"logits": logits}
+                            return raw_output
+                        except (RuntimeError, ValueError):
+                            key = (
+                                tuple(int(slot_id) for slot_id in slot_ids),
+                                tuple(int(query_len) for query_len in query_lens),
+                            )
+                            self._compiled_forwards.pop(key, None)
+                            self._failed_compiled_forward_keys.add(key)
+                            logger.debug("Compiled forward failed, falling back to eager")
+
+                cache_views = self._cache_views
+                cache_metadata = self._page_metadata_for(
+                    tuple(int(query_len) for query_len in query_lens),
+                    tuple(int(slot_id) for slot_id in slot_ids),
+                )
+            else:
+                batch_token_ids = mx.array(np.asarray(sequence.token_ids, dtype=np.int32)[None, :])
+                cache_views = None
+                cache_metadata = None
+
+            raw_output = self._call_model(
+                input_ids=batch_token_ids,
+                cache_views=cache_views,
+                cache_metadata=cache_metadata,
+                query_lens=query_lens,
+                positions=positions,
+                slot_ids=slot_ids,
+                return_dict=True,
+                multimodal_inputs=multimodal,
+                multimodal=multimodal,
+                **extra,
+            )
+            return raw_output
+
         batch_token_ids, query_lens = self._pad_batch_token_ids(request.sequences)
         logger.debug(
             "Forward step: batch_size=%d, query_lens=%s, paged_cache=%s",
@@ -951,15 +1177,18 @@ class ModelRunner:
                         raw_output = {"logits": logits}
                         return raw_output, _as_numpy_logits(raw_output)
                     except (RuntimeError, ValueError):
+                        key = (
+                            tuple(int(slot_id) for slot_id in slot_ids),
+                            tuple(int(query_len) for query_len in query_lens),
+                        )
+                        self._compiled_forwards.pop(key, None)
+                        self._failed_compiled_forward_keys.add(key)
                         logger.debug("Compiled forward failed, falling back to eager")
 
-            from easymlx.caching import PageMetadata, build_query_start_loc
-
-            cache_views = list(self.kv_caches)
-            cache_metadata = PageMetadata(
-                query_start_loc=build_query_start_loc(query_lens),
-                is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
-                slot_ids=tuple(int(s) for s in slot_ids),
+            cache_views = self._cache_views
+            cache_metadata = self._page_metadata_for(
+                tuple(int(query_len) for query_len in query_lens),
+                tuple(int(slot_id) for slot_id in slot_ids),
             )
         else:
             batch_token_ids, query_lens = self._pad_batch_token_ids(request.sequences)
@@ -968,8 +1197,7 @@ class ModelRunner:
             cache_views = None
             cache_metadata = None
 
-        raw_output = _call_with_filtered_kwargs(
-            self.model,
+        raw_output = self._call_model(
             input_ids=batch_token_ids,
             cache_views=cache_views,
             cache_metadata=cache_metadata,
@@ -981,6 +1209,22 @@ class ModelRunner:
             multimodal=multimodal,
             **extra,
         )
+        return raw_output
+
+    def _forward_step(self, request: ExecutionRequest) -> tuple[Any, np.ndarray]:
+        """Execute a single model forward pass for the given execution request.
+
+        Constructs the input tensors, cache views, and metadata, then
+        invokes the model callable.
+
+        Args:
+            request: The :class:`ExecutionRequest` describing this step.
+
+        Returns:
+            A ``(raw_output, logits)`` tuple where *logits* is a 2-D
+            NumPy array of shape ``(batch_size, vocab_size)``.
+        """
+        raw_output = self._forward_step_raw(request)
         return raw_output, _as_numpy_logits(raw_output)
 
     def _apply_updates_to_sequence_buffer(self, updates: list[ExecutionUpdate]) -> None:
@@ -995,6 +1239,29 @@ class ModelRunner:
             self.sequence_buffer.append_output_tokens(update.request_id, update.sampled_token_ids)
             if update.num_computed_tokens is not None:
                 self.sequence_buffer.set_num_computed_tokens(update.request_id, update.num_computed_tokens)
+
+    def sample_next_token(self, logits: np.ndarray, *, sampling_params: SamplingParams | None) -> int:
+        """Sample a single token using the runner's RNG state.
+
+        Args:
+            logits: Logit scores for one sequence.
+            sampling_params: Sampling configuration for the sequence.
+
+        Returns:
+            The sampled token ID.
+        """
+        return _sample_next_token(
+            logits,
+            sampling_params=sampling_params,
+            rng=self._rng,
+        )
+
+    def sample_greedy_token_from_output(self, output: Any) -> int:
+        """Greedily sample the next token from a raw model output."""
+        token_ids = _argmax_token_ids(output)
+        if token_ids.size == 0:
+            raise RuntimeError("Runner produced no greedy token IDs.")
+        return int(token_ids[0])
 
     def run(self, request: ExecutionRequest) -> ExecutionResult:
         """Execute a full scheduling step: forward pass, sampling, and bookkeeping.
@@ -1036,7 +1303,7 @@ class ModelRunner:
             num_computed_tokens = int(sequence.num_computed_tokens) + len(sequence.token_ids)
             sequence_logits = np.asarray(logits[index], dtype=np.float64)
             sampling_params = request.sampling_for(sequence.request_id)
-            sampled_token = _sample_next_token(sequence_logits, sampling_params=sampling_params, rng=self._rng)
+            sampled_token = self.sample_next_token(sequence_logits, sampling_params=sampling_params)
             updates.append(
                 ExecutionUpdate(
                     request_id=sequence.request_id,
