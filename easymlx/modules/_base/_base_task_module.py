@@ -73,7 +73,6 @@ class BaseTaskModule[ModelT: BaseModelProtocol, ConfigT: EasyMLXBaseConfig](Easy
         _config_class (type | None): The configuration class for this model.
     """
 
-    # Class variables for registration (to be set by subclasses)
     _task_type: TaskType | None = None
     _auto_register: bool = True
     _model_type: str | None = None
@@ -91,11 +90,8 @@ class BaseTaskModule[ModelT: BaseModelProtocol, ConfigT: EasyMLXBaseConfig](Easy
         """
         super().__init_subclass__(**kwargs)
 
-        # Auto-register if enabled and task type is specified
         if cls._auto_register and cls._task_type is not None:
-            # Only register if this is a concrete subclass with a model type
             if cls._model_type is not None and cls._config_class is not None:
-                # Apply registration decorator
                 register_module(
                     task_type=cls._task_type,
                     config=cls._config_class,
@@ -109,12 +105,10 @@ class BaseTaskModule[ModelT: BaseModelProtocol, ConfigT: EasyMLXBaseConfig](Easy
         base_model_class: type[ModelT] | None = None,
         base_model_name: str = "model",
         *,
-        # Feature flags
         tie_word_embeddings: bool = False,
         logit_cap: float | None = None,
         router_aux_loss_coef: float | None = None,
         pooling_strategy: str = "last",
-        # Head configuration
         head_bias: bool = False,
     ):
         """Initialize the base task module.
@@ -148,20 +142,16 @@ class BaseTaskModule[ModelT: BaseModelProtocol, ConfigT: EasyMLXBaseConfig](Easy
         """
         super().__init__(config)
 
-        # Create or store base model
         if base_model is None:
             if base_model_class is None:
                 raise ValueError("Either base_model or base_model_class must be provided")
             base_model = base_model_class(config=config)
 
-        # Store base model with custom attribute name
         setattr(self, base_model_name, base_model)
         self._base_model_name = base_model_name
 
-        # Store head configuration
         self._head_bias = head_bias
 
-        # Initialize features
         self._logit_cap_feature = LogitCapFeature(logit_cap) if logit_cap is not None else None
         self._tie_embeddings_feature = TieEmbeddingsFeature(tie_word_embeddings)
         self._router_aux_loss_feature = (

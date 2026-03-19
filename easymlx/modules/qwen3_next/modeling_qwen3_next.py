@@ -28,7 +28,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -43,7 +43,7 @@ from easymlx.operations.kernels.gated_delta_rule import GatedDeltaRuleOp
 
 from .qwen3_next_configuration import Qwen3NextConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -65,6 +65,25 @@ def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
     if name == "gelu":
         return nn.gelu
     raise ValueError(f"Unsupported activation: {name!r}")
+
+
+def _resolve_module_activation_dtype(module: nn.Module, fallback: mx.Dtype) -> mx.Dtype:
+    """Return a real floating activation dtype for ``module``.
+
+    Quantized MLX linears store packed weights in integer dtypes, so using
+    ``module.weight.dtype`` for activations is incorrect. Prefer any floating
+    parameter/bias dtype exposed by the module and otherwise fall back to the
+    provided runtime dtype.
+    """
+
+    for attr in ("bias", "biases", "scales", "weight"):
+        value = getattr(module, attr, None)
+        dtype = getattr(value, "dtype", None)
+        if dtype is not None and mx.issubdtype(dtype, mx.floating):
+            return dtype
+    if mx.issubdtype(fallback, mx.floating):
+        return fallback
+    return mx.float16
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -148,6 +167,21 @@ class Qwen3NextRMSNormGated(nn.Module):
         return hidden_states.astype(input_dtype)
 
 
+class _PartialRoPE(nn.Module):
+    """Apply rotary embeddings only to the leading ``rotary_dim`` dimensions."""
+
+    def __init__(self, rope: nn.Module, rotary_dim: int):
+        super().__init__()
+        self.rope = rope
+        self.rotary_dim = int(rotary_dim)
+
+    def __call__(self, x: mx.array, offset: int | mx.array = 0) -> mx.array:
+        if self.rotary_dim <= 0 or self.rotary_dim >= x.shape[-1]:
+            return self.rope(x, offset=offset)
+        x_rot = self.rope(x[..., : self.rotary_dim], offset=offset)
+        return mx.concatenate([x_rot, x[..., self.rotary_dim :]], axis=-1)
+
+
 class Qwen3NextFullAttention(nn.Module):
     """Full softmax attention with partial RoPE and gated output for Qwen3-Next.
 
@@ -213,59 +247,20 @@ class Qwen3NextFullAttention(nn.Module):
 
         self.rope = None
         if self.rotary_dim > 0:
-            self.rope = get_rope(
-                dims=self.rotary_dim,
-                base=config.rope_theta,
-                traditional=False,
-                scaling_config=config.rope_scaling,
-                max_position_embeddings=config.max_position_embeddings,
+            self.rope = _PartialRoPE(
+                get_rope(
+                    dims=self.rotary_dim,
+                    base=config.rope_theta,
+                    traditional=False,
+                    scaling_config=config.rope_scaling,
+                    max_position_embeddings=config.max_position_embeddings,
+                ),
+                rotary_dim=self.rotary_dim,
             )
 
-        self.attention_performer = AttentionPerformer(scale=self.scale)
-
-    def _apply_partial_rope_blhd(self, tensor: mx.array, *, offset: int = 0) -> mx.array:
-        """Apply partial RoPE on ``[B, L, H, D]`` layout.
-
-        Transposes internally to ``[B, H, L, D]`` for the rope module, applies
-        RoPE to the first ``rotary_dim`` dimensions, and transposes back.
-
-        Args:
-            tensor: Input tensor of shape ``(batch, seq_len, heads, head_dim)``.
-            offset: Position offset for the rotary embeddings.
-
-        Returns:
-            Tensor with partial RoPE applied, same shape as input.
-        """
-        if self.rope is None or self.rotary_dim <= 0:
-            return tensor
-        t = tensor.transpose(0, 2, 1, 3)
-        head_rot = t[..., : self.rotary_dim]
-        head_pass = t[..., self.rotary_dim :]
-        head_rot = self.rope(head_rot, offset=offset)
-        t = mx.concatenate([head_rot, head_pass], axis=-1)
-        return t.transpose(0, 2, 1, 3)
-
-    def _apply_partial_rope_thd(self, tensor: mx.array, *, offset: int = 0) -> mx.array:
-        """Apply partial RoPE on ``[T, H, D]`` layout.
-
-        Adds a batch dimension, transposes for the rope module, applies RoPE,
-        and squeezes back to 3-D.
-
-        Args:
-            tensor: Input tensor of shape ``(total_tokens, heads, head_dim)``.
-            offset: Position offset for the rotary embeddings.
-
-        Returns:
-            Tensor with partial RoPE applied, same shape as input.
-        """
-        if self.rope is None or self.rotary_dim <= 0:
-            return tensor
-        t = tensor[None].transpose(0, 2, 1, 3)
-        head_rot = t[..., : self.rotary_dim]
-        head_pass = t[..., self.rotary_dim :]
-        head_rot = self.rope(head_rot, offset=offset)
-        t = mx.concatenate([head_rot, head_pass], axis=-1)
-        return t.transpose(0, 2, 1, 3).squeeze(0)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,
@@ -295,19 +290,11 @@ class Qwen3NextFullAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        offset = cache_view.offset if cache_view is not None else 0
-        if q.ndim == 4:
-            q = self._apply_partial_rope_blhd(q, offset=offset)
-            k = self._apply_partial_rope_blhd(k, offset=offset)
-        else:
-            q = self._apply_partial_rope_thd(q, offset=offset)
-            k = self._apply_partial_rope_thd(k, offset=offset)
-
         attn = self.attention_performer(
             q,
             k,
             v,
-            rope=None,
+            rope=self.rope,
             mask=mask,
             cache_view=cache_view,
             cache_metadata=cache_metadata,
@@ -394,9 +381,14 @@ class Qwen3NextLinearAttention(nn.Module):
 
     def reset_state(self, batch_size: int = 1):
         """Reset conv and recurrent states for a new generation."""
-        self._conv_state = mx.zeros((batch_size, self.conv_dim, self.d_conv))
+        conv_dtype = _resolve_module_activation_dtype(self.in_proj_qkv, mx.float16)
+        self._conv_state = mx.zeros(
+            (batch_size, self.conv_dim, self.d_conv),
+            dtype=conv_dtype,
+        )
         self._recurrent_state = mx.zeros(
             (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
+            dtype=mx.float32,
         )
 
     def __call__(
@@ -443,7 +435,7 @@ class Qwen3NextLinearAttention(nn.Module):
         A = -mx.exp(self.A_log.astype(mx.float32))
         alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
         decay = A * nn.softplus(alpha_biased)
-        beta = mx.sigmoid(beta_raw)
+        beta = mx.sigmoid(beta_raw.astype(mx.float32))
 
         if is_decode and self._conv_state is not None:
             conv_x = conv_input[:, 0, :]
@@ -456,7 +448,10 @@ class Qwen3NextLinearAttention(nn.Module):
             if seq_len >= self.d_conv:
                 self._conv_state = conv_input[:, -self.d_conv :, :].transpose(0, 2, 1)
             else:
-                self._conv_state = mx.zeros((batch_size, self.conv_dim, self.d_conv))
+                self._conv_state = mx.zeros(
+                    (batch_size, self.conv_dim, self.d_conv),
+                    dtype=conv_input.dtype,
+                )
                 self._conv_state = mx.concatenate(
                     [
                         self._conv_state[:, :, seq_len:],
@@ -466,6 +461,9 @@ class Qwen3NextLinearAttention(nn.Module):
                 )
         else:
             conv_out = conv_input
+
+        if conv_out.dtype != mx.float32:
+            conv_out = conv_out.astype(mx.float32)
 
         query = conv_out[:, :, : self.key_dim].reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         key = conv_out[:, :, self.key_dim : self.key_dim * 2].reshape(
@@ -485,12 +483,13 @@ class Qwen3NextLinearAttention(nn.Module):
             decay_is_log=True,
             prefer_metal=True,
         )
-        output = gdr_output.attention_outputs.astype(self.out_proj.weight.dtype)
+        output = gdr_output.attention_outputs
         self._recurrent_state = gdr_output.recurrent_state
 
-        output = output.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)
-        gate = z.reshape(batch_size * seq_len, self.num_k_heads, self.head_v_dim)
-        output = self.norm(output, gate)
+        output = self.norm(output, z)
+        out_proj_input_dtype = _resolve_module_activation_dtype(self.out_proj, hidden_states.dtype)
+        if output.dtype != out_proj_input_dtype:
+            output = output.astype(out_proj_input_dtype)
         output = output.reshape(batch_size, seq_len, -1)
         output = self.out_proj(output)
 

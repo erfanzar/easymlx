@@ -65,6 +65,11 @@ class TracePagedCache:
         self.key_cache = np.zeros(shape, dtype=np.float16)
         self.value_cache = np.zeros_like(self.key_cache)
 
+    @property
+    def cache(self):
+        """Compatibility property: operations may access ``view.cache``."""
+        return self
+
     def reset(self, seq_idx: int) -> None:
         self.kv_lens[int(seq_idx)] = 0
         self.block_tables[int(seq_idx), :] = -1

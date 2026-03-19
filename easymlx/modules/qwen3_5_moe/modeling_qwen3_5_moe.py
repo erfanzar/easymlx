@@ -25,7 +25,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import CausalLMOutput, EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.layers.attention import build_attention_mask
@@ -41,7 +41,7 @@ from .qwen3_5_moe_configuration import (
     Qwen3_5MoeTextConfig,
 )
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 @register_module(task_type=TaskType.BASE_MODULE, config=Qwen3_5MoeTextConfig, model_type="qwen3_5_moe_text")

@@ -25,7 +25,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["hunyuan_a13b"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["hunyuan_a13b"])
 class HunyuanA13BReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Hunyuan A13B models using <think>...</think> tags."""
 

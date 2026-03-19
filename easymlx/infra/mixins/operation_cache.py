@@ -124,7 +124,7 @@ class OperationsCacheInfo:
         combined_metadata: Union of metadata requirements across layers.
         is_hybrid_model: Whether the model mixes attention and
             recurrent layer types.
-        supports_paged: Whether all operations support ``PagedKVCache``.
+        supports_paged: Whether all operations support ``PageCacheView``.
         supports_transformer_cache: Whether all operations support
             ``TransformerCache``.
         requires_hybrid_cache: Whether the model needs ``HybridCache``
@@ -269,10 +269,6 @@ class OperationCacheMixin:
             pass
         return None
 
-    # ------------------------------------------------------------------
-    # Main entry point
-    # ------------------------------------------------------------------
-
     def get_operations_cache_info(
         self,
         mode: ExecutionMode = ExecutionMode.MIXED,
@@ -295,10 +291,6 @@ class OperationCacheMixin:
             if info.layers:
                 return info
         return self._get_operations_cache_info_from_config(mode)
-
-    # ------------------------------------------------------------------
-    # Config-based discovery (primary for easymlx)
-    # ------------------------------------------------------------------
 
     def _get_operations_cache_info_from_config(
         self,
@@ -457,10 +449,6 @@ class OperationCacheMixin:
             has_separate_decode_ops=decode_op != prefill_op,
         )
 
-    # ------------------------------------------------------------------
-    # Dynamic discovery (fallback for complex architectures)
-    # ------------------------------------------------------------------
-
     def get_operations_cache_info_dynamic(
         self,
         mode: ExecutionMode = ExecutionMode.MIXED,
@@ -485,7 +473,6 @@ class OperationCacheMixin:
         seen_op_ids: set[int] = set()
         has_separate_decode = False
 
-        # Locate the layer list on the model.
         model_layers: list | None = None
         for attr_name in ("layers", "h", "blocks"):
             candidate = getattr(self, attr_name, None)
@@ -546,12 +533,10 @@ class OperationCacheMixin:
             if attr_value is None:
                 continue
 
-            # AttentionPerformer — simple performer, just note the layer.
             if isinstance(attr_value, AttentionPerformer):
                 if id(attr_value) in seen_op_ids:
                     continue
                 seen_op_ids.add(id(attr_value))
-                # AttentionPerformer is a vanilla attention helper; default reqs.
                 reqs = OperationRequirements.default("attention_performer")
                 layer_info = LayerOperationInfo(
                     layer_index=layer_idx,
@@ -566,7 +551,6 @@ class OperationCacheMixin:
                 layers.append(layer_info)
                 continue
 
-            # OperationExecutor — richer info available.
             if isinstance(attr_value, OperationExecutor):
                 if id(attr_value) in seen_op_ids:
                     continue
@@ -603,7 +587,6 @@ class OperationCacheMixin:
                     layers.append(layer_info)
                 continue
 
-            # Bare BaseOperation instance on a module attribute.
             if isinstance(attr_value, BaseOperation):
                 if id(attr_value) in seen_op_ids:
                     continue
@@ -632,7 +615,6 @@ class OperationCacheMixin:
                 layers.append(layer_info)
                 continue
 
-            # Recurse into child nn.Modules.
             if isinstance(attr_value, nn.Module):
                 self._walk_layer_for_ops(
                     attr_value,
@@ -641,10 +623,6 @@ class OperationCacheMixin:
                     layers,
                     seen_op_ids,
                 )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _build_cache_info_from_layers(
         self,
@@ -783,11 +761,6 @@ class OperationCacheMixin:
         return cache_view_classes
 
 
-# ---------------------------------------------------------------------------
-# Module-private helpers
-# ---------------------------------------------------------------------------
-
-
 def _supported_caches(reqs: OperationRequirements) -> CacheType:
     """Infer supported cache types from an :class:`OperationRequirements`.
 
@@ -813,7 +786,6 @@ def _supported_caches(reqs: OperationRequirements) -> CacheType:
 
     cls = reqs.cache_view_cls
     if cls is None:
-        # No explicit cache view — assume standard attention support.
         return CacheType.TRANSFORMER | CacheType.PAGED
 
     result = CacheType.NONE
@@ -825,7 +797,6 @@ def _supported_caches(reqs: OperationRequirements) -> CacheType:
         result |= CacheType.HYBRID | CacheType.TRANSFORMER | CacheType.RECURRENT
 
     if result == CacheType.NONE:
-        # Fallback for unknown view classes.
         return CacheType.TRANSFORMER | CacheType.PAGED
 
     return result

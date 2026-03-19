@@ -54,7 +54,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module(["qwen3_coder"])  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module(["qwen3_coder"])
 class Qwen3CoderToolParser(ToolParser):
     """Tool parser for Qwen3 Coder models.
 

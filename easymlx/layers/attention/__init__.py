@@ -17,7 +17,7 @@
 Provides access to all attention-related components including:
 
 - Operation implementations (``Vanilla``, ``ScaledDotProductAttention``,
-  ``UnifiedAttention``).
+  ``UnifiedAttention``, ``PageAttention``).
 - Flexible runtime dispatch (:class:`FlexibleAttentionModule`,
   :func:`scaled_dot_product_attention`).
 - Mask construction helpers (:func:`create_causal_mask`,
@@ -30,6 +30,8 @@ Provides access to all attention-related components including:
 from __future__ import annotations
 
 from easymlx.operations import (
+    PageAttention,
+    PageAttn,
     ScaledDotProductAttention,
     UnifiedAttention,
     UnifiedAttn,
@@ -51,6 +53,8 @@ __all__ = (
     "AttentionMechanisms",
     "AttentionPerformer",
     "FlexibleAttentionModule",
+    "PageAttention",
+    "PageAttn",
     "PagedAttentionInputs",
     "ScaledDotProductAttention",
     "UnifiedAttention",

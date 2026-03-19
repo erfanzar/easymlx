@@ -28,7 +28,7 @@ from functools import lru_cache
 
 import mlx.core as mx
 
-from easymlx.caching import PageCache, PageMetadata
+from easymlx.caching import PageCacheView, PageMetadata
 from easymlx.operations import (
     AttentionOutput,
     ExecutionMode,
@@ -55,6 +55,9 @@ class AttentionMechanisms(StrEnum):
     VANILLA = "vanilla"
     PAGED_ATTENTION = "page_attention"
     UNIFIED_ATTENTION = "unified_attention"
+
+
+_DEFAULT_PAGED_ATTENTION_MECHANISM = AttentionMechanisms.UNIFIED_ATTENTION
 
 
 def create_causal_mask(seq_len: int, *, window_size: int | None = None) -> mx.array:
@@ -237,7 +240,9 @@ def _resolve_paged_impl_name(mechanism: AttentionMechanisms) -> str:
     Raises:
         ValueError: If *mechanism* is not a supported paged mechanism.
     """
-    if mechanism in {AttentionMechanisms.PAGED_ATTENTION, AttentionMechanisms.UNIFIED_ATTENTION}:
+    if mechanism == AttentionMechanisms.PAGED_ATTENTION:
+        return AttentionMechanisms.PAGED_ATTENTION.value
+    if mechanism == AttentionMechanisms.UNIFIED_ATTENTION:
         return AttentionMechanisms.UNIFIED_ATTENTION.value
     raise ValueError(f"Unsupported paged attention mechanism: {mechanism.value!r}")
 
@@ -282,7 +287,7 @@ class FlexibleAttentionModule:
         self,
         *,
         attention_mechanism: AttentionMechanisms | str = AttentionMechanisms.AUTO,
-        paged_attention_mechanism: AttentionMechanisms | str = AttentionMechanisms.UNIFIED_ATTENTION,
+        paged_attention_mechanism: AttentionMechanisms | str = _DEFAULT_PAGED_ATTENTION_MECHANISM,
         metadata: OperationMetadata | None = None,
     ) -> None:
         """Initialize the flexible attention module.
@@ -308,7 +313,7 @@ class FlexibleAttentionModule:
         self,
         *,
         cache_metadata: PageMetadata | None,
-        cache_view: PageCache | None,
+        cache_view: PageCacheView | None,
     ) -> OperationExecutor:
         """Select the appropriate executor based on cache arguments.
 
@@ -338,7 +343,7 @@ class FlexibleAttentionModule:
         *,
         cache: tp.Any | None = None,
         cache_metadata: PageMetadata | None = None,
-        cache_view: PageCache | None = None,
+        cache_view: PageCacheView | None = None,
         scale: float,
         mask: mx.array | str | None = None,
         sinks: mx.array | None = None,
@@ -354,7 +359,8 @@ class FlexibleAttentionModule:
             cache: Generic cache argument (may contain
                 :class:`PageMetadata`).
             cache_metadata: Explicit paged attention metadata.
-            cache_view: Paged cache view object.
+            cache_view: Paged cache view object (:class:`PageCacheView`
+                or ``None``).
             scale: Attention scale factor (typically
                 ``1 / sqrt(head_dim)``).
             mask: Attention mask or the string ``"causal"``.
@@ -421,12 +427,12 @@ def scaled_dot_product_attention(
     *,
     cache: tp.Any | None = None,
     cache_metadata: PageMetadata | None = None,
-    cache_view: PageCache | None = None,
+    cache_view: PageCacheView | None = None,
     scale: float,
     mask: mx.array | str | None = None,
     sinks: mx.array | None = None,
     attention_mechanism: AttentionMechanisms | str = AttentionMechanisms.AUTO,
-    paged_attention_mechanism: AttentionMechanisms | str = AttentionMechanisms.UNIFIED_ATTENTION,
+    paged_attention_mechanism: AttentionMechanisms | str = _DEFAULT_PAGED_ATTENTION_MECHANISM,
     return_output: bool = False,
     **kwargs: tp.Any,
 ) -> AttentionOutput | mx.array:

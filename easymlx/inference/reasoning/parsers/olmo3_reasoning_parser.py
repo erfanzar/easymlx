@@ -21,7 +21,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["olmo3"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["olmo3"])
 class Olmo3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for AI2 OLMo3 models.
 

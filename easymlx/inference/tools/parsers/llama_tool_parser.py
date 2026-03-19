@@ -45,8 +45,8 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from transformers import PreTrainedTokenizerBase
 
 from ...openai_api_modules import (
@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 @ToolParserManager.register_module("llama3_json")
-@ToolParserManager.register_module("llama4_json")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("llama4_json")
 class Llama3JsonToolParser(ToolParser):
     """Tool call parser for Llama 3.x and 4 models with JSON format.
 

@@ -25,6 +25,8 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+_getenv = os.getenv
+
 
 def check_bool_flag(name: str, default: bool = False) -> bool:
     """Check whether an environment variable represents a truthy boolean.
@@ -41,12 +43,10 @@ def check_bool_flag(name: str, default: bool = False) -> bool:
         ``False`` otherwise (or ``default`` if unset).
 
     Example:
-        >>> import os
-        >>> os.environ["MY_FLAG"] = "yes"
-        >>> check_bool_flag("MY_FLAG")
-        True
+        >>> check_bool_flag("MY_FLAG")  # returns False if MY_FLAG is not set
+        False
     """
-    value = os.getenv(name)
+    value = _getenv(name)
     if value is None:
         return bool(default)
     return value.strip().lower() in {"1", "true", "yes", "on"}

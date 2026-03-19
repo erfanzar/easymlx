@@ -37,8 +37,8 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -56,7 +56,7 @@ from ..utils import extract_intermediate_diff
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("jamba")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("jamba")
 class JambaToolParser(ToolParser):
     """Tool parser for Jamba models.
 
@@ -101,7 +101,7 @@ class JambaToolParser(ToolParser):
                 in the tokenizer vocabulary.
         """
         super().__init__(tokenizer)
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # pyright: ignore[reportMissingImports]
+        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
         if isinstance(self.model_tokenizer, MistralTokenizer):
             raise ValueError("Detected a MistralTokenizer tokenizer when using a Jamba model")

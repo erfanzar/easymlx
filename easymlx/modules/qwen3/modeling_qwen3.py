@@ -19,7 +19,7 @@ Structure mirrors EasyDeL's qwen3:
   -> Qwen3Model -> Qwen3ForCausalLM
 
 Unified ``__call__`` at every level -- cache_view is either
-``TransformerCacheView`` (standard) or ``PageCache`` (paged serving).
+``TransformerCacheView`` (standard) or ``PageCacheView`` (paged serving).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -40,7 +40,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .qwen3_configuration import Qwen3Config
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 class Qwen3Attention(nn.Module):
@@ -98,7 +98,9 @@ class Qwen3Attention(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

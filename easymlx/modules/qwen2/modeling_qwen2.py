@@ -17,7 +17,7 @@
 This module provides the Qwen2 transformer architecture on MLX, featuring
 grouped-query attention with optional sliding-window support, a SiLU-gated
 MLP, and a causal language model wrapper. The unified ``__call__`` API
-accepts both ``TransformerCacheView`` and ``PageCache`` for flexible serving.
+accepts both ``TransformerCacheView`` and ``PageCacheView`` for flexible serving.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -38,7 +38,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .qwen2_configuration import Qwen2Config
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 class Qwen2Attention(nn.Module):
@@ -85,7 +85,9 @@ class Qwen2Attention(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

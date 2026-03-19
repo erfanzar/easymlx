@@ -212,11 +212,9 @@ class BaseEmbeddingModule[ModelT: nn.Module, ConfigT: EasyMLXBaseConfig](EasyMLX
             pad_token_id=getattr(self.config, "pad_token_id", None),
         )
 
-        # Optional Matryoshka truncation
         if self._embedding_dim is not None:
             embeddings = embeddings[:, : self._embedding_dim]
 
-        # Optional L2 normalization
         if self._normalize_embeddings:
             norms = mx.linalg.norm(embeddings, axis=-1, keepdims=True)
             embeddings = embeddings / mx.maximum(norms, mx.array(1e-12))

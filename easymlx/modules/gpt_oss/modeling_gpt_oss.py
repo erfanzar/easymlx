@@ -24,7 +24,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.layers.attention import AttentionPerformer, build_attention_mask
@@ -34,7 +34,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .gpt_oss_configuration import GptOssConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def mlx_topk(values: mx.array, k: int, axis: int = -1) -> tuple[mx.array, mx.array]:
@@ -144,7 +144,9 @@ class AttentionBlock(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

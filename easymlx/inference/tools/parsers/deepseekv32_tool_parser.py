@@ -52,7 +52,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("deepseek_v32")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("deepseek_v32")
 class DeepSeekV32ToolParser(ToolParser):
     """Tool parser for DeepSeek V3.2 models using DSML format.
 
@@ -122,7 +122,6 @@ class DeepSeekV32ToolParser(ToolParser):
 
         self.prev_tool_call_arr: list[dict] = []
 
-        # Sentinel tokens
         self.dsml_token: str = "｜DSML｜"
         self.dsml_start_check: str = "<" + self.dsml_token
         self.tool_call_start_token: str = "<｜DSML｜function_calls>"
@@ -132,15 +131,12 @@ class DeepSeekV32ToolParser(ToolParser):
         self.parameter_prefix: str = "<｜DSML｜parameter name="
         self.parameter_end_token: str = "</｜DSML｜parameter>"
 
-        # Streaming state variables
         self.current_tool_name_sent: bool = False
-        # Override base class type - we use string IDs for tool calls
         self.current_tool_id: str | None = None
         self.streamed_args_for_tool: list[str] = []
         self.is_tool_call_started: bool = False
         self.failed_count: int = 0
 
-        # Initialize streaming state variables
         self.current_tool_index: int = 0
         self.invoke_index: int = 0
         self.header_sent: bool = False
@@ -155,10 +151,8 @@ class DeepSeekV32ToolParser(ToolParser):
         self.accumulated_params: dict = {}
         self.streaming_request: ChatCompletionRequest | None = None
 
-        # Enhanced streaming state - reset for each new message
         self._reset_streaming_state()
 
-        # Regex patterns for complete parsing
         self.tool_call_complete_regex = re.compile(r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>", re.DOTALL)
         self.invoke_complete_regex = re.compile(r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>', re.DOTALL)
         self.parameter_complete_regex = re.compile(

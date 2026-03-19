@@ -51,7 +51,7 @@ from ..utils import consume_space
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("hunyuan_a13b")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("hunyuan_a13b")
 class HunyuanA13BToolParser(ToolParser):
     """Tool parser for Hunyuan A13B model outputs.
 
@@ -113,7 +113,6 @@ class HunyuanA13BToolParser(ToolParser):
 
         self.tool_empty_arg_reg = re.compile(r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{\s*\}')
 
-        # TODO: not support nested json object in fc arguments.
         self.tool_non_empty_arg_reg = re.compile(
             r'"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*(\{(?:[^{}]|(?:\{[^{}]*\}))*\})'
         )

@@ -50,7 +50,6 @@ References:
 from __future__ import annotations
 
 import math
-import os
 import typing as tp
 from dataclasses import dataclass
 
@@ -84,8 +83,6 @@ class GatedDeltaRuleOutput(AttentionOutput):
 
 
 _MAX_GDR_METAL_HEAD_DIM = 128
-_ENABLE_GDR_METAL = os.getenv("EASYMLX_GDR_USE_METAL", "1").strip().lower() not in {"0", "false", "no", "off"}
-_GDR_RECURRENT_METAL_KERNEL: tp.Any | None = None
 
 _GDR_METAL_HEADER = r"""
 #include <metal_stdlib>
@@ -151,6 +148,75 @@ _GDR_RECURRENT_METAL_SOURCE = r"""
     output[v_base + value_idx] = out_val;
 """
 
+_GDR_CHUNKED_METAL_SOURCE = r"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint batch_idx = threadgroup_position_in_grid.y;
+    uint head_idx = threadgroup_position_in_grid.z;
+    uint tg_size = threads_per_threadgroup.x;
+
+    int batch = query_shape[0];
+    int seq_len = query_shape[1];
+    int num_heads = query_shape[2];
+    int head_dim = query_shape[3];
+    int d_state = value_shape[3];
+    if (head_dim <= 0 || d_state <= 0 || seq_len <= 0) {
+        return;
+    }
+    if ((int)batch_idx >= batch || (int)head_idx >= num_heads) {
+        return;
+    }
+
+    threadgroup float q_shared[128];
+    threadgroup float k_shared[128];
+
+    bool active_lane = (int)tid < d_state;
+    int state_base = (((int)batch_idx * num_heads + (int)head_idx) * head_dim) * d_state;
+    if (active_lane) {
+        int lane = (int)tid;
+        for (int d = 0; d < head_dim; ++d) {
+            int state_idx = state_base + d * d_state + lane;
+            new_recurrent_state[state_idx] = (float)recurrent_state[state_idx];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int t = 0; t < seq_len; ++t) {
+        int qkv_base = (((int)batch_idx * seq_len + t) * num_heads + (int)head_idx);
+        int q_base = qkv_base * head_dim;
+        for (int d = (int)tid; d < head_dim; d += (int)tg_size) {
+            q_shared[d] = (float)query[q_base + d];
+            k_shared[d] = (float)key[q_base + d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (active_lane) {
+            int lane = (int)tid;
+            int value_idx = qkv_base * d_state + lane;
+            int beta_idx = ((int)batch_idx * seq_len + t) * num_heads + (int)head_idx;
+            float decay = (float)decay_scale[beta_idx];
+            float beta_t = (float)beta[beta_idx];
+
+            float kv_dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                int state_idx = state_base + d * d_state + lane;
+                float scaled_state = (float)new_recurrent_state[state_idx] * decay;
+                kv_dot += scaled_state * k_shared[d];
+            }
+
+            float delta = ((float)value[value_idx] - kv_dot) * beta_t;
+            float out_val = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                int state_idx = state_base + d * d_state + lane;
+                float new_state_val = (float)new_recurrent_state[state_idx] * decay + k_shared[d] * delta;
+                new_recurrent_state[state_idx] = new_state_val;
+                out_val += new_state_val * q_shared[d];
+            }
+            output[value_idx] = out_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
 
 def _next_power_of_two(value: int) -> int:
     """Return the next power of two greater than or equal to ``value``."""
@@ -158,18 +224,21 @@ def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def _get_gdr_recurrent_metal_kernel():
-    """Lazily compile the recurrent gated-delta Metal kernel."""
-    global _GDR_RECURRENT_METAL_KERNEL
-    if _GDR_RECURRENT_METAL_KERNEL is None:
-        _GDR_RECURRENT_METAL_KERNEL = mx.fast.metal_kernel(
-            name="gated_delta_rule_recurrent",
-            input_names=["query", "key", "value", "beta", "decay_scale", "recurrent_state"],
-            output_names=["output", "new_recurrent_state"],
-            header=_GDR_METAL_HEADER,
-            source=_GDR_RECURRENT_METAL_SOURCE,
-        )
-    return _GDR_RECURRENT_METAL_KERNEL
+_GDR_RECURRENT_METAL_KERNEL = mx.fast.metal_kernel(
+    name="gated_delta_rule_recurrent",
+    input_names=["query", "key", "value", "beta", "decay_scale", "recurrent_state"],
+    output_names=["output", "new_recurrent_state"],
+    header=_GDR_METAL_HEADER,
+    source=_GDR_RECURRENT_METAL_SOURCE,
+)
+
+_GDR_CHUNKED_METAL_KERNEL = mx.fast.metal_kernel(
+    name="gated_delta_rule_chunked",
+    input_names=["query", "key", "value", "beta", "decay_scale", "recurrent_state"],
+    output_names=["output", "new_recurrent_state"],
+    header=_GDR_METAL_HEADER,
+    source=_GDR_CHUNKED_METAL_SOURCE,
+)
 
 
 def _l2_normalize(x: mx.array, axis: int = -1, eps: float = 1e-6) -> mx.array:
@@ -265,6 +334,34 @@ def _scalar_decay_scale_for_metal(
     return None
 
 
+def _scalar_token_decay_scale_for_metal(
+    decay: mx.array | None,
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_heads: int,
+    decay_is_log: bool,
+) -> mx.array | None:
+    """Return ``[batch, seq_len, heads]`` decay scales for the chunked Metal path."""
+    if decay is None:
+        return mx.ones((batch_size, seq_len, num_heads), dtype=mx.float32)
+
+    decay = decay.astype(mx.float32)
+    if decay_is_log:
+        decay = mx.exp(decay)
+
+    if decay.ndim == 1 and decay.shape[0] == num_heads:
+        return mx.broadcast_to(decay[None, None, :], (batch_size, seq_len, num_heads))
+    if decay.ndim == 2:
+        if decay.shape == (batch_size, num_heads):
+            return mx.broadcast_to(decay[:, None, :], (batch_size, seq_len, num_heads))
+        if decay.shape == (seq_len, num_heads):
+            return mx.broadcast_to(decay[None, :, :], (batch_size, seq_len, num_heads))
+    if decay.ndim == 3 and decay.shape == (batch_size, seq_len, num_heads):
+        return decay
+    return None
+
+
 def _gdr_recurrent_step_metal(
     query: mx.array,
     key: mx.array,
@@ -280,7 +377,7 @@ def _gdr_recurrent_step_metal(
         raise ValueError("Unsupported head or state dimension for GDR Metal kernel.")
 
     tg_size = min(_MAX_GDR_METAL_HEAD_DIM, _next_power_of_two(max(head_dim, d_state)))
-    kernel = _get_gdr_recurrent_metal_kernel()
+    kernel = _GDR_RECURRENT_METAL_KERNEL
     output_shape = (query.shape[0], query.shape[1], value.shape[2])
     output, new_state = kernel(
         inputs=[query, key, value, beta, decay_scale, recurrent_state],
@@ -290,6 +387,33 @@ def _gdr_recurrent_step_metal(
         output_dtypes=[mx.float32, mx.float32],
     )
     return output[:, None, :, :], new_state
+
+
+def _gdr_chunked_forward_metal(
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    beta: mx.array,
+    decay_scale: mx.array,
+    recurrent_state: mx.array,
+) -> tuple[mx.array, mx.array]:
+    """Metal chunked gated-delta update for normalized float32 inputs."""
+    head_dim = int(query.shape[-1])
+    d_state = int(value.shape[-1])
+    if head_dim <= 0 or head_dim > _MAX_GDR_METAL_HEAD_DIM or d_state <= 0 or d_state > _MAX_GDR_METAL_HEAD_DIM:
+        raise ValueError("Unsupported head or state dimension for chunked GDR Metal kernel.")
+
+    tg_size = min(_MAX_GDR_METAL_HEAD_DIM, _next_power_of_two(max(head_dim, d_state)))
+    kernel = _GDR_CHUNKED_METAL_KERNEL
+    output_shape = value.shape
+    output, new_state = kernel(
+        inputs=[query, key, value, beta, decay_scale, recurrent_state],
+        grid=(tg_size, int(query.shape[0]), int(query.shape[2])),
+        threadgroup=(tg_size, 1, 1),
+        output_shapes=[output_shape, recurrent_state.shape],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return output, new_state
 
 
 def _recurrent_step(
@@ -354,7 +478,7 @@ def _recurrent_step(
     if decay is not None:
         decay_t = decay[:, 0] if decay.ndim >= 3 else decay
 
-    if prefer_metal and _ENABLE_GDR_METAL and b.ndim == 2:
+    if prefer_metal and b.ndim == 2:
         decay_scale = _scalar_decay_scale_for_metal(
             decay_t,
             batch_size=batch,
@@ -394,6 +518,7 @@ def _chunked_forward(
     chunk_size: int = 64,
     query_scale: float | None = None,
     decay_is_log: bool = False,
+    prefer_metal: bool = True,
 ) -> tuple[mx.array, mx.array]:
     """Chunked forward pass for prefill (seq_len > 1).
 
@@ -439,6 +564,27 @@ def _chunked_forward(
     else:
         state = recurrent_state.astype(mx.float32)
 
+    if prefer_metal and beta.ndim == 3:
+        decay_scale = _scalar_token_decay_scale_for_metal(
+            decay,
+            batch_size=batch,
+            seq_len=seq_len,
+            num_heads=num_heads,
+            decay_is_log=decay_is_log,
+        )
+        if decay_scale is not None:
+            try:
+                return _gdr_chunked_forward_metal(
+                    query=query.astype(mx.float32),
+                    key=key.astype(mx.float32),
+                    value=value.astype(mx.float32),
+                    beta=beta.astype(mx.float32),
+                    decay_scale=decay_scale,
+                    recurrent_state=state,
+                )
+            except (RuntimeError, ValueError):
+                pass
+
     output_chunks: list[mx.array] = []
     num_chunks = math.ceil(seq_len / chunk_size)
     for c in range(num_chunks):
@@ -446,7 +592,7 @@ def _chunked_forward(
         end = min(start + chunk_size, seq_len)
         chunk_len = end - start
 
-        q_c = query[:, start:end]  # [B, chunk_len, H, head_dim]
+        q_c = query[:, start:end]
         k_c = key[:, start:end]
         v_c = value[:, start:end]
         chunk_outputs: list[mx.array] = []
@@ -513,7 +659,21 @@ class GatedDeltaRuleOp(BaseOperation):
         ...     beta=beta,
         ...     decay=decay,
         ... )
+
+    Args:
+        metadata: Optional operation metadata for runtime configuration.
+        use_metal: Whether to prefer Metal GPU kernels for the gated
+            delta rule computation. Defaults to ``True``.
     """
+
+    def __init__(
+        self,
+        metadata: tp.Any | None = None,
+        *,
+        use_metal: bool = True,
+    ):
+        super().__init__(metadata=metadata)
+        self.use_metal = bool(use_metal)
 
     @classmethod
     def get_impl_name(cls) -> tuple[str, ...]:
@@ -556,7 +716,7 @@ class GatedDeltaRuleOp(BaseOperation):
         chunk_size: int = 64,
         query_scale: float | None = None,
         decay_is_log: bool = False,
-        prefer_metal: bool = True,
+        prefer_metal: bool | None = None,
         **kwargs: tp.Any,
     ) -> GatedDeltaRuleOutput:
         """Forward pass for gated delta rule attention.
@@ -592,6 +752,9 @@ class GatedDeltaRuleOp(BaseOperation):
             ``GatedDeltaRuleOutput`` containing attention outputs and
             updated states.
         """
+        if prefer_metal is None:
+            prefer_metal = self.use_metal
+
         runtime_dtype = mx.float32
         if self.metadata is not None and self.metadata.runtime_dtype is not None:
             runtime_dtype = self.metadata.runtime_dtype
@@ -601,7 +764,6 @@ class GatedDeltaRuleOp(BaseOperation):
         value = value.astype(runtime_dtype)
         beta = beta.astype(runtime_dtype)
 
-        # Squeeze trailing singleton on beta if present
         if beta.ndim == 4 and beta.shape[-1] == 1:
             beta = beta[..., 0]
 
@@ -641,6 +803,7 @@ class GatedDeltaRuleOp(BaseOperation):
                 chunk_size=chunk_size,
                 query_scale=query_scale,
                 decay_is_log=decay_is_log,
+                prefer_metal=prefer_metal,
             )
 
         return GatedDeltaRuleOutput(
@@ -663,7 +826,7 @@ class GatedDeltaRuleOp(BaseOperation):
         chunk_size: int = 64,
         query_scale: float | None = None,
         decay_is_log: bool = False,
-        prefer_metal: bool = True,
+        prefer_metal: bool | None = None,
         **kwargs: tp.Any,
     ) -> GatedDeltaRuleOutput:
         """Execute the gated delta rule operation.

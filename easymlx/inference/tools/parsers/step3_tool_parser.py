@@ -58,7 +58,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module(["step3"])  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module(["step3"])
 class Step3ToolParser(ToolParser):
     """Tool parser for Step3 models with XML-like format.
 

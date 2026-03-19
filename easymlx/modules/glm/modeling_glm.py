@@ -26,7 +26,7 @@ import typing as tp
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.layers.attention import AttentionPerformer, build_attention_mask
@@ -35,7 +35,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .glm_configuration import GlmConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -158,7 +158,9 @@ class GlmAttention(nn.Module):
             if self.rotary_dim > 0
             else None
         )
-        self.attention_performer = AttentionPerformer(scale=self.head_dim**-0.5)
+        self.attention_performer = AttentionPerformer(
+            scale=self.head_dim**-0.5, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

@@ -24,7 +24,6 @@ padding, warmup precompilation, and performance tracking.
 from __future__ import annotations
 
 import inspect
-import os
 import time
 from typing import Any
 
@@ -40,28 +39,24 @@ from .sequence_buffer import SequenceBuffer
 
 logger = get_logger("eSurgeRunner")
 
-_ENABLE_COMPILED_PAGED_FORWARD = os.getenv("EASYMLX_ESURGE_USE_COMPILED_PAGED_FORWARD", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
 
 class _CompiledPagedCacheProxy:
     """State-backed cache proxy for ``mx.compile`` paged forwards."""
 
-    __slots__ = ("block_size", "head_dim", "num_kv_heads", "state")
+    __slots__ = ("block_size", "head_dim", "num_kv_heads", "page_vec_size", "state")
 
     def __init__(self, cache: Any):
         self.block_size = int(cache.block_size)
         self.num_kv_heads = int(cache.num_kv_heads)
         self.head_dim = int(cache.head_dim)
+        self.page_vec_size = int(getattr(cache, "page_vec_size", 0) or 0)
         self.state = {
             "key_cache": cache.key_cache,
             "value_cache": cache.value_cache,
             "block_tables": cache.block_tables,
             "kv_lens": cache.kv_lens,
+            "page_key_cache": getattr(cache, "page_key_cache", None),
+            "page_value_cache": getattr(cache, "page_value_cache", None),
         }
 
     @property
@@ -95,6 +90,27 @@ class _CompiledPagedCacheProxy:
     @kv_lens.setter
     def kv_lens(self, value):
         self.state["kv_lens"] = value
+
+    @property
+    def page_key_cache(self):
+        return self.state["page_key_cache"]
+
+    @page_key_cache.setter
+    def page_key_cache(self, value):
+        self.state["page_key_cache"] = value
+
+    @property
+    def page_value_cache(self):
+        return self.state["page_value_cache"]
+
+    @page_value_cache.setter
+    def page_value_cache(self, value):
+        self.state["page_value_cache"] = value
+
+    @property
+    def cache(self):
+        """Return self for compatibility with code that accesses ``view.cache``."""
+        return self
 
     @property
     def num_seqs(self) -> int:
@@ -147,7 +163,8 @@ def _as_numpy_logits(output: Any) -> np.ndarray:
     if isinstance(logits, mx.array):
         if logits.ndim == 3:
             logits = logits[:, -1, :]
-        mx.eval(logits)
+        if logits.dtype == mx.bfloat16 or not mx.issubdtype(logits.dtype, mx.floating):
+            logits = logits.astype(mx.float32)
         array = np.array(logits)
     else:
         array = np.asarray(logits)
@@ -250,7 +267,7 @@ class ModelRunner:
         model: The model callable (or ``nn.Module.__call__``).
         sequence_buffer: Row-oriented mutable buffer of active sequences.
         kv_caches: List of KV-cache objects (typically
-            :class:`PagedKVCache` instances).
+            :class:`PageCacheView` instances).
         max_model_len: Maximum supported sequence length.
         max_num_batched_tokens: Maximum tokens per forward pass.
         max_num_seqs: Maximum concurrent sequences.
@@ -275,6 +292,7 @@ class ModelRunner:
         supports_async_overlap: bool = False,
         verbose: bool = False,
         seed: int = 0,
+        use_compiled_forward: bool = True,
     ):
         """Initialize the model runner.
 
@@ -307,6 +325,7 @@ class ModelRunner:
         self.max_num_seq_buckets = self._init_seq_buckets(max_num_seq_buckets, self.max_num_seqs)
         self.memory_utilization = float(memory_utilization)
         self.supports_async_overlap = bool(supports_async_overlap)
+        self.use_compiled_forward = bool(use_compiled_forward)
         self._rng = np.random.default_rng(seed)
         self._page_size = self._infer_page_size()
         self.log_it = logger.info if verbose else logger.debug
@@ -390,11 +409,11 @@ class ModelRunner:
         req_buckets = self.max_num_seq_buckets
         pairs = self._get_feasible_compile_pairs(token_buckets, req_buckets)
 
-        from easymlx.caching import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+        from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
         from easymlx.workers.loggers import ProgressLogger
 
-        if not all(isinstance(c, PagedKVCache) for c in self.kv_caches):
-            self.log_it("Skipping warmup: KV caches are not PagedKVCache instances")
+        if not all(isinstance(c, (PageCacheView, PageCacheView)) for c in self.kv_caches):
+            self.log_it("Skipping warmup: KV caches are not PageCacheView instances")
             return
 
         max_slots = int(self.kv_caches[0].num_seqs) if self.kv_caches else self.max_num_seqs
@@ -414,8 +433,12 @@ class ModelRunner:
             dummy_ids = mx.zeros((num_tokens,), dtype=mx.int32)
             slot_ids = list(range(num_reqs))
             query_lens = self._distribute_tokens(num_tokens, num_reqs)
-            cache_views = [PageCache(kv_cache, slot_ids, query_lens=query_lens) for kv_cache in self.kv_caches]
-            cache_metadata = PageMetadata(query_start_loc=build_query_start_loc(query_lens))
+            cache_views = list(self.kv_caches)
+            cache_metadata = PageMetadata(
+                query_start_loc=build_query_start_loc(query_lens),
+                is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
+                slot_ids=tuple(slot_ids),
+            )
 
             try:
                 compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
@@ -466,12 +489,12 @@ class ModelRunner:
         slot_ids: list[int],
         query_lens: list[int],
     ) -> Any:
-        """Return an ``mx.compile``'d forward with PageCache captured in closure.
+        """Return an ``mx.compile``'d forward with cache proxy captured in closure.
 
-        PageCache is captured in the closure (not passed as arg) so
+        The cache proxy is captured in the closure (not passed as arg) so
         ``mx.compile`` only sees ``mx.array`` inputs. We cache compiled fns
         by ``(slot_ids, query_lens)`` since ``cache_metadata`` differs.
-        The underlying PagedKVCache arrays are shared and mutated in-place.
+        The underlying PageCacheView arrays are shared and mutated in-place.
 
         Args:
             slot_ids: Cache slot indices for this batch.
@@ -483,12 +506,12 @@ class ModelRunner:
         """
         if not self.kv_caches:
             return None
-        if not _ENABLE_COMPILED_PAGED_FORWARD:
+        if not self.use_compiled_forward:
             return None
 
-        from easymlx.caching import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+        from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 
-        if not all(isinstance(c, PagedKVCache) for c in self.kv_caches):
+        if not all(isinstance(c, (PageCacheView, PageCacheView)) for c in self.kv_caches):
             return None
         if not query_lens or any(int(query_len) != 1 for query_len in query_lens):
             return None
@@ -507,8 +530,12 @@ class ModelRunner:
             return compiled_entry
 
         cache_proxies = [_CompiledPagedCacheProxy(kv_cache) for kv_cache in self.kv_caches]
-        cache_views = [PageCache(kv_cache, slot_ids, query_lens=query_lens) for kv_cache in cache_proxies]
-        cache_metadata = PageMetadata(query_start_loc=build_query_start_loc(query_lens))
+        cache_views = list(cache_proxies)
+        cache_metadata = PageMetadata(
+            query_start_loc=build_query_start_loc(query_lens),
+            is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
+            slot_ids=tuple(int(s) for s in slot_ids),
+        )
 
         static_kwargs = {
             name: value
@@ -541,6 +568,10 @@ class ModelRunner:
             cache_proxy.value_cache = cache.value_cache
             cache_proxy.block_tables = cache.block_tables
             cache_proxy.kv_lens = cache.kv_lens
+            if hasattr(cache, "page_key_cache"):
+                cache_proxy.page_key_cache = cache.page_key_cache
+            if hasattr(cache, "page_value_cache"):
+                cache_proxy.page_value_cache = cache.page_value_cache
 
     @staticmethod
     def _sync_compiled_cache_state(
@@ -553,6 +584,10 @@ class ModelRunner:
             cache.value_cache = cache_proxy.value_cache
             cache.block_tables = cache_proxy.block_tables
             cache.kv_lens = cache_proxy.kv_lens
+            if hasattr(cache, "page_key_cache"):
+                cache.page_key_cache = cache_proxy.page_key_cache
+            if hasattr(cache, "page_value_cache"):
+                cache.page_value_cache = cache_proxy.page_value_cache
 
     def _infer_page_size(self) -> int:
         """Infer the KV-cache page size from the first cache object.
@@ -656,6 +691,7 @@ class ModelRunner:
                 block_tables[row_index, :] = -1
             if kv_lens is not None and row_index < kv_lens.shape[0]:
                 kv_lens[row_index] = 0
+        mx.eval(*[c.block_tables for c in self.kv_caches if hasattr(c, "block_tables")])
 
     def _zero_pages(self, page_ids: list["int"]) -> None:
         """Zero out the key and value caches for the given page IDs.
@@ -665,15 +701,28 @@ class ModelRunner:
         """
         if not page_ids or not self.kv_caches:
             return
+        valid_ids = [int(p) for p in page_ids if int(p) >= 0]
+        if not valid_ids:
+            return
+        mx.array(valid_ids, dtype=mx.int32)
         for cache in self.kv_caches:
             key_cache = getattr(cache, "key_cache", None)
             value_cache = getattr(cache, "value_cache", None)
             if key_cache is None or value_cache is None:
                 continue
-            for page_id in page_ids:
-                if 0 <= int(page_id) < key_cache.shape[0]:
-                    key_cache[int(page_id)] = 0
-                    value_cache[int(page_id)] = 0
+            cap = int(key_cache.shape[0])
+            filtered = mx.array([p for p in valid_ids if p < cap], dtype=mx.int32)
+            if filtered.size == 0:
+                continue
+            key_cache[filtered] = 0
+            value_cache[filtered] = 0
+            page_key_cache = getattr(cache, "page_key_cache", None)
+            page_value_cache = getattr(cache, "page_value_cache", None)
+            if page_key_cache is not None:
+                page_key_cache[filtered] = 0
+            if page_value_cache is not None:
+                page_value_cache[filtered] = 0
+        mx.eval(*[c.key_cache for c in self.kv_caches if hasattr(c, "key_cache")])
 
     def _assign_row_mapping(
         self,
@@ -904,10 +953,14 @@ class ModelRunner:
                     except (RuntimeError, ValueError):
                         logger.debug("Compiled forward failed, falling back to eager")
 
-            from easymlx.caching import PageCache, PageMetadata, build_query_start_loc
+            from easymlx.caching import PageMetadata, build_query_start_loc
 
-            cache_views = [PageCache(kv_cache, slot_ids, query_lens=query_lens) for kv_cache in self.kv_caches]
-            cache_metadata = PageMetadata(query_start_loc=build_query_start_loc(query_lens))
+            cache_views = list(self.kv_caches)
+            cache_metadata = PageMetadata(
+                query_start_loc=build_query_start_loc(query_lens),
+                is_single_token_decode=all(int(query_len) == 1 for query_len in query_lens),
+                slot_ids=tuple(int(s) for s in slot_ids),
+            )
         else:
             batch_token_ids, query_lens = self._pad_batch_token_ids(request.sequences)
             if not isinstance(batch_token_ids, mx.array):

@@ -70,7 +70,7 @@ def _make_tool_call_id() -> str:
     return f"chatcmpl-tool-{uuid4()}"
 
 
-@ToolParserManager.register_module("xlam")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("xlam")
 class xLAMToolParser(ToolParser):
     """Tool parser for xLAM and similar models with flexible JSON formats.
 
@@ -119,7 +119,6 @@ class xLAMToolParser(ToolParser):
         self.current_tool_name_sent = False
         self.streamed_args: list[str] = []
 
-        # For backward compatibility with tests / serving code
         self.current_tools_sent: list[bool] = []
         self.prev_tool_call_arr: list[dict] = []
 

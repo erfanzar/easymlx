@@ -133,7 +133,6 @@ class BaseQuestionAnsweringModule[ModelT: nn.Module, ConfigT: EasyMLXBaseConfig]
             hidden_states = getattr(outputs, "last_hidden_state", outputs)
 
         logits = self.qa_outputs(hidden_states)
-        # Split into start/end logits along last dimension
         start_logits = logits[..., 0]
         end_logits = logits[..., 1]
 

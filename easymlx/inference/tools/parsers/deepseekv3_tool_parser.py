@@ -50,7 +50,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("deepseek_v3")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("deepseek_v3")
 class DeepSeekV3ToolParser(ToolParser):
     """Tool parser for DeepSeek V3 models.
 

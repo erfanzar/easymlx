@@ -14,12 +14,16 @@
 
 """Paged KV cache for serving and unified attention.
 
-Re-exports :class:`PageCache`, :class:`PageMetadata`, :class:`PagedKVCache`,
+Re-exports :class:`PageMetadata`, :class:`PageCacheView`,
 and the :func:`build_query_start_loc` helper from the implementation modules.
 """
 
-from .page_cache import PageCache
-from .page_metadata import PageMetadata
-from .paged_kv_cache import PagedKVCache, build_query_start_loc
+from .cache import PageCache, PageCacheConfig, PageCacheView, PageMetadata, build_query_start_loc
 
-__all__ = ("PageCache", "PageMetadata", "PagedKVCache", "build_query_start_loc")
+__all__ = (
+    "PageCache",
+    "PageCacheConfig",
+    "PageCacheView",
+    "PageMetadata",
+    "build_query_start_loc",
+)

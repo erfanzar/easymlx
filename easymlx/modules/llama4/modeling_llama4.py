@@ -17,7 +17,7 @@
 This module provides the full Llama4 multimodal architecture on MLX, including
 a vision encoder, text decoder with MoE and chunked attention, and a
 conditional generation wrapper. The unified ``__call__`` API at every layer
-accepts both ``TransformerCacheView`` and ``PageCache`` for flexible serving.
+accepts both ``TransformerCacheView`` and ``PageCacheView`` for flexible serving.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import typing as tp
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import CausalLMOutput, EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.layers.attention import AttentionPerformer, build_attention_mask, scaled_dot_product_attention
@@ -37,7 +37,7 @@ from easymlx.layers.rotary import get_rope
 
 from .llama4_configuration import Llama4Config, Llama4TextConfig, Llama4VisionConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -362,7 +362,9 @@ class Llama4Attention(nn.Module):
                 max_position_embeddings=config.max_position_embeddings,
             )
 
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

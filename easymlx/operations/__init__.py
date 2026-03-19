@@ -29,6 +29,8 @@ from ._operation_impl import OperationImpl, OperationOutput
 from ._operation_meta import OperationMetadata
 from .executor import OperationExecutor
 from .kernels import (
+    PageAttention,
+    PageAttn,
     ScaledDotProductAttention,
     ScaledDotProductAttn,
     UnifiedAttention,
@@ -38,6 +40,7 @@ from .kernels import (
     Vanilla,
     VanillaAttention,
     VanillaAttn,
+    page_attention,
     paged_attention,
 )
 from .requirements import (
@@ -65,6 +68,8 @@ __all__ = (
     "OperationOutput",
     "OperationRegistry",
     "OperationRequirements",
+    "PageAttention",
+    "PageAttn",
     "RequirementsBuilder",
     "ScaledDotProductAttention",
     "ScaledDotProductAttn",
@@ -78,6 +83,7 @@ __all__ = (
     "available_metadata_fields",
     "iter_required_field_names",
     "missing_required_fields",
+    "page_attention",
     "paged_attention",
     "validate_metadata",
 )

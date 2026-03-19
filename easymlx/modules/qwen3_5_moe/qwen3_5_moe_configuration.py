@@ -159,7 +159,6 @@ class Qwen3_5MoeTextConfig(EasyMLXBaseConfig):
             bos_token_id: Beginning-of-sequence token ID.
             **kwargs: Additional keyword arguments forwarded to the base class.
         """
-        # Resolve rope_scaling from rope_parameters alias.
         if rope_scaling is None and rope_parameters is not None:
             rope_scaling = rope_parameters
         if rope_scaling is not None and "type" in rope_scaling and "rope_type" not in rope_scaling:
@@ -209,13 +208,11 @@ class Qwen3_5MoeTextConfig(EasyMLXBaseConfig):
         self.router_aux_loss_coef = float(router_aux_loss_coef)
         self.mlp_only_layers = [] if mlp_only_layers is None else list(mlp_only_layers)
 
-        # HF Qwen3.5 checkpoints expose split linear-attention projections.
         if linear_attention_separate_proj is None:
             self.linear_attention_separate_proj = True
         else:
             self.linear_attention_separate_proj = bool(linear_attention_separate_proj)
 
-        # Mirror HF naming for rope config interop.
         self.rope_parameters = rope_scaling
 
         super().__init__(

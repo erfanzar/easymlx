@@ -120,30 +120,24 @@ class BaseThinkingReasoningParser(ReasoningParser):
         """
         if self.start_token not in model_output:
             if self._is_prompt_reasoning_active():
-                # Prompt-aware asymmetric mode: start token came from prompt.
-                # If end token is present, split into reasoning/content.
                 if self.end_token in model_output:
                     parts = model_output.split(self.end_token, 1)
                     reasoning = parts[0].strip()
                     content = parts[1].strip() if len(parts) > 1 else None
                     return reasoning or None, content
-                # If end token is missing, we are still inside reasoning.
                 reasoning = model_output.strip()
                 return reasoning or None, None
             return None, model_output
 
-        # Split at start token
         before_start, after_start = model_output.split(self.start_token, 1)
 
         if self.end_token not in after_start:
-            # Incomplete reasoning (no end token) — treat all after start as reasoning
             return after_start.strip() or None, before_start.strip() or None
 
         reasoning_part, content_part = after_start.split(self.end_token, 1)
         reasoning = reasoning_part.strip()
         content = content_part.strip()
 
-        # Prepend any text before the start token to content
         if before_start.strip():
             content = before_start.strip() + ("\n" + content if content else "")
 
@@ -188,7 +182,6 @@ class BaseThinkingReasoningParser(ReasoningParser):
         has_end_in_delta = self.end_token in delta_text
         reasoning_started = has_start_in_prev or self._is_prompt_reasoning_active()
 
-        # Case 1: Both start and end appear in the delta itself
         if has_start_in_delta and has_end_in_delta:
             after_start = delta_text.split(self.start_token, 1)[1]
             reasoning_part, content_part = after_start.split(self.end_token, 1)
@@ -197,20 +190,15 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 content=content_part if content_part else None,
             )
 
-        # Case 2: We're past the end token already — everything is content
         if has_end_in_prev:
             return DeltaMessage(content=delta_text)
 
-        # Case 3: Start token appears in this delta (reasoning begins). Keep this
-        # before inferred-reasoning checks so literal start tokens are stripped.
         if has_start_in_delta:
             after_start = delta_text.split(self.start_token, 1)[1]
             if after_start:
                 return DeltaMessage(reasoning_content=after_start)
-            return None  # Just the start token itself, wait for more
+            return None
 
-        # Case 4: Reasoning already active (explicitly started or prompt-gated),
-        # and end token arrives in this chunk.
         if reasoning_started and has_end_in_delta:
             parts = delta_text.split(self.end_token, 1)
             reasoning_part = parts[0]
@@ -220,11 +208,9 @@ class BaseThinkingReasoningParser(ReasoningParser):
                 content=content_part if content_part else None,
             )
 
-        # Case 5: Reasoning already active and still accumulating.
         if reasoning_started and not has_end_in_current:
             return DeltaMessage(reasoning_content=delta_text)
 
-        # Case 6: No reasoning start seen — treat as content.
         if not has_start_in_current:
             return DeltaMessage(content=delta_text)
 

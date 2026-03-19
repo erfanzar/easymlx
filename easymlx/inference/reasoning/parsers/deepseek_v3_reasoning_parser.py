@@ -29,7 +29,7 @@ from .deepseek_r1_reasoning_parser import DeepSeekR1ReasoningParser
 from .identity_reasoning_parser import IdentityReasoningParser
 
 
-@ReasoningParserManager.register_module(["deepseek_v3", "glm45", "holo2", "kimi_k2"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["deepseek_v3", "glm45", "holo2", "kimi_k2"])
 class DeepSeekV3ReasoningParser(ReasoningParser):
     """Conditional reasoning parser: delegates to R1 or Identity based on tokenizer config.
 
@@ -51,7 +51,6 @@ class DeepSeekV3ReasoningParser(ReasoningParser):
             tokenizer: Tokenizer whose chat template determines the delegate.
         """
         super().__init__(tokenizer)
-        # Check if tokenizer's chat template supports thinking
         chat_template = getattr(tokenizer, "chat_template", "") or ""
         has_thinking = (
             "thinking" in chat_template

@@ -37,8 +37,8 @@ import logging
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -56,7 +56,7 @@ from ..utils import extract_intermediate_diff
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module(["internlm"])  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module(["internlm"])
 class Internlm2ToolParser(ToolParser):
     """Tool parser for InternLM2 models.
 

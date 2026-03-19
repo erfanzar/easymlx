@@ -43,9 +43,6 @@ from .auto_modeling import (
     AutoEasyMLXModelForSequenceClassification,
     AutoEasyMLXModelForTokenClassification,
     BaseAutoEasyModel,
-    FromPretrainedKwargs,
-    QuantizationConfig,
-    QuantizationMode,
 )
 
 __all__ = (
@@ -59,9 +56,6 @@ __all__ = (
     "AutoEasyMLXModelForSequenceClassification",
     "AutoEasyMLXModelForTokenClassification",
     "BaseAutoEasyModel",
-    "FromPretrainedKwargs",
-    "QuantizationConfig",
-    "QuantizationMode",
     "get_modules_by_type",
     "infer_task_from_hf_config",
     "normalize_task",

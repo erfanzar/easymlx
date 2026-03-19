@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from easymlx.caching import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 from easymlx.layers.attention import AttentionPerformer, prepare_paged_attention_inputs
 from easymlx.modules.llama.llama_configuration import LlamaConfig
 from easymlx.modules.llama.modeling_llama import LlamaAttention
@@ -25,8 +25,8 @@ from easymlx.modules.qwen2.qwen2_configuration import Qwen2Config
 from easymlx.operations.kernels.unified_attention import paged_attention
 
 
-def _clone_cache(cache: PagedKVCache) -> PagedKVCache:
-    return PagedKVCache(
+def _clone_cache(cache: PageCacheView) -> PageCacheView:
+    return PageCacheView(
         key_cache=mx.array(cache.key_cache),
         value_cache=mx.array(cache.value_cache),
         block_tables=mx.array(cache.block_tables),
@@ -44,7 +44,7 @@ def test_attention_performer_paged_matches_manual_cache_update():
     head_dim = 4
     performer = AttentionPerformer(scale=1.0 / np.sqrt(head_dim))
 
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=2,
         max_seq_len=8,
         num_kv_heads=num_kv_heads,
@@ -83,14 +83,13 @@ def test_attention_performer_paged_matches_manual_cache_update():
         use_metal=False,
     )
 
-    # Use unified __call__ with PageCache + PageMetadata
-    cache_view = PageCache(cache, [0, 1])
-    cache_metadata = PageMetadata(query_start_loc=query_start_loc)
+    # Use unified __call__ with PageCacheView + PageMetadata
+    cache_metadata = PageMetadata(query_start_loc=query_start_loc, slot_ids=(0, 1))
     actual = performer(
         queries,
         keys,
         values,
-        cache_view=cache_view,
+        cache_view=cache,
         cache_metadata=cache_metadata,
     )
 
@@ -99,7 +98,7 @@ def test_attention_performer_paged_matches_manual_cache_update():
 
 
 def test_prepare_paged_attention_inputs_returns_page_metadata():
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=1,
         max_seq_len=4,
         num_kv_heads=1,
@@ -184,7 +183,11 @@ def test_attention_modules_delegate_all_to_performer(
         # Return same shape as queries (performer contract)
         return mx.zeros_like(queries)
 
-    monkeypatch.setattr(attention, "attention_performer", type("FakePerformer", (), {"__call__": lambda self, *a, **kw: fake_performer(*a, **kw)})())
+    monkeypatch.setattr(
+        attention,
+        "attention_performer",
+        type("FakePerformer", (), {"__call__": lambda self, *a, **kw: fake_performer(*a, **kw)})(),
+    )
     dense_out = attention(mx.zeros((1, 3, hidden_size), dtype=mx.float32), mask="causal")
 
     # Model passes BTHD [B, L, H, D] to performer
@@ -198,7 +201,7 @@ def test_attention_modules_delegate_all_to_performer(
 
     # -- Paged path (3D input, single sequence) --
     calls.clear()
-    paged_cache = PagedKVCache.allocate(
+    paged_cache = PageCacheView.allocate(
         num_seqs=2,
         max_seq_len=8,
         num_kv_heads=num_kv_heads,
@@ -206,8 +209,8 @@ def test_attention_modules_delegate_all_to_performer(
         block_size=4,
         dtype=mx.float32,
     )
-    cache_view = PageCache(paged_cache, [0])
-    cache_metadata = PageMetadata(query_start_loc=build_query_start_loc([2]))
+    cache_view = paged_cache
+    cache_metadata = PageMetadata(query_start_loc=build_query_start_loc([2]), slot_ids=(0,))
     cache_out = attention(
         mx.zeros((1, 2, hidden_size), dtype=mx.float32),
         cache_view=cache_view,
@@ -217,13 +220,13 @@ def test_attention_modules_delegate_all_to_performer(
     # Model passes BTHD [1, 2, H, D] to performer — performer flattens internally
     assert calls["queries_shape"] == (1, 2, num_heads, head_dim)
     assert calls["keys_shape"] == (1, 2, num_kv_heads, head_dim)
-    assert isinstance(calls["cache_view"], PageCache)
+    assert isinstance(calls["cache_view"], PageCacheView)
     assert isinstance(calls["cache_metadata"], PageMetadata)
     assert cache_out.shape == (1, 2, hidden_size)
 
     # -- Paged path (multi-sequence, 3D input) --
     calls.clear()
-    paged_cache2 = PagedKVCache.allocate(
+    paged_cache2 = PageCacheView.allocate(
         num_seqs=2,
         max_seq_len=8,
         num_kv_heads=num_kv_heads,
@@ -231,14 +234,13 @@ def test_attention_modules_delegate_all_to_performer(
         block_size=4,
         dtype=mx.float32,
     )
-    paged_view = PageCache(paged_cache2, [0, 1])
-    paged_metadata = PageMetadata(query_start_loc=build_query_start_loc([2, 1]))
+    paged_view = paged_cache2
+    paged_metadata = PageMetadata(query_start_loc=build_query_start_loc([2, 1]), slot_ids=(0, 1))
     paged_out = attention(
         mx.zeros((1, 3, hidden_size), dtype=mx.float32),
         cache_view=paged_view,
         cache_metadata=paged_metadata,
     )
     assert calls["queries_shape"] == (1, 3, num_heads, head_dim)
-    assert isinstance(calls["cache_view"], PageCache)
-    assert list(calls["cache_view"].slot_ids) == [0, 1]
+    assert isinstance(calls["cache_view"], PageCacheView)
     assert paged_out.shape == (1, 3, hidden_size)

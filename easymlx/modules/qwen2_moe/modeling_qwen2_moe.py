@@ -19,7 +19,7 @@ Structure mirrors EasyDeL's qwen2_moe:
   -> Qwen2MoeDecoderLayer -> Qwen2MoeModel -> Qwen2MoeForCausalLM
 
 Unified ``__call__`` at every level -- cache_view is either
-``TransformerCacheView`` (standard) or ``PageCache`` (paged serving).
+``TransformerCacheView`` (standard) or ``PageCacheView`` (paged serving).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -44,7 +44,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .qwen2_moe_configuration import Qwen2MoeConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -118,7 +118,9 @@ class Qwen2MoeAttention(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

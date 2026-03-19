@@ -49,7 +49,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module(["kimi_k2"])  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module(["kimi_k2"])
 class KimiK2ToolParser(ToolParser):
     """Tool parser for Kimi K2 model outputs.
 

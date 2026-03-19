@@ -23,18 +23,18 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
-from easymlx.caching import PagedKVCache
+from easymlx.caching import PageCacheView
 from easymlx.inference.esurge import SamplingParams, eSurge
 
 
 class DummyPagedModel:
-    """Minimal model using real PagedKVCache for eSurge tests."""
+    """Minimal model using real PageCacheView for eSurge tests."""
 
     vocab_size = 6
 
     def init_paged_cache(self, *, num_seqs: int, max_seq_len: int = 16, page_size: int = 16, **_kwargs):
         return [
-            PagedKVCache.allocate(
+            PageCacheView.allocate(
                 num_seqs=num_seqs,
                 max_seq_len=max_seq_len,
                 num_kv_heads=1,

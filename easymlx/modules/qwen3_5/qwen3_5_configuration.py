@@ -151,14 +151,12 @@ class Qwen3_5TextConfig(Qwen3NextConfig):
             bos_token_id: Beginning-of-sequence token ID.
             **kwargs: Additional keyword arguments forwarded to the base class.
         """
-        # Resolve rope_theta from rope_scaling / rope_parameters if needed.
         effective_rope_scaling = rope_scaling or rope_parameters
         if rope_theta is None and isinstance(effective_rope_scaling, dict):
             rope_theta = effective_rope_scaling.get("rope_theta")
         if rope_theta is None:
             rope_theta = 10000.0
 
-        # Qwen3.5 text uses dense MLPs by default (no MoE FFN layers).
         if mlp_only_layers is None or len(mlp_only_layers) == 0:
             mlp_only_layers = list(range(num_hidden_layers))
 

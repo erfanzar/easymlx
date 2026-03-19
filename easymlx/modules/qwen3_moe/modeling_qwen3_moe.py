@@ -27,7 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -41,7 +41,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .qwen3_moe_configuration import Qwen3MoeConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -120,7 +120,9 @@ class Qwen3MoeAttention(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

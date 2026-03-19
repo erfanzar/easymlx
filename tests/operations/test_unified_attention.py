@@ -15,7 +15,7 @@
 import mlx.core as mx
 import numpy as np
 
-from easymlx.caching import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 from easymlx.layers.rotary import get_rope
 from easymlx.operations.kernels.unified_attention import paged_attention
 
@@ -94,7 +94,7 @@ def test_paged_attention_reference_matches():
 
     seq_lens = [5, 3]
     query_lens = [2, 1]
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=num_seqs,
         max_seq_len=max(seq_lens),
         num_kv_heads=num_kv_heads,
@@ -158,7 +158,7 @@ def test_paged_attention_metal_matches_reference(monkeypatch):
 
     seq_lens = [6, 4]
     query_lens = [2, 1]
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=num_seqs,
         max_seq_len=max(seq_lens),
         num_kv_heads=num_kv_heads,
@@ -221,7 +221,7 @@ def test_paged_attention_metal_decode_fast_path_matches_reference(monkeypatch):
 
     seq_lens = [5, 7, 3]
     query_lens = [1, 1, 1]
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=num_seqs,
         max_seq_len=max(seq_lens),
         num_kv_heads=num_kv_heads,
@@ -268,7 +268,7 @@ def test_paged_attention_metal_decode_fast_path_matches_reference(monkeypatch):
 
 def test_page_cache_concatenate_to_cache_updates_multiple_slots():
     rng = np.random.default_rng(2)
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=3,
         max_seq_len=8,
         num_kv_heads=1,
@@ -287,8 +287,11 @@ def test_page_cache_concatenate_to_cache_updates_multiple_slots():
 
     initial_key_cache = np.asarray(cache.key_cache).copy()
     initial_value_cache = np.asarray(cache.value_cache).copy()
+    initial_page_key_cache = np.asarray(cache.page_key_cache).copy()
+    initial_page_value_cache = np.asarray(cache.page_value_cache).copy()
     initial_kv_lens = np.asarray(cache.kv_lens).copy()
     block_tables = np.asarray(cache.block_tables)
+    page_vec_size = int(cache.page_vec_size)
 
     query_lens = [2, 0, 3]
     query_start_loc = build_query_start_loc(query_lens)
@@ -298,6 +301,8 @@ def test_page_cache_concatenate_to_cache_updates_multiple_slots():
 
     expected_key_cache = initial_key_cache.copy()
     expected_value_cache = initial_value_cache.copy()
+    expected_page_key_cache = initial_page_key_cache.copy()
+    expected_page_value_cache = initial_page_value_cache.copy()
     expected_kv_lens = initial_kv_lens.copy()
     qsl = np.asarray(query_start_loc)
 
@@ -312,28 +317,38 @@ def test_page_cache_concatenate_to_cache_updates_multiple_slots():
             pos = offset + local_idx
             block = int(block_tables[slot, pos // cache.block_size])
             in_block = pos % cache.block_size
-            expected_key_cache[block, in_block] = np.asarray(keys)[q_start + local_idx]
-            expected_value_cache[block, in_block] = np.asarray(values)[q_start + local_idx]
+            key_token = np.asarray(keys)[q_start + local_idx]
+            value_token = np.asarray(values)[q_start + local_idx]
+            expected_key_cache[block, in_block] = key_token
+            expected_value_cache[block, in_block] = value_token
+            expected_page_key_cache[block, :, :, in_block, :] = key_token.reshape(
+                key_token.shape[0],
+                key_token.shape[1] // page_vec_size,
+                page_vec_size,
+            )
+            expected_page_value_cache[block, :, :, in_block] = value_token
         expected_kv_lens[slot] = offset + q_len
 
-    view = PageCache(cache, [0, 1, 2])
-    prepared_queries, key_cache, value_cache, metadata = view.concatenate_to_cache(
+    prepared_queries, key_cache, value_cache, metadata = cache.concatenate_to_cache(
         queries,
         keys,
         values,
         cache_metadata=PageMetadata(query_start_loc=query_start_loc),
+        slot_ids=[0, 1, 2],
     )
 
     np.testing.assert_allclose(np.asarray(prepared_queries), np.asarray(queries), atol=1e-6, rtol=1e-6)
     np.testing.assert_allclose(np.asarray(key_cache), expected_key_cache, atol=1e-6, rtol=1e-6)
     np.testing.assert_allclose(np.asarray(value_cache), expected_value_cache, atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(cache.page_key_cache), expected_page_key_cache, atol=1e-6, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(cache.page_value_cache), expected_page_value_cache, atol=1e-6, rtol=1e-6)
     np.testing.assert_array_equal(np.asarray(metadata.kv_lens), expected_kv_lens)
     np.testing.assert_array_equal(np.asarray(metadata.block_tables), block_tables[[0, 1, 2]])
 
 
 def test_page_cache_single_token_decode_fast_path_applies_rope_and_updates_cache():
     rng = np.random.default_rng(7)
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=3,
         max_seq_len=8,
         num_kv_heads=1,
@@ -363,12 +378,13 @@ def test_page_cache_single_token_decode_fast_path_applies_rope_and_updates_cache
     expected_queries = np.stack([np.asarray(q) for q in expected_queries], axis=0)
     expected_keys = np.stack([np.asarray(k) for k in expected_keys], axis=0)
 
-    view = PageCache(cache, [0, 1, 2], query_lens=[1, 1, 1])
-    prepared_queries, key_cache, value_cache, metadata = view.concatenate_to_cache(
+    prepared_queries, key_cache, value_cache, metadata = cache.concatenate_to_cache(
         queries,
         keys,
         values,
         cache_metadata=PageMetadata(query_start_loc=build_query_start_loc([1, 1, 1])),
+        slot_ids=[0, 1, 2],
+        query_lens=[1, 1, 1],
         rope=rope,
     )
 
@@ -377,9 +393,24 @@ def test_page_cache_single_token_decode_fast_path_applies_rope_and_updates_cache
 
     key_cache_np = np.asarray(key_cache)
     value_cache_np = np.asarray(value_cache)
+    page_key_cache_np = np.asarray(cache.page_key_cache)
+    page_value_cache_np = np.asarray(cache.page_value_cache)
     block_tables_np = np.asarray(cache.block_tables)
+    page_vec_size = int(cache.page_vec_size)
     for seq_idx, offset in enumerate(initial_lens):
         block = int(block_tables_np[seq_idx, offset // cache.block_size])
         in_block = offset % cache.block_size
         np.testing.assert_allclose(key_cache_np[block, in_block], expected_keys[seq_idx], atol=1e-5, rtol=1e-5)
         np.testing.assert_allclose(value_cache_np[block, in_block], np.asarray(values)[seq_idx], atol=1e-5, rtol=1e-5)
+        np.testing.assert_allclose(
+            page_key_cache_np[block, :, :, in_block, :].reshape(1, 4),
+            expected_keys[seq_idx].reshape(1, 4 // page_vec_size, page_vec_size).reshape(1, 4),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+        np.testing.assert_allclose(
+            page_value_cache_np[block, :, :, in_block],
+            np.asarray(values)[seq_idx],
+            atol=1e-5,
+            rtol=1e-5,
+        )

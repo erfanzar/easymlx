@@ -261,13 +261,10 @@ def _cast_weights(
 def _default_converted_cache_root() -> Path:
     """Return the default cache root for converted checkpoints.
 
-    Respects the ``EASYMLX_CONVERTED_CACHE`` environment variable.
-    Falls back to ``~/.cache/easymlx/converted``.
-
     Returns:
-        A :class:`Path` to the cache root directory.
+        A :class:`Path` to ``~/.cache/easymlx/converted``.
     """
-    return Path(os.getenv("EASYMLX_CONVERTED_CACHE", Path.home() / ".cache" / "easymlx" / "converted"))
+    return Path.home() / ".cache" / "easymlx" / "converted"
 
 
 def _conversion_cache_path(

@@ -29,7 +29,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["qwen3", "qwen3_reasoning"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["qwen3", "qwen3_reasoning"])
 class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Qwen3 models with strict tag enforcement.
 
@@ -83,15 +83,10 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
                 when strict tag requirements are not met.
         """
         if self.end_token not in model_output:
-            # If an explicit reasoning start tag is present, keep the whole
-            # unfinished segment hidden as reasoning rather than surfacing it
-            # as visible content.
             if self.start_token in model_output or self._is_prompt_reasoning_active():
                 return super().extract_reasoning(model_output, request)
             return None, model_output
 
-        # Missing start tag is only allowed when prompt context indicates
-        # reasoning already started in the prompt.
         if self.start_token not in model_output:
             if self._is_prompt_reasoning_active():
                 return super().extract_reasoning(model_output, request)
@@ -134,8 +129,6 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
             self._start_token_id is not None and self._start_token_id in current_token_ids
         )
 
-        # Strict behavior: if no start tag is observed and we are not in prompt-aware
-        # asymmetric mode, treat streaming output as content.
         if (
             not self._is_prompt_reasoning_active()
             and current_text

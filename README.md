@@ -230,7 +230,7 @@ EasyMLX mirrors EasyDeL's architecture, adapted for MLX:
 ```md
 easymlx/
 ├── caching/           # KV cache implementations
-│   ├── paged/         #   PagedKVCache, PageCache, PageMetadata
+│   ├── paged/         #   PageCacheView, PageCacheView, PageMetadata
 │   ├── transformer/   #   TransformerCache (dense attention)
 │   ├── recurrent/     #   RecurrentCache (Mamba/SSM)
 │   └── hybrid/        #   HybridCache (mixed attention + SSM)

@@ -59,7 +59,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("minimax_m2")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("minimax_m2")
 class MinimaxM2ToolParser(ToolParser):
     """Tool parser for Minimax M2 models with XML-style tool calls.
 

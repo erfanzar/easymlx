@@ -30,7 +30,7 @@ from ...openai_api_modules import DeltaMessage
 from ..abstract_reasoning import ReasoningParser, ReasoningParserManager
 
 
-@ReasoningParserManager.register_module(["openai_gptoss", "gptoss"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["openai_gptoss", "gptoss"])
 class GptOssReasoningParser(ReasoningParser):
     """Reasoning parser for GptOss models using channel tags.
 

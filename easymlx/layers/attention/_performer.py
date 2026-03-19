@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 
-from easymlx.caching import PageCache, PagedKVCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 
 from ._flexible import scaled_dot_product_attention
 
@@ -56,7 +56,7 @@ def prepare_paged_attention_inputs(
     keys: mx.array,
     values: mx.array,
     *,
-    kv_cache: PagedKVCache | PageCache,
+    kv_cache: PageCacheView | PageCacheView,
     query_start_loc: tp.Sequence["int"] | PageMetadata,
     slot_ids: tp.Sequence["int"] | None = None,
     rope: tp.Any = None,
@@ -73,12 +73,13 @@ def prepare_paged_attention_inputs(
             ``[B, L, num_heads, head_dim]``.
         keys: Key tensor with matching layout.
         values: Value tensor with matching layout.
-        kv_cache: A :class:`PagedKVCache` or :class:`PageCache`
+        kv_cache: A :class:`PageCacheView` or :class:`PageCacheView`
             instance.
         query_start_loc: Either a sequence of per-sequence query start
             locations or a :class:`PageMetadata` object.
         slot_ids: Optional slot IDs for the paged cache. Required if
-            *kv_cache* is a raw :class:`PagedKVCache`.
+            *kv_cache* is a raw :class:`PageCacheView` without metadata
+            carrying slot_ids.
         rope: Optional RoPE module applied inside the cache
             concatenation.
         sliding_window: Optional sliding-window size for the page
@@ -88,7 +89,6 @@ def prepare_paged_attention_inputs(
         A :class:`PagedAttentionInputs` containing the prepared
         tensors and metadata.
     """
-    cache_view = kv_cache if isinstance(kv_cache, PageCache) else PageCache(kv_cache, slot_ids or ())
     cache_metadata = (
         query_start_loc
         if isinstance(query_start_loc, PageMetadata)
@@ -97,11 +97,13 @@ def prepare_paged_attention_inputs(
             sliding_window=int(sliding_window) if sliding_window is not None else 0,
         )
     )
-    prepared_queries, key_cache, value_cache, metadata = cache_view.concatenate_to_cache(
+    resolved_slots = slot_ids or getattr(cache_metadata, "slot_ids", None) or ()
+    prepared_queries, key_cache, value_cache, metadata = kv_cache.concatenate_to_cache(
         queries,
         keys,
         values,
         cache_metadata=cache_metadata,
+        slot_ids=resolved_slots,
         rope=rope,
     )
     return PagedAttentionInputs(
@@ -129,13 +131,23 @@ class AttentionPerformer:
             ``1 / sqrt(head_dim)``.
     """
 
-    def __init__(self, *, scale: float):
+    def __init__(
+        self,
+        *,
+        scale: float,
+        attn_mechanism: str | None = None,
+    ):
         """Initialize the attention performer.
 
         Args:
             scale: The attention scale factor.
+            attn_mechanism: Paged attention mechanism override. If ``None``,
+                uses the module-level default (unified_attention). Pass
+                ``"paged"`` or ``"page_attention"`` to use the page_attention
+                Metal kernels instead.
         """
         self.scale = float(scale)
+        self.attn_mechanism = attn_mechanism
 
     def __call__(
         self,
@@ -144,7 +156,7 @@ class AttentionPerformer:
         values: mx.array,
         *,
         mask: mx.array | str | None = None,
-        cache_view: TransformerCacheView | PageCache | None = None,
+        cache_view: TransformerCacheView | PageCacheView | None = None,
         cache_metadata: PageMetadata | None = None,
         rope: tp.Any = None,
     ) -> mx.array:
@@ -160,17 +172,18 @@ class AttentionPerformer:
             keys: Key tensor with matching layout.
             values: Value tensor with matching layout.
             mask: Attention mask for the dense path. Ignored for paged.
-            cache_view: Cache view object. A :class:`PageCache` triggers
-                the paged path; a :class:`TransformerCacheView` or
-                ``None`` triggers the dense path.
+            cache_view: Cache view object. A :class:`PageCacheView`
+                triggers the paged path; a
+                :class:`TransformerCacheView` or ``None`` triggers the
+                dense path.
             cache_metadata: Required when *cache_view* is a
-                :class:`PageCache`.
+                :class:`PageCacheView`.
             rope: Optional RoPE module (applied internally).
 
         Returns:
             Attention output with the same leading shape as *queries*.
         """
-        if isinstance(cache_view, PageCache):
+        if isinstance(cache_view, PageCacheView):
             return self._forward_paged(
                 queries,
                 keys,
@@ -194,7 +207,7 @@ class AttentionPerformer:
         keys: mx.array,
         values: mx.array,
         *,
-        cache_view: PageCache,
+        cache_view: PageCacheView,
         cache_metadata: PageMetadata | None,
         rope: tp.Any,
     ) -> mx.array:
@@ -297,7 +310,7 @@ class AttentionPerformer:
         mask: mx.array | str | None = None,
         cache: tp.Any = None,
         cache_metadata: PageMetadata | None = None,
-        cache_view: PageCache | None = None,
+        cache_view: PageCacheView | None = None,
         sinks: mx.array | None = None,
     ) -> mx.array:
         """Low-level SDPA dispatch.
@@ -318,6 +331,15 @@ class AttentionPerformer:
         Returns:
             Attention output tensor.
         """
+        _PAGED_MECHANISMS = {
+            "paged": "page_attention",
+            "page_attention": "page_attention",
+            "unified": "unified_attention",
+            "unified_attention": "unified_attention",
+        }
+        paged_mechanism_kwargs = {}
+        if self.attn_mechanism is not None and self.attn_mechanism in _PAGED_MECHANISMS:
+            paged_mechanism_kwargs["paged_attention_mechanism"] = _PAGED_MECHANISMS[self.attn_mechanism]
         return scaled_dot_product_attention(
             queries,
             keys,
@@ -328,6 +350,7 @@ class AttentionPerformer:
             scale=self.scale,
             mask=mask,
             sinks=sinks,
+            **paged_mechanism_kwargs,
         )
 
 

@@ -157,10 +157,6 @@ class EasyGenerationMixin:
 
     config: tp.Any
 
-    # ------------------------------------------------------------------
-    # Cache initialisation
-    # ------------------------------------------------------------------
-
     def init_operations_cache(
         self,
         batch_size: int,
@@ -188,13 +184,15 @@ class EasyGenerationMixin:
 
         Returns:
             For ``"transformer"`` -- a ``TransformerCache``.
-            For ``"paged"`` -- a ``list[PagedKVCache]`` (one per layer).
+            For ``"paged"`` -- a ``PageCache`` (one view per layer).
             For ``"hybrid"`` -- a ``HybridCache``.
         """
         from easymlx.caching import (
             HybridCache,
             HybridCacheConfig,
-            PagedKVCache,
+            PageCache,
+            PageCacheConfig,
+            PageCacheView,
             TransformerCache,
             TransformerCacheConfig,
         )
@@ -202,7 +200,6 @@ class EasyGenerationMixin:
         cache_info = self.get_operations_cache_info()  # type: ignore[attr-defined]
         recommended = cache_type or cache_info.get_recommended_cache_type()
 
-        # --- Resolve head geometry from the first attention module. --------
         num_heads, head_dim, num_kv_heads = self._resolve_head_geometry()
         config = getattr(self, "config", None)
         num_hidden_layers: int = getattr(config, "num_hidden_layers", len(cache_info.layers) or 1)
@@ -222,32 +219,40 @@ class EasyGenerationMixin:
             return TransformerCache.init_cache(cache_cfg)
 
         if recommended == "paged":
-            caches = []
+            model_cache_dtype = getattr(config, "cache_dtype", None)
+            ragged_cfg = PageCacheConfig(
+                num_hidden_layers=num_hidden_layers,
+                num_kv_heads=num_kv_heads or num_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                max_num_reqs=batch_size,
+                max_model_length=max_length,
+                dtype=dtype,
+                cache_dtype=model_cache_dtype,
+            )
+            ragged_cache = PageCache.init_cache(ragged_cfg)
+
             for layer_idx in range(num_hidden_layers):
-                layer_nkv = num_kv_heads or num_heads
-                layer_hd = head_dim
                 if layer_idx < len(cache_info.layers):
                     layer_info = cache_info.layers[layer_idx]
                     op_name = layer_info.operation_name
                     if op_name in ("linear_attention", "gated_delta_rule", "gdr"):
-                        layer_nkv = getattr(config, "linear_num_value_heads", layer_nkv)
-                        layer_hd = getattr(config, "linear_value_head_dim", layer_hd)
+                        layer_nkv = ragged_cfg.num_kv_heads
+                        layer_hd = ragged_cfg.head_dim
                         text_cfg = getattr(config, "text_config", config)
                         layer_nkv = getattr(text_cfg, "linear_num_value_heads", layer_nkv)
                         layer_hd = getattr(text_cfg, "linear_value_head_dim", layer_hd)
-                caches.append(
-                    PagedKVCache.allocate(
-                        num_seqs=batch_size,
-                        max_seq_len=max_length,
-                        num_kv_heads=layer_nkv,
-                        head_dim=layer_hd,
-                        block_size=page_size,
-                        dtype=dtype,
-                    )
-                )
-            return caches
+                        ragged_cache[layer_idx] = PageCacheView.init(
+                            num_seqs=batch_size,
+                            max_seq_len=max_length,
+                            num_kv_heads=layer_nkv,
+                            head_dim=layer_hd,
+                            block_size=page_size,
+                            dtype=dtype,
+                            cache_dtype=model_cache_dtype,
+                        )
+            return ragged_cache
 
-        # recommended == "hybrid"
         layer_types_raw = getattr(config, "layer_types", None)
         if layer_types_raw is not None:
             layer_types = tuple(str(lt) for lt in layer_types_raw)
@@ -291,7 +296,6 @@ class EasyGenerationMixin:
             if num_heads is not None and head_dim is not None:
                 return int(num_heads), int(head_dim), int(num_kv_heads) if num_kv_heads else None
 
-        # Fallback: walk the model's layers list.
         for attr_name in ("layers", "h", "blocks"):
             layer_list = getattr(self, attr_name, None)
             if not isinstance(layer_list, list) or not layer_list:
@@ -307,14 +311,9 @@ class EasyGenerationMixin:
                 if nh is not None and hd is not None:
                     return int(nh), int(hd), int(nkv) if nkv else None
 
-        # Absolute fallback.
         hidden = getattr(config, "hidden_size", 4096) if config else 4096
         nh = getattr(config, "num_attention_heads", 32) if config else 32
         return int(nh), int(hidden) // int(nh), None
-
-    # ------------------------------------------------------------------
-    # Text generation
-    # ------------------------------------------------------------------
 
     def generate(
         self,

@@ -89,6 +89,9 @@ class SequenceBuffer:
         self.max_num_rows = None if max_num_rows is None else max(int(max_num_rows), 0)
         self._rows: list[SequenceRow | None] = []
         self._req_id_to_index: dict[str, int] = {}
+        self._mutation_counter: int = 0
+        self._cached_page_table: np.ndarray | None = None
+        self._page_table_version: int = -1
 
     def __len__(self) -> int:
         """Return the number of active (non-hole) rows.
@@ -359,6 +362,7 @@ class SequenceBuffer:
         """
         row = self.get_row(request_id)
         row.page_ids = [int(page_id) for page_id in page_ids]
+        self._mutation_counter += 1
 
     def swap_rows(self, first_index: int, second_index: int) -> None:
         """Swap two rows in-place, updating the request-ID mapping.
@@ -453,6 +457,9 @@ class SequenceBuffer:
     def page_table(self, *, pad_value: int = -1, max_pages_per_row: int | None = None) -> np.ndarray:
         """Build a dense page-table matrix from row page ids.
 
+        Caches the result until the buffer is modified (rows added/removed
+        or page_ids changed).
+
         Args:
             pad_value: Value used for unused page slots.
             max_pages_per_row: Column width of the output.  Defaults to
@@ -462,18 +469,24 @@ class SequenceBuffer:
             A 2-D ``int32`` NumPy array of shape
             ``(row_capacity, max_pages_per_row)``.
         """
+        version = getattr(self, "_page_table_version", -1)
+        current = getattr(self, "_mutation_counter", 0)
+        cached = getattr(self, "_cached_page_table", None)
+        if cached is not None and version == current and max_pages_per_row is None:
+            return cached
 
         if max_pages_per_row is None:
             max_pages_per_row = max((len(row.page_ids) for row in self._rows if row is not None), default=0)
         max_pages_per_row = max(int(max_pages_per_row), 0)
         table = np.full((len(self._rows), max_pages_per_row), int(pad_value), dtype=np.int32)
-        if max_pages_per_row == 0:
-            return table
-        for row_index, row in enumerate(self._rows):
-            if row is None or not row.page_ids:
-                continue
-            page_ids = row.page_ids[:max_pages_per_row]
-            table[row_index, : len(page_ids)] = np.asarray(page_ids, dtype=np.int32)
+        if max_pages_per_row > 0:
+            for row_index, row in enumerate(self._rows):
+                if row is None or not row.page_ids:
+                    continue
+                page_ids = row.page_ids[:max_pages_per_row]
+                table[row_index, : len(page_ids)] = np.asarray(page_ids, dtype=np.int32)
+        self._cached_page_table = table
+        self._page_table_version = current
         return table
 
     def snapshot(self) -> list[SequenceRow | None]:
@@ -483,15 +496,17 @@ class SequenceBuffer:
             List of :class:`SequenceRow` copies (or ``None`` for holes).
         """
         return [
-            None
-            if row is None
-            else SequenceRow(
-                request_id=row.request_id,
-                prompt_token_ids=list(row.prompt_token_ids),
-                output_token_ids=list(row.output_token_ids),
-                num_computed_tokens=row.num_computed_tokens,
-                page_ids=list(row.page_ids),
-                metadata=dict(row.metadata),
+            (
+                None
+                if row is None
+                else SequenceRow(
+                    request_id=row.request_id,
+                    prompt_token_ids=list(row.prompt_token_ids),
+                    output_token_ids=list(row.output_token_ids),
+                    num_computed_tokens=row.num_computed_tokens,
+                    page_ids=list(row.page_ids),
+                    metadata=dict(row.metadata),
+                )
             )
             for row in self._rows
         ]

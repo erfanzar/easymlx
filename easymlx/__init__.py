@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# pyright:reportUnusedImport=none
-# pyright:reportImportCycles=none
 
 """EasyMLX: MLX-native framework for efficient inference on Apple Silicon.
 
@@ -52,6 +50,10 @@ _import_structure = {
         "EasyMLXRuntimeError",
         "EasyMLXSyntaxRuntimeError",
         "EasyMLXTimerError",
+    ],
+    "infra.etils": [
+        "QuantizationConfig",
+        "QuantizationMode",
     ],
     "infra.factory": [
         "ConfigType",
@@ -232,6 +234,7 @@ if _tp.TYPE_CHECKING:
     from .inference import SamplingParams, eSurge, eSurgeApiServer
     from .infra import EasyMLXBaseConfig, EasyMLXBaseModule
     from .infra.errors import EasyMLXRuntimeError, EasyMLXSyntaxRuntimeError, EasyMLXTimerError
+    from .infra.etils import QuantizationConfig, QuantizationMode
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .infra.modeling_outputs import (
         BaseModelOutput,

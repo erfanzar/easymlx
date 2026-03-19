@@ -64,7 +64,7 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("olmo3")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("olmo3")
 class Olmo3PythonicToolParser(ToolParser):
     """Parser for OLMo-3 models that emit newline-separated pythonic tool calls.
 
@@ -193,7 +193,6 @@ class Olmo3PythonicToolParser(ToolParser):
                 - tool_calls: Delta with function name or argument fragments
                 - None if more data needed or parsing incomplete
         """
-        # All tool calls start with <function_calls>, but streaming may see partial tags.
         if not current_text.startswith("<"):
             return DeltaMessage(content=delta_text)
 
@@ -243,7 +242,6 @@ class Olmo3PythonicToolParser(ToolParser):
                     if delta.function is not None and delta.function.arguments is not None:
                         self.streamed_args_for_tool[index] += delta.function.arguments
 
-            # Ensure finish_reason is set to tool_calls once at least one tool is called.
             if tool_deltas and not self.prev_tool_call_arr:
                 self.prev_tool_call_arr = [{"arguments": {}}]
 

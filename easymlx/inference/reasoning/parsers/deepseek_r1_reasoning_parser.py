@@ -25,7 +25,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["deepseek_r1", "deepseek-r1"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["deepseek_r1", "deepseek-r1"])
 class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for DeepSeek R1 models using <think>...</think> tags."""
 

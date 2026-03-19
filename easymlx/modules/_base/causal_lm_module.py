@@ -26,7 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from easymlx.caching import (
-    PageCache,
+    PageCacheView,
     PageMetadata,
     TransformerCacheView,
 )
@@ -34,7 +34,7 @@ from easymlx.infra.base_config import EasyMLXBaseConfig
 from easymlx.infra.base_module import EasyMLXBaseModule
 from easymlx.infra.modeling_outputs import CausalLMOutput
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 class BaseCausalLMModule[ModelT: nn.Module, ConfigT: EasyMLXBaseConfig](EasyMLXBaseModule):

@@ -46,3 +46,33 @@ RopeType = tp.Literal["default", "linear", "llama3", "yarn", "longrope", "mrope"
 MODEL_CONFIG_NAME = "config.json"
 MODEL_WEIGHTS_GLOB = "model*.safetensors"
 MODEL_WEIGHTS_NAME = "model.safetensors"
+
+
+QuantizationMode = tp.Literal["affine", "mxfp4", "mxfp8", "nvfp4"]
+
+
+class QuantizationConfig(tp.TypedDict, total=False):
+    """Quantization configuration for model loading.
+
+    Attributes:
+        mode: Quantization mode. Supported modes:
+
+            - ``"affine"`` — Standard affine quantization (default). Requires
+              ``bits`` and ``group_size``.
+            - ``"mxfp4"`` — Microscaling FP4 format.
+            - ``"mxfp8"`` — Microscaling FP8 format.
+            - ``"nvfp4"`` — NVIDIA FP4 format.
+        bits: Number of bits per weight element. Only used for ``"affine"``
+            mode. Common values: ``4`` (default), ``8``, ``2``.
+        group_size: Number of elements sharing a scale/bias. Only used for
+            ``"affine"`` mode. Default ``64``.
+
+    Example:
+        >>> QuantizationConfig(mode="affine", bits=4, group_size=64)
+        >>> QuantizationConfig(mode="mxfp4")
+        >>> QuantizationConfig(mode="nvfp4")
+    """
+
+    mode: QuantizationMode
+    bits: int
+    group_size: int

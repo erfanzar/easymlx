@@ -122,8 +122,6 @@ class TieEmbeddingsFeature:
         """
         if not self.tie:
             return
-        # Placeholder: actual tying depends on the embedding/lm_head structure.
-        # Typically: lm_head.weight = embedding.weight
         pass
 
     def __repr__(self) -> str:
@@ -175,7 +173,7 @@ class RouterAuxLossFeature:
             return None
 
         total_loss = sum(router_losses)
-        return total_loss * self.coef  # pyright: ignore[reportReturnType]
+        return total_loss * self.coef
 
     def __repr__(self) -> str:
         return f"RouterAuxLossFeature(coef={self.coef})"

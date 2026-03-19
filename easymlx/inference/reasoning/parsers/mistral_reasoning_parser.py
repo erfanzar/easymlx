@@ -22,7 +22,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["mistral"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["mistral"])
 class MistralReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Mistral models.
 

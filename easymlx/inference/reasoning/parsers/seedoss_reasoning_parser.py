@@ -21,7 +21,7 @@ from ..abstract_reasoning import ReasoningParserManager
 from ..basic_parsers import BaseThinkingReasoningParser
 
 
-@ReasoningParserManager.register_module(["seed_oss"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["seed_oss"])
 class SeedOSSReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for Seed OSS models.
 

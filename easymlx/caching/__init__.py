@@ -38,7 +38,13 @@ from ._specs import (
     SlidingWindowSpec,
 )
 from .hybrid import HybridCache, HybridCacheConfig, HybridCacheView
-from .paged import PageCache, PagedKVCache, PageMetadata, build_query_start_loc
+from .paged import (
+    PageCache,
+    PageCacheConfig,
+    PageCacheView,
+    PageMetadata,
+    build_query_start_loc,
+)
 from .recurrent import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
 from .transformer import TransformerCache, TransformerCacheConfig, TransformerCacheView
 
@@ -58,8 +64,11 @@ __all__ = (
     "MambaSpec",
     "OperationsMetadata",
     "PageCache",
+    "PageCacheConfig",
+    "PageCacheView",
+    "PageCacheView",
     "PageMetadata",
-    "PagedKVCache",
+    "PageMetadata",
     "RecurrentCache",
     "RecurrentCacheConfig",
     "RecurrentCacheView",

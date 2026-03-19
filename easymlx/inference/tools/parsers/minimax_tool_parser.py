@@ -58,7 +58,7 @@ from ..utils import extract_intermediate_diff
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("minimax")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("minimax")
 class MinimaxToolParser(ToolParser):
     """Tool parser for Minimax models.
 

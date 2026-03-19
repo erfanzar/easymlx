@@ -19,7 +19,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from easymlx.caching import PagedKVCache
+from easymlx.caching import PageCacheView
 from easymlx.inference.esurge.runners import (
     ExecutionManager,
     ExecutionRequest,
@@ -27,6 +27,7 @@ from easymlx.inference.esurge.runners import (
     ScheduledSequence,
     SequenceBuffer,
 )
+from easymlx.inference.esurge.runners.model_runner import _as_numpy_logits
 from easymlx.inference.esurge.sampling_params import SamplingParams
 
 
@@ -52,8 +53,9 @@ class DummyCompiledPagedModel:
         self.vocab_size = vocab_size
 
     def __call__(self, input_ids=None, *, cache_views=None, cache_metadata=None, return_dict=True):
-        slot_array = cache_views[0]._slot_array
-        cache = cache_views[0].cache
+        slot_ids = cache_metadata.slot_ids or ()
+        slot_array = mx.array(list(slot_ids), dtype=mx.int32)
+        cache = cache_views[0]
         cache.kv_lens[slot_array] = cache.kv_lens[slot_array] + 1
 
         last_indices = (cache_metadata.query_start_loc[1:] - 1).astype(mx.int32)
@@ -121,17 +123,19 @@ def test_model_runner_normalizes_step_updates_and_mutates_buffer() -> None:
     assert buffer.get_row("req-b").output_token_ids == [0]
 
 
+def test_as_numpy_logits_handles_mlx_bfloat16() -> None:
+    logits = mx.arange(12, dtype=mx.float32).reshape(1, 3, 4).astype(mx.bfloat16)
+    array = _as_numpy_logits(logits)
+    assert array.shape == (1, 4)
+    assert array.dtype == np.float32
+    np.testing.assert_allclose(array, np.arange(8, 12, dtype=np.float32).reshape(1, 4))
+
+
 def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch) -> None:
-    monkeypatch.setenv("EASYMLX_ESURGE_USE_COMPILED_PAGED_FORWARD", "1")
-
-    from importlib import reload
-
-    import easymlx.inference.esurge.runners.model_runner as model_runner_module
-
-    model_runner_module = reload(model_runner_module)
+    from easymlx.inference.esurge.runners import model_runner as model_runner_module
 
     model = DummyCompiledPagedModel(vocab_size=6)
-    cache = PagedKVCache.allocate(
+    cache = PageCacheView.allocate(
         num_seqs=2,
         max_seq_len=8,
         num_kv_heads=1,
@@ -139,7 +143,7 @@ def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch)
         block_size=2,
         dtype=mx.float32,
     )
-    runner = model_runner_module.ModelRunner(model, kv_caches=[cache], seed=0)
+    runner = model_runner_module.ModelRunner(model, kv_caches=[cache], seed=0, use_compiled_forward=True)
 
     request = model_runner_module.ExecutionRequest(
         step_id=11,

@@ -47,8 +47,8 @@ import json
 from json import JSONDecodeError, JSONDecoder
 from typing import Any
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 
 
 def find_common_prefix(s1: str, s2: str) -> str:

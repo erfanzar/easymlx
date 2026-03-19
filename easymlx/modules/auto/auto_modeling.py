@@ -30,40 +30,13 @@ import mlx.core as mx
 
 from easymlx.infra.base_config import EasyMLXBaseConfig
 from easymlx.infra.base_module import EasyMLXBaseModule
+from easymlx.infra.etils import QuantizationConfig, QuantizationMode
 from easymlx.infra.factory import TaskType, registry
-
-QuantizationMode = Literal["affine", "mxfp4", "mxfp8", "nvfp4"]
-
-
-class QuantizationConfig(TypedDict, total=False):
-    """Quantization configuration for model loading.
-
-    Attributes:
-        mode: Quantization mode. Supported modes:
-
-            - ``"affine"`` — Standard affine quantization (default). Requires
-              ``bits`` and ``group_size``.
-            - ``"mxfp4"`` — Microscaling FP4 format.
-            - ``"mxfp8"`` — Microscaling FP8 format.
-            - ``"nvfp4"`` — NVIDIA FP4 format.
-        bits: Number of bits per weight element. Only used for ``"affine"``
-            mode. Common values: ``4`` (default), ``8``, ``2``.
-        group_size: Number of elements sharing a scale/bias. Only used for
-            ``"affine"`` mode. Default ``64``.
-
-    Example:
-        >>> QuantizationConfig(mode="affine", bits=4, group_size=64)
-        >>> QuantizationConfig(mode="mxfp4")
-        >>> QuantizationConfig(mode="nvfp4")
-    """
-
-    mode: QuantizationMode
-    bits: int
-    group_size: int
 
 
 def _apply_quantization(
-    model: EasyMLXBaseModule, quantization: QuantizationConfig | QuantizationMode | None
+    model: EasyMLXBaseModule,
+    quantization: QuantizationConfig | QuantizationMode | None,
 ) -> EasyMLXBaseModule:
     """Apply quantization to a model in-place.
 
@@ -159,12 +132,28 @@ def _apply_quantization(
     return model
 
 
+class ConfigOverrides(TypedDict, total=False):
+    """Typed overrides applied on top of the loaded model config.
+
+    Attributes:
+        attn_mechanism: Attention mechanism to use. Overrides the value
+            loaded from the pretrained config.
+        cache_dtype: Data type for KV cache storage. ``"auto"`` uses the
+            model dtype, ``"fp8"`` uses FP8 E4M3 quantization (uint8
+            storage) for ~50% KV cache memory reduction.
+    """
+
+    attn_mechanism: Literal["auto", "vanilla", "sdpa", "paged", "unified"]
+    cache_dtype: Literal["auto", "float16", "bfloat16", "float32", "fp8"]
+
+
 class FromPretrainedKwargs(TypedDict, total=False):
     """Keyword arguments accepted by ``from_pretrained`` methods.
 
     Attributes:
-        config: Pre-loaded config, config dict, or path. If None, loaded
-            automatically from the checkpoint.
+        config: Config overrides applied on top of the pretrained config.
+            Pass a :class:`ConfigOverrides` dict to selectively update
+            fields (e.g. ``config={"attn_mechanism": "sdpa"}``).
         dtype: Target data type for model parameters (e.g., ``mx.float16``).
         device: Target device for model parameters.
         revision: Git revision (branch, tag, commit) for HuggingFace Hub.
@@ -183,7 +172,7 @@ class FromPretrainedKwargs(TypedDict, total=False):
             ``group_size``.
     """
 
-    config: EasyMLXBaseConfig | dict | str | os.PathLike | None
+    config: ConfigOverrides | None
     dtype: mx.Dtype | None
     device: mx.Device | None
     revision: str | None
@@ -249,6 +238,7 @@ class BaseAutoEasyModel:
         from transformers import AutoConfig
 
         quantization = kwargs.pop("quantization", None)
+        config_overrides: ConfigOverrides | None = kwargs.pop("config", None)
 
         hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
         model_type: str = hf_config.model_type
@@ -256,6 +246,14 @@ class BaseAutoEasyModel:
         registration = registry.get_module_registration(cls.model_task, model_type)
         module_class = registration.module
         model = module_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+
+        if config_overrides:
+            config_obj = model.config
+            for key, value in config_overrides.items():
+                if hasattr(config_obj, key):
+                    setattr(config_obj, key, value)
+                elif hasattr(config_obj, "text_config") and hasattr(config_obj.text_config, key):
+                    setattr(config_obj.text_config, key, value)
 
         if quantization is not None:
             model = _apply_quantization(model, quantization)

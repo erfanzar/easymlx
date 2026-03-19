@@ -48,7 +48,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("functiongemma")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("functiongemma")
 class FunctionGemmaToolParser(ToolParser):
     """Tool parser for Google's FunctionGemma model.
 
@@ -293,7 +293,6 @@ class FunctionGemmaToolParser(ToolParser):
             prev_start_count = previous_text.count(self.tool_call_start_token)
             prev_end_count = previous_text.count(self.tool_call_end_token)
 
-            # Starting a new function call
             if start_count > prev_start_count and start_count > end_count:
                 self.current_tool_id += 1
                 self.current_tool_name_sent = False
@@ -302,7 +301,6 @@ class FunctionGemmaToolParser(ToolParser):
                 logger.debug("Starting new tool call %d", self.current_tool_id)
                 return None
 
-            # In the middle of a function call
             if start_count > end_count:
                 last_start = current_text.rfind(self.tool_call_start_token)
                 partial_call = current_text[last_start + len(self.tool_call_start_token) :]
@@ -350,7 +348,6 @@ class FunctionGemmaToolParser(ToolParser):
 
                 return None
 
-            # Function call just ended
             if end_count > prev_end_count:
                 if 0 <= self.current_tool_id < len(self.prev_tool_call_arr):
                     all_calls = self.tool_call_regex.findall(current_text)

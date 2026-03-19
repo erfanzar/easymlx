@@ -27,7 +27,7 @@ import typing as tp
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.infra.modeling_outputs import CausalLMOutput
@@ -42,7 +42,7 @@ from .qwen3_omni_moe_configuration import (
     Qwen3OmniMoeVisionEncoderConfig,
 )
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _get_activation(name: str) -> tp.Callable[[mx.array], mx.array]:
@@ -319,7 +319,9 @@ class Qwen3OmniMoeTextAttention(nn.Module):
             scaling_config=config.rope_scaling,
             max_position_embeddings=config.max_position_embeddings,
         )
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
     def __call__(
         self,

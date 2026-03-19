@@ -27,14 +27,16 @@ from .factory import TaskType, register_config, register_module, registry
 if tp.TYPE_CHECKING:  # pragma: no cover
     from .base_config import EasyMLXBaseConfig
     from .base_module import EasyMLXBaseModule
+    from .etils import QuantizationConfig, QuantizationMode
     from .modeling_outputs import CausalLMOutput, GenerateOutput, GreedySearchOutput, SampleOutput
-
 __all__ = (
     "CausalLMOutput",
     "EasyMLXBaseConfig",
     "EasyMLXBaseModule",
     "GenerateOutput",
     "GreedySearchOutput",
+    "QuantizationConfig",
+    "QuantizationMode",
     "SampleOutput",
     "TaskType",
     "register_config",
@@ -72,6 +74,16 @@ def __getattr__(name: str):  # pragma: no cover
         from . import modeling_outputs as _mo
 
         return getattr(_mo, name)
+    if name == "QuantizationConfig":
+        from .etils import QuantizationConfig
+
+        return QuantizationConfig
+
+    if name == "QuantizationMode":
+        from .etils import QuantizationMode
+
+        return QuantizationMode
+
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

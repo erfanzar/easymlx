@@ -35,6 +35,10 @@ class _DummyPagedCache:
         self.num_seqs = num_seqs
         self.kv_lens = np.zeros((num_seqs,), dtype=np.int32)
 
+    @property
+    def cache(self):
+        return self
+
     def reset(self, seq_idx: int) -> None:
         self.kv_lens[int(seq_idx)] = 0
 

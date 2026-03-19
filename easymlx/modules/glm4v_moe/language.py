@@ -26,11 +26,8 @@ import mlx.nn as nn
 import numpy as np
 
 from easymlx.caching import (
-    PageCache,
-    PagedKVCache,
+    PageCacheView,
     PageMetadata,
-    TransformerCache,
-    TransformerCacheConfig,
     TransformerCacheView,
 )
 from easymlx.layers.attention import AttentionPerformer, build_attention_mask
@@ -38,7 +35,7 @@ from easymlx.layers.linears import SwitchGLU
 
 from .glm4v_moe_configuration import Glm4VMoeModelConfig, Glm4VMoeTextConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 def _compute_default_rope_parameters(
@@ -214,7 +211,9 @@ class Glm4vMoeAttention(nn.Module):
         self.k_proj = nn.Linear(dim, self.n_kv_heads * head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.n_heads * head_dim, dim, bias=False)
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
         self.rope_scaling = config.rope_scaling
 
     def __call__(
@@ -814,72 +813,6 @@ class LanguageModel(nn.Module):
             hidden_states = mx.take(hidden_states, last_indices, axis=0)
 
         return self.lm_head(hidden_states)
-
-    def init_paged_cache(
-        self,
-        *,
-        num_seqs: int,
-        max_seq_len: int,
-        page_size: int = 16,
-        dtype: mx.Dtype = mx.float16,
-    ) -> list[PagedKVCache]:
-        """Creates paged KV caches for all decoder layers.
-
-        Args:
-            num_seqs: Number of sequences.
-            max_seq_len: Maximum sequence length per sequence.
-            page_size: Tokens per cache page. Defaults to 16.
-            dtype: Cache tensor dtype. Defaults to ``mx.float16``.
-
-        Returns:
-            List of ``PagedKVCache`` instances, one per layer.
-
-        Raises:
-            ValueError: If the model has no decoder layers.
-        """
-        if not self.model.layers:
-            raise ValueError("Paged cache initialization requires at least one decoder layer.")
-        first_attn = self.model.layers[0].self_attn
-        return [
-            PagedKVCache.allocate(
-                num_seqs=num_seqs,
-                max_seq_len=max_seq_len,
-                num_kv_heads=first_attn.n_kv_heads,
-                head_dim=self.args.head_dim,
-                block_size=page_size,
-                dtype=dtype,
-            )
-            for _ in self.model.layers
-        ]
-
-    def init_cache(
-        self,
-        *,
-        batch_size: int = 1,
-        max_sequence_length: int = 4096,
-        dtype: mx.Dtype = mx.float16,
-    ) -> TransformerCache:
-        """Creates a TransformerCache for standard autoregressive generation.
-
-        Args:
-            batch_size: Batch size. Defaults to 1.
-            max_sequence_length: Max sequence length. Defaults to 4096.
-            dtype: Cache dtype. Defaults to ``mx.float16``.
-
-        Returns:
-            An initialized ``TransformerCache`` instance.
-        """
-        first_attn = self.model.layers[0].self_attn
-        config = TransformerCacheConfig(
-            batch_size=batch_size,
-            num_hidden_layers=len(self.model.layers),
-            num_heads=first_attn.n_heads,
-            head_dim=self.args.head_dim,
-            num_key_value_heads=first_attn.n_kv_heads,
-            max_sequence_length=max_sequence_length,
-            dtype=dtype,
-        )
-        return TransformerCache.init_cache(config)
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         """Sanitizes weights for loading pretrained checkpoints.

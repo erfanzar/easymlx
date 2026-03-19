@@ -66,7 +66,7 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("pythonic")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("pythonic")
 class PythonicToolParser(ToolParser):
     """Tool call parser for models using Python-style function call syntax.
 
@@ -90,8 +90,6 @@ class PythonicToolParser(ToolParser):
         Tool arguments must be valid Python literals (strings, numbers,
         lists, dicts). Complex Python expressions are not supported.
     """
-
-    # TODO(mdepinet): Possible future improvements:
 
     TOOL_CALL_REGEX = re.compile(
         r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
@@ -234,7 +232,6 @@ class PythonicToolParser(ToolParser):
                     if delta.function is not None and delta.function.arguments is not None:
                         self.streamed_args_for_tool[index] += delta.function.arguments
 
-            # HACK: serving_chat.py inspects the internal state of tool parsers
             if tool_deltas and not self.prev_tool_call_arr:
                 self.prev_tool_call_arr = [{"arguments": {}}]
 

@@ -41,7 +41,7 @@ _RESPONSE_STARTERS = [
 ]
 
 
-@ReasoningParserManager.register_module(["granite"])  # pyright: ignore[reportUntypedClassDecorator]
+@ReasoningParserManager.register_module(["granite"])
 class GraniteReasoningParser(ReasoningParser):
     """Reasoning parser for Granite models using text delimiters."""
 
@@ -136,15 +136,12 @@ class GraniteReasoningParser(ReasoningParser):
         if not delta_text:
             return None
 
-        # Check if we've already found the response delimiter
         if self._reasoning_done:
             return DeltaMessage(content=delta_text)
 
-        # Check if response delimiter appears in current text
         for starter in self._response_starters:
             if starter in current_text:
                 self._reasoning_done = True
-                # Check if it's in the delta
                 if starter in delta_text:
                     parts = delta_text.split(starter, 1)
                     reasoning_part = parts[0] if self._in_reasoning else None
@@ -155,7 +152,6 @@ class GraniteReasoningParser(ReasoningParser):
                     )
                 return DeltaMessage(content=delta_text)
 
-        # Check if thought delimiter appears
         for starter in self._thought_starters:
             if starter in current_text:
                 self._in_reasoning = True

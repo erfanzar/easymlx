@@ -17,7 +17,7 @@
 This module provides the Qwen transformer architecture on MLX, including
 multi-head attention with rotary embeddings, a SiLU-gated MLP, and a
 causal language model wrapper. The unified ``__call__`` API at every layer
-accepts both ``TransformerCacheView`` and ``PageCache`` for flexible serving.
+accepts both ``TransformerCacheView`` and ``PageCacheView`` for flexible serving.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.layers.attention import AttentionPerformer, build_attention_mask
@@ -34,7 +34,7 @@ from easymlx.modules._base import BaseCausalLMModule
 
 from .qwen_configuration import QwenConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 class QwenAttention(nn.Module):
@@ -64,7 +64,9 @@ class QwenAttention(nn.Module):
         self.scale = head_dim**-0.5
 
         self.rope = get_rope(dims=head_dim, base=10000.0, traditional=False)
-        self.attention_performer = AttentionPerformer(scale=self.scale)
+        self.attention_performer = AttentionPerformer(
+            scale=self.scale, attn_mechanism=getattr(config, "attn_mechanism", None)
+        )
 
         proj_size = config.kv_channels * self.num_attention_heads
         self.c_attn = nn.Linear(hidden_size, proj_size * 3, bias=True)

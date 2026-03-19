@@ -24,7 +24,7 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from easymlx.caching import PageCache, PageMetadata, TransformerCacheView
+from easymlx.caching import PageCacheView, PageMetadata, TransformerCacheView
 from easymlx.infra import CausalLMOutput, EasyMLXBaseModule, TaskType
 from easymlx.infra.factory import register_module
 from easymlx.modules._base import BaseCausalLMModule
@@ -37,7 +37,7 @@ from easymlx.modules.qwen3_vl.modeling_qwen3_vl import (
 
 from .qwen3_5_configuration import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 
-CacheView = TransformerCacheView | PageCache
+CacheView = TransformerCacheView | PageCacheView
 
 
 class Qwen3_5VisionMerger(nn.Module):

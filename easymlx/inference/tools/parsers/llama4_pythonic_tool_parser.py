@@ -67,7 +67,7 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("llama4_pythonic")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("llama4_pythonic")
 class Llama4PythonicToolParser(ToolParser):
     """Tool call parser for Llama 4 models with Pythonic syntax.
 
@@ -244,7 +244,6 @@ class Llama4PythonicToolParser(ToolParser):
                     if delta.function is not None and delta.function.arguments is not None:
                         self.streamed_args_for_tool[index] += delta.function.arguments
 
-            # HACK: serving_chat.py inspects the internal state of tool parsers
             if tool_deltas and not self.prev_tool_call_arr:
                 self.prev_tool_call_arr = [{"arguments": {}}]
 

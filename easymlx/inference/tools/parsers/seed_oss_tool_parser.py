@@ -57,7 +57,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("seed_oss")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("seed_oss")
 class SeedOssToolParser(ToolParser):
     """Tool parser for Seed OSS model outputs.
 

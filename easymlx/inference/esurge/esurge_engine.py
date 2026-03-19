@@ -378,9 +378,9 @@ class eSurge:
         max_model_len: int = 8192,
         max_num_seqs: int = 4,
         max_num_seq_buckets: list[int] | None = None,
-        max_num_batched_tokens: int | None = 2048,
+        max_num_batched_tokens: int | None = 1024,
         memory_utilization: float = 0.6,
-        page_size: int = 16,
+        page_size: int = 128,
         enable_prefix_caching: bool = True,
         reserve_tokens: int | None = None,
         auto_truncate_prompt: bool = True,
@@ -458,6 +458,7 @@ class eSurge:
         self._lock = threading.Lock()
         self._work_cv = threading.Condition(self._lock)
         self._shutdown = threading.Event()
+        self._has_terminal_states = False
         self._paused = False
         self._background_thread: threading.Thread | None = None
         self._scheduler: Scheduler | AsyncScheduler | None = None
@@ -720,7 +721,14 @@ class eSurge:
                 dtype=np.float16,
                 cache_type="paged",
             )
-            cache_list = list(result) if isinstance(result, (list, tuple)) else [result]
+            if isinstance(result, (list, tuple)):
+                cache_list = list(result)
+            elif hasattr(result, "views"):
+                cache_list = list(result.views)
+            elif hasattr(result, "__iter__"):
+                cache_list = list(result)
+            else:
+                cache_list = [result]
             if not cache_list:
                 raise ValueError("init_operations_cache returned no caches.")
             return cache_list
@@ -1252,18 +1260,50 @@ class eSurge:
         if self._scheduler is None or self._runner is None:
             raise RuntimeError("Background runtime is not initialized.")
 
-        for request_id in step_output.preempted_request_ids:
-            self._runner.detach_request(request_id)
         if step_output.preempted_request_ids:
+            for request_id in step_output.preempted_request_ids:
+                self._runner.detach_request(request_id)
             self._scheduler.remap_rows(self._runner.compact_rows())
+
+        scheduled_list = step_output.scheduled
+        num_scheduled = len(scheduled_list)
+
+        if num_scheduled == 0:
+            return ExecutionRequest(step_id=self._step_counter)
+
+        is_pure_decode = num_scheduled > 0 and not scheduled_list[0].is_prefill
+        if is_pure_decode and num_scheduled == 1:
+            entry = scheduled_list[0]
+            state = self._runtime_states.get(entry.request_id)
+            if state is not None and not state.request.is_finished:
+                self._runner.bind_request(state.request, entry.row_index)
+                seq = ScheduledSequence(
+                    request_id=entry.request_id,
+                    row_index=entry.row_index,
+                    token_ids=list(entry.token_ids),
+                    num_computed_tokens=state.request.num_computed_tokens,
+                    page_ids=entry.page_ids,
+                    meta={"is_prefill": False},
+                )
+                sp = state.request.sampling_params
+                return ExecutionRequest(
+                    step_id=self._step_counter,
+                    mode="decode",
+                    sequences=[seq],
+                    sampling_by_request={entry.request_id: sp} if sp is not None else {},
+                    page_table=self._runner.sequence_buffer.page_table(),
+                )
 
         sequences: list[ScheduledSequence] = []
         sampling_by_request: dict[str, SamplingParams] = {}
-        for scheduled in step_output.scheduled:
+        has_prefill = False
+        for scheduled in scheduled_list:
             state = self._runtime_states.get(scheduled.request_id)
             if state is None or state.request.is_finished:
                 continue
             self._runner.bind_request(state.request, scheduled.row_index)
+            if scheduled.is_prefill:
+                has_prefill = True
             sequences.append(
                 ScheduledSequence(
                     request_id=scheduled.request_id,
@@ -1284,10 +1324,8 @@ class eSurge:
         if not sequences:
             return ExecutionRequest(step_id=self._step_counter)
 
-        multimodal = self._prepare_multimodal_batch(step_output)
-        mode = "decode"
-        if any(sequence.meta.get("is_prefill", False) for sequence in sequences):
-            mode = "prefill" if all(sequence.meta.get("is_prefill", False) for sequence in sequences) else "mixed"
+        multimodal = self._prepare_multimodal_batch(step_output) if has_prefill else None
+        mode = "prefill" if has_prefill and len(sequences) == num_scheduled else "mixed" if has_prefill else "decode"
 
         return ExecutionRequest(
             step_id=self._step_counter,
@@ -1314,26 +1352,43 @@ class eSurge:
         if not sampled_token_ids:
             return None
 
-        candidate_generated = list(state.generated_token_ids) + [int(token_id) for token_id in sampled_token_ids]
-        raw_text = self.tokenizer.decode(candidate_generated, skip_special_tokens=True)
-        parsed = self._parse_text_output(
-            raw_text,
-            stop=state.stop,
-            finish_reason=None,
-            gen_kwargs=state.gen_kwargs,
-            tool_parser=state.tool_parser_instance,
-            reasoning_parser=state.reasoning_parser_instance,
-        )
-        if parsed["stop_reason"] is not None:
-            return str(parsed["stop_reason"])
-        if parsed["tool_calls"]:
-            return "tool_calls"
-
-        if int(sampled_token_ids[-1]) in state.eos_token_ids:
+        last_token = int(sampled_token_ids[-1])
+        if last_token in state.eos_token_ids:
             return "eos"
 
-        if len(candidate_generated) >= state.request.max_new_tokens:
+        total_generated = len(state.generated_token_ids) + len(sampled_token_ids)
+        if total_generated >= state.request.max_new_tokens:
             return "length"
+
+        has_stop_strings = bool(state.stop)
+        has_tool_parser = state.tool_parser_instance is not None
+
+        if not has_stop_strings and not has_tool_parser:
+            return None
+
+        tail_size = min(total_generated, 64)
+        tail_ids = list(state.generated_token_ids[-tail_size:]) + [int(t) for t in sampled_token_ids]
+        tail_text = self.tokenizer.decode(tail_ids, skip_special_tokens=True)
+
+        if has_stop_strings:
+            for stop_str in state.stop:
+                if stop_str in tail_text:
+                    return "stop"
+
+        if has_tool_parser:
+            candidate_generated = list(state.generated_token_ids) + [int(t) for t in sampled_token_ids]
+            raw_text = self.tokenizer.decode(candidate_generated, skip_special_tokens=True)
+            parsed = self._parse_text_output(
+                raw_text,
+                stop=state.stop,
+                finish_reason=None,
+                gen_kwargs=state.gen_kwargs,
+                tool_parser=state.tool_parser_instance,
+                reasoning_parser=state.reasoning_parser_instance,
+            )
+            if parsed["tool_calls"]:
+                return "tool_calls"
+
         return None
 
     def _reconcile_terminal_states_locked(self) -> None:
@@ -1358,6 +1413,7 @@ class eSurge:
                 state.finalize()
         if detached:
             self._scheduler.remap_rows(self._runner.compact_rows())
+        self._has_terminal_states = False
 
     def _dispatch_distributed_step(self, step_output: SchedulerStepOutput) -> Any | None:
         """Dispatch a step to remote workers via the distributed controller.
@@ -1448,8 +1504,9 @@ class eSurge:
                 continue
             state.finalize()
         if finished_requests:
+            self._has_terminal_states = True
             self._reset_recurrent_states()
-        self._reconcile_terminal_states_locked()
+            self._reconcile_terminal_states_locked()
 
     def _run_loop(self) -> None:
         """Background loop that continuously schedules and executes steps.
@@ -1471,19 +1528,15 @@ class eSurge:
                 if self._paused or self._scheduler is None:
                     continue
 
-                self._reconcile_terminal_states_locked()
+                if self._has_terminal_states:
+                    self._reconcile_terminal_states_locked()
                 step_output = self._scheduler.schedule()
                 if not step_output.scheduled:
                     self._work_cv.wait(timeout=0.001)
                     continue
                 self._step_counter += 1
-                logger.debug(
-                    "Scheduling step %d: %d sequences scheduled",
-                    self._step_counter,
-                    step_output.num_scheduled,
-                )
                 execution_request = self._build_execution_request(step_output)
-                dispatch = self._dispatch_distributed_step(step_output)
+                dispatch = self._dispatch_distributed_step(step_output) if self._distributed_controller is not None else None
 
             execution_error: BaseException | None = None
             result: ExecutionResult | None = None
@@ -1603,6 +1656,185 @@ class eSurge:
             max_tokens,
         )
         return self._generate_with_background(prompts, sampling_params=sampling_params, **generate_kwargs)
+
+    def _generate_sync(
+        self,
+        prompt: str,
+        sampling_params: SamplingParams | None = None,
+        **generate_kwargs: Any,
+    ) -> RequestOutput | None:
+        """Synchronous single-request fast path — no thread, no locks.
+
+        Bypasses the background scheduling loop entirely for single-request
+        generation. Runs prefill + decode in a tight Python loop on the
+        calling thread, eliminating ~3ms/step of threading overhead.
+
+        Returns ``None`` if the fast path cannot be used (e.g. runner not
+        initialized), in which case the caller should fall back to the
+        background loop.
+        """
+        if self._runner is None or self._scheduler is None or self._execution_manager is None:
+            return None
+
+        import numpy as np
+
+        gen_kwargs = self._resolve_generation_kwargs(sampling_params, **generate_kwargs)
+        max_new_tokens = int(gen_kwargs.get("max_new_tokens", sampling_params.max_tokens if sampling_params else 16))
+        if self.auto_cap_new_tokens:
+            max_new_tokens = max(1, min(max_new_tokens, self.max_model_len - self.reserve_tokens))
+
+        eos_token_id = gen_kwargs.get("eos_token_id", self.tokenizer.eos_token_id)
+        eos_set: set[int] = set()
+        if isinstance(eos_token_id, int):
+            eos_set.add(eos_token_id)
+        elif isinstance(eos_token_id, (list, tuple)):
+            eos_set.update(int(e) for e in eos_token_id)
+
+        stop_strings: list[str] = gen_kwargs.get("stop", []) or []
+        if sampling_params and sampling_params.stop:
+            stop_strings = list(sampling_params.stop)
+
+        input_ids = self.tokenizer.encode(prompt)
+        if not input_ids:
+            return None
+
+        runner = self._runner
+        scheduler = self._scheduler
+
+        request_id = f"sync_{id(self)}_{time.time()}"
+        from easymlx.inference.esurge.request import EngineRequest
+        if sampling_params is not None:
+            sp_copy = SamplingParams(
+                max_tokens=max_new_tokens,
+                temperature=sampling_params.temperature,
+                top_p=sampling_params.top_p,
+                top_k=sampling_params.top_k,
+                do_sample=sampling_params.do_sample,
+                stop=sampling_params.stop,
+            )
+        else:
+            sp_copy = SamplingParams(max_tokens=max_new_tokens)
+        engine_request = EngineRequest(
+            request_id=request_id,
+            prompt=prompt,
+            prompt_token_ids=list(input_ids),
+            sampling_params=sp_copy,
+        )
+
+        scheduler.add_request(engine_request)
+        runner.bind_request(engine_request, 0)
+
+        generated_token_ids: list[int] = []
+        finish_reason: str | None = None
+        t_start = time.time()
+        np.random.default_rng()
+
+        step = 0
+        while len(generated_token_ids) < max_new_tokens:
+            step_output = scheduler.schedule()
+            if not step_output.scheduled:
+                break
+
+            entry = step_output.scheduled[0]
+            seq = ScheduledSequence(
+                request_id=request_id,
+                row_index=entry.row_index,
+                token_ids=list(entry.token_ids),
+                num_computed_tokens=engine_request.num_computed_tokens,
+                page_ids=entry.page_ids,
+                meta={"is_prefill": entry.is_prefill},
+            )
+            is_prefill = entry.is_prefill
+            mode = "prefill" if is_prefill else "decode"
+
+            exec_request = ExecutionRequest(
+                step_id=step,
+                mode=mode,
+                sequences=[seq],
+                sampling_by_request={request_id: sampling_params} if sampling_params else {},
+                page_table=runner.sequence_buffer.page_table(),
+            )
+
+            result = self._execution_manager.execute(exec_request)
+
+            if result.updates:
+                update = result.updates[0]
+                new_tokens = list(update.sampled_token_ids) if update.sampled_token_ids else []
+                generated_token_ids.extend(new_tokens)
+                engine_request.generated_token_ids.extend(new_tokens)
+                engine_request.num_computed_tokens = (update.num_computed_tokens or engine_request.num_computed_tokens)
+                runner.sequence_buffer.append_output_tokens(request_id, new_tokens)
+                runner.sequence_buffer.set_num_computed_tokens(request_id, engine_request.num_computed_tokens)
+
+                sampled_ids = {request_id: new_tokens}
+                stop_reason: str | None = None
+
+                if new_tokens and new_tokens[-1] in eos_set:
+                    stop_reason = "eos"
+                elif len(generated_token_ids) >= max_new_tokens:
+                    stop_reason = "length"
+                elif stop_strings:
+                    tail = self.tokenizer.decode(generated_token_ids[-64:], skip_special_tokens=True)
+                    for s in stop_strings:
+                        if s in tail:
+                            stop_reason = "stop"
+                            break
+
+                scheduler.update_from_model_output(
+                    step_output,
+                    sampled_token_ids=sampled_ids,
+                    stop_reasons={request_id: stop_reason},
+                )
+
+                if stop_reason is not None:
+                    finish_reason = stop_reason
+                    break
+            else:
+                scheduler.update_from_model_output(step_output, sampled_token_ids={})
+
+            step += 1
+
+        self._reset_recurrent_states()
+        runner.detach_request(request_id)
+        runner.compact_rows()
+
+        elapsed = max(time.time() - t_start, 1e-6)
+        num_gen = len(generated_token_ids)
+        tps = float(num_gen) / elapsed if num_gen else 0.0
+
+        raw_text = self.tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        parsed = self._parse_text_output(
+            raw_text,
+            stop=stop_strings,
+            finish_reason=finish_reason,
+            gen_kwargs=gen_kwargs,
+            tool_parser=self._new_tool_parser() if self.tool_parser_name else None,
+            reasoning_parser=self._new_reasoning_parser() if self.reasoning_parser_name else None,
+        )
+
+        text = str(parsed["text"])
+        completion = CompletionOutput(
+            index=0,
+            text=text,
+            token_ids=generated_token_ids,
+            finish_reason=parsed["finish_reason"] or finish_reason,
+            tool_calls=parsed.get("tool_calls"),
+            reasoning_content=parsed.get("reasoning_content"),
+        )
+        return RequestOutput(
+            request_id=request_id,
+            outputs=[completion],
+            prompt=prompt,
+            prompt_token_ids=list(input_ids),
+            finished=True,
+            accumulated_text=text,
+            tokens_per_second=tps,
+            num_generated_tokens=num_gen,
+            time_spent_generating=elapsed,
+            processing_time=elapsed,
+            reasoning_content=parsed.get("reasoning_content"),
+            tool_calls=parsed.get("tool_calls"),
+        )
 
     def stream(
         self,

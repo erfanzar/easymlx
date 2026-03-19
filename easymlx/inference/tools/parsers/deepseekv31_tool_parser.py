@@ -47,7 +47,7 @@ from ..abstract_tool import ToolParser, ToolParserManager
 logger = logging.getLogger(__name__)
 
 
-@ToolParserManager.register_module("deepseek_v31")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("deepseek_v31")
 class DeepSeekV31ToolParser(ToolParser):
     """Tool parser for DeepSeek V3.1 models.
 
@@ -265,7 +265,6 @@ class DeepSeekV31ToolParser(ToolParser):
                 delta_text = delta_text.split(self.tool_call_end_token)[0].rstrip()
                 text_portion = delta_text.split(self.tool_call_end_token)[-1].lstrip()
 
-            # Starting a new tool call
             if cur_tool_start_count > cur_tool_end_count and cur_tool_start_count > prev_tool_start_count:
                 if len(delta_token_ids) > 1:
                     tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
@@ -280,12 +279,10 @@ class DeepSeekV31ToolParser(ToolParser):
                 self.streamed_args_for_tool.append("")
                 logger.debug("Starting on a new tool %s", self.current_tool_id)
 
-            # Updating existing tool call
             elif cur_tool_start_count > cur_tool_end_count and cur_tool_start_count == prev_tool_start_count:
                 tool_call_portion = current_text.split(self.tool_call_start_token)[-1]
                 text_portion = None
 
-            # Closing tool call
             elif cur_tool_start_count == cur_tool_end_count and cur_tool_end_count >= prev_tool_end_count:
                 if self.prev_tool_call_arr is None or len(self.prev_tool_call_arr) == 0:
                     logger.debug("attempting to close tool call, but no tool call")
@@ -309,7 +306,6 @@ class DeepSeekV31ToolParser(ToolParser):
                         ]
                     )
 
-            # Otherwise, regular content tokens (strip tool call tokens if they leaked)
             else:
                 text = delta_text.replace(self.tool_call_start_token, "")
                 text = text.replace(self.tool_call_end_token, "")
@@ -332,7 +328,6 @@ class DeepSeekV31ToolParser(ToolParser):
                         logger.debug("Not enough token")
                         return None
 
-            # Send tool name first
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
                 if function_name:
@@ -349,7 +344,6 @@ class DeepSeekV31ToolParser(ToolParser):
                     )
                 return None
 
-            # If we don't have tool portion yet, pass through any text after tool closure
             if tool_call_portion is None:
                 return DeltaMessage(content=delta_text) if text_portion is not None else None
 

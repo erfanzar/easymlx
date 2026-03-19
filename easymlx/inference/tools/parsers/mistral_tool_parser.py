@@ -45,13 +45,13 @@ from collections.abc import Sequence
 from random import choices
 from string import ascii_letters, digits
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from pydantic import Field
 from transformers import AutoTokenizer as AnyTokenizer
 
 try:
-    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # pyright: ignore[reportMissingImports]
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 except ImportError:
     MistralTokenizer = None
 
@@ -159,7 +159,7 @@ def _is_fn_name_regex_support(model_tokenizer: AnyTokenizer) -> bool:
     return bool(MistralTokenizer and isinstance(model_tokenizer, MistralTokenizer) and model_tokenizer.version >= 11)
 
 
-@ToolParserManager.register_module("mistral")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("mistral")
 class MistralToolParser(ToolParser):
     """Tool call parser for Mistral models (7B Instruct v0.3+).
 
@@ -276,7 +276,6 @@ class MistralToolParser(ToolParser):
             and request.tools
             and request.tool_choice != "none"
         ):
-            # Note: we don't want skip_special_tokens=False
             request.skip_special_tokens = False
         return request
 
@@ -342,7 +341,6 @@ class MistralToolParser(ToolParser):
                 else:
                     function_call_arr = json.loads(tool_content)
             except json.JSONDecodeError:
-                # NOTE: This use case should not happen if the model is trained
                 raw_tool_call = self.tool_call_regex.findall(tool_content)[0]
                 function_call_arr = json.loads(raw_tool_call)
 

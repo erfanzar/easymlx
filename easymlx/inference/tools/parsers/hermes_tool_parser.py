@@ -47,8 +47,8 @@ import re
 from collections.abc import Sequence
 from uuid import uuid4
 
-import partial_json_parser  # pyright: ignore[reportMissingTypeStubs]
-from partial_json_parser.core.options import Allow  # pyright: ignore[reportMissingTypeStubs]
+import partial_json_parser
+from partial_json_parser.core.options import Allow
 from transformers import AutoTokenizer as AnyTokenizer
 
 from ...openai_api_modules import (
@@ -63,7 +63,7 @@ from ...openai_api_modules import (
 from ..abstract_tool import ToolParser, ToolParserManager
 
 
-@ToolParserManager.register_module("hermes")  # pyright: ignore[reportUntypedClassDecorator]
+@ToolParserManager.register_module("hermes")
 class HermesToolParser(ToolParser):
     """
     Tool call parser for Hermes models.
