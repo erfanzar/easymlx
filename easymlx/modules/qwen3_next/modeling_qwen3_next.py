@@ -87,8 +87,20 @@ def _resolve_module_activation_dtype(module: nn.Module, fallback: mx.Dtype) -> m
 
 
 def sanitize_qwen3_next_projection_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
-    """Return Qwen3-Next weights unchanged."""
-    return weights
+    """Sanitize Qwen3-Next weights (conv1d HF→MLX layout, mtp removal).
+
+    HuggingFace Conv1d stores weights as ``(out, in/groups, kernel)``
+    while MLX uses ``(out, kernel, in/groups)``.  This function transposes
+    any ``conv1d.weight`` tensors and drops multi-token prediction heads.
+    """
+    out: dict[str, mx.array] = {}
+    for key, value in weights.items():
+        if key.startswith("mtp."):
+            continue
+        if key.endswith("conv1d.weight") and value.ndim == 3 and value.shape[-1] != 1:
+            value = value.transpose(0, 2, 1)
+        out[key] = value
+    return out
 
 
 class Qwen3NextRMSNorm(nn.Module):
@@ -355,16 +367,16 @@ class Qwen3NextLinearAttention(nn.Module):
         self.head_v_dim = int(config.linear_value_head_dim)
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
-        self.conv_dim = self.key_dim * 2 + self.num_k_heads * self.head_v_dim
-        self.d_conv = int(getattr(config, "linear_conv_kernel_dim", 4))
         self.expand_ratio = self.num_v_heads // self.num_k_heads
+        self.conv_value_dim = self.num_v_heads * self.head_v_dim
+        self.conv_dim = self.key_dim * 2 + self.conv_value_dim
+        self.d_conv = int(getattr(config, "linear_conv_kernel_dim", 4))
 
-        self.conv_value_dim = self.num_k_heads * self.head_v_dim
         qkv_dim = self.key_dim * 2 + self.conv_value_dim
         self.in_proj_qkv = nn.Linear(config.hidden_size, qkv_dim, bias=False)
         self.in_proj_z = nn.Linear(config.hidden_size, self.conv_value_dim, bias=False)
-        self.in_proj_b = nn.Linear(config.hidden_size, self.num_k_heads, bias=False)
-        self.in_proj_a = nn.Linear(config.hidden_size, self.num_k_heads, bias=False)
+        self.in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
+        self.in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
         self.out_proj = nn.Linear(self.conv_value_dim, config.hidden_size, bias=False)
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.gdr_op = GatedDeltaRuleOp()
@@ -382,8 +394,8 @@ class Qwen3NextLinearAttention(nn.Module):
                 bias=False,
             )
 
-        self.A_log = mx.zeros((self.num_k_heads,))
-        self.dt_bias = mx.ones((self.num_k_heads,))
+        self.A_log = mx.zeros((self.num_v_heads,))
+        self.dt_bias = mx.ones((self.num_v_heads,))
 
         self._conv_state: mx.array | None = None
         self._recurrent_state: mx.array | None = None
@@ -420,7 +432,7 @@ class Qwen3NextLinearAttention(nn.Module):
             dtype=conv_dtype,
         )
         self._recurrent_state = mx.zeros(
-            (batch_size, self.num_k_heads, self.head_k_dim, self.head_v_dim),
+            (batch_size, self.num_v_heads, self.head_k_dim, self.head_v_dim),
             dtype=mx.float32,
         )
         self._refresh_decode_cache()
@@ -460,7 +472,7 @@ class Qwen3NextLinearAttention(nn.Module):
         is_decode = seq_len == 1 and self._recurrent_state is not None
 
         qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         beta_raw = self.in_proj_b(hidden_states)
         alpha_raw = self.in_proj_a(hidden_states)
 
@@ -505,7 +517,12 @@ class Qwen3NextLinearAttention(nn.Module):
         key = conv_out[:, :, self.key_dim : self.key_dim * 2].reshape(
             batch_size, seq_len, self.num_k_heads, self.head_k_dim
         )
-        value = conv_out[:, :, self.key_dim * 2 :].reshape(batch_size, seq_len, self.num_k_heads, self.head_v_dim)
+        value = conv_out[:, :, self.key_dim * 2 :].reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        # Expand Q/K heads to match V heads when num_v_heads > num_k_heads.
+        if self.expand_ratio > 1:
+            query = mx.repeat(query, self.expand_ratio, axis=2)
+            key = mx.repeat(key, self.expand_ratio, axis=2)
 
         if is_decode:
             output, self._recurrent_state = self.gdr_op.step_decode(

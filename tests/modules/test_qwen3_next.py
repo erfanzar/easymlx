@@ -150,7 +150,7 @@ class TestQwen3Next:
         assert output.shape == hidden_states.shape
         np.testing.assert_allclose(
             np.asarray(attn._recurrent_state),
-            np.ones((1, config.linear_num_key_heads, config.linear_key_head_dim, config.linear_value_head_dim)),
+            np.ones((1, config.linear_num_value_heads, config.linear_key_head_dim, config.linear_value_head_dim)),
         )
 
     def test_gdr_recurrent_metal_matches_math(self):

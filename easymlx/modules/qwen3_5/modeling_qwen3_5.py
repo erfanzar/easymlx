@@ -319,8 +319,6 @@ class Qwen3_5ForConditionalGeneration(EasyMLXBaseModule):
         """
         sanitized = {}
         for key, value in weights.items():
-            if key.startswith("mtp."):
-                continue
             new_key = key.replace("model.visual.", "model.vision_tower.")
             new_key = new_key.replace(".mlp.linear_fc1.", ".mlp.fc1.")
             new_key = new_key.replace(".mlp.linear_fc2.", ".mlp.fc2.")
@@ -328,8 +326,6 @@ class Qwen3_5ForConditionalGeneration(EasyMLXBaseModule):
             new_key = new_key.replace("model.vision_tower.merger.linear_fc2.", "model.vision_tower.merger.fc2.")
             if new_key.endswith("patch_embed.proj.weight") and value.ndim == 5:
                 value = value.sum(axis=2).transpose(0, 2, 3, 1)
-            if new_key.endswith("conv1d.weight") and value.ndim == 3:
-                value = value.transpose(0, 2, 1)
             sanitized[new_key] = value
         return sanitize_qwen3_next_projection_weights(sanitized)
 

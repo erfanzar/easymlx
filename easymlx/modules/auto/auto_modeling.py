@@ -34,104 +34,6 @@ from easymlx.infra.etils import QuantizationConfig, QuantizationMode
 from easymlx.infra.factory import TaskType, registry
 
 
-def _apply_quantization(
-    model: EasyMLXBaseModule,
-    quantization: QuantizationConfig | QuantizationMode | None,
-) -> EasyMLXBaseModule:
-    """Apply quantization to a model in-place.
-
-    Args:
-        model: The model to quantize.
-        quantization: Quantization specification. Can be:
-
-            - ``None`` — No quantization.
-            - :class:`QuantizationMode` — Shorthand mode literal
-              (``"affine"``, ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``).
-              Uses default bits/group_size for the mode.
-            - :class:`QuantizationConfig` dict with ``mode``, ``bits``,
-              ``group_size`` keys.
-
-    Returns:
-        The quantized model (modified in-place).
-
-    Raises:
-        ValueError: If the quantization mode is not recognized.
-    """
-    import mlx.nn as nn
-
-    if quantization is None or quantization == "":
-        return model
-
-    if isinstance(quantization, str):
-        quantization = QuantizationConfig(mode=quantization)
-
-    mode = quantization.get("mode", "affine")
-    valid_modes = ("affine", "mxfp4", "mxfp8", "nvfp4")
-    if mode not in valid_modes:
-        raise ValueError(f"Unknown quantization mode '{mode}'. Supported: {valid_modes}")
-
-    _MODE_DEFAULTS: dict[str, dict[str, int]] = {
-        "affine": {"bits": 4, "group_size": 64},
-        "mxfp4": {"bits": 4, "group_size": 32},
-        "mxfp8": {"bits": 8, "group_size": 32},
-        "nvfp4": {"bits": 4, "group_size": 16},
-    }
-
-    defaults = _MODE_DEFAULTS[mode]
-    kwargs: dict = {
-        "mode": mode,
-        "bits": quantization.get("bits", defaults["bits"]),
-        "group_size": quantization.get("group_size", defaults["group_size"]),
-    }
-
-    import logging
-
-    logger = logging.getLogger("easymlx.quantization")
-
-    logger.info(
-        "Quantizing model: mode=%s, bits=%d, group_size=%d",
-        kwargs["mode"],
-        kwargs["bits"],
-        kwargs["group_size"],
-    )
-
-    try:
-        gs = kwargs["group_size"]
-        bits = kwargs["bits"]
-        dummy_w = mx.ones((gs, gs))
-        quant_result = mx.quantize(dummy_w, gs, bits, mode=kwargs["mode"])
-        scales = quant_result[1]
-        biases = quant_result[2] if len(quant_result) == 3 else None
-        dummy_x = mx.ones((1, gs))
-        out = mx.quantized_matmul(
-            dummy_x,
-            quant_result[0],
-            scales=scales,
-            biases=biases,
-            transpose=True,
-            group_size=gs,
-            bits=bits,
-            mode=kwargs["mode"],
-        )
-        mx.eval(out)
-    except RuntimeError as exc:
-        if "Unable to load kernel" in str(exc):
-            device_info = mx.metal.device_info()
-            device_name = device_info.get("device_name", "unknown")
-            raise RuntimeError(
-                f"Quantization mode '{mode}' is not supported on {device_name} "
-                f"(arch={device_info.get('architecture', '?')}). "
-                f"The required Metal kernel is not available in MLX {mx.__version__}. "
-                f"Try mode='affine' (bits=4, group_size=64) which works on all Apple Silicon, "
-                f"or upgrade MLX: pip install -U mlx"
-            ) from exc
-        raise
-
-    nn.quantize(model, **kwargs)
-    logger.info("Quantization complete")
-    return model
-
-
 class ConfigOverrides(TypedDict, total=False):
     """Typed overrides applied on top of the loaded model config.
 
@@ -237,7 +139,6 @@ class BaseAutoEasyModel:
         """
         from transformers import AutoConfig
 
-        quantization = kwargs.pop("quantization", None)
         config_overrides: ConfigOverrides | None = kwargs.pop("config", None)
 
         hf_config = AutoConfig.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
@@ -245,6 +146,8 @@ class BaseAutoEasyModel:
 
         registration = registry.get_module_registration(cls.model_task, model_type)
         module_class = registration.module
+        # quantization is passed through to bridge's from_pretrained so
+        # it can quantize per-shard (much lower peak memory).
         model = module_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         if config_overrides:
@@ -254,9 +157,6 @@ class BaseAutoEasyModel:
                     setattr(config_obj, key, value)
                 elif hasattr(config_obj, "text_config") and hasattr(config_obj.text_config, key):
                     setattr(config_obj.text_config, key, value)
-
-        if quantization is not None:
-            model = _apply_quantization(model, quantization)
 
         return model
 

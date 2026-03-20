@@ -34,6 +34,7 @@ from easymlx.modules.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 from easymlx.modules.qwen3_next.modeling_qwen3_next import (
     Qwen3NextDecoderLayer,
     Qwen3NextRMSNorm,
+    sanitize_qwen3_next_projection_weights,
 )
 
 from .qwen3_5_moe_configuration import (
@@ -149,6 +150,10 @@ class Qwen3_5MoeForCausalLM(BaseCausalLMModule[Qwen3_5MoeTextModel, Qwen3_5MoeTe
             base_model_class=Qwen3_5MoeTextModel,
             tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
         )
+
+    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+        """Sanitize weights for CausalLM (conv1d transpose + base cleanup)."""
+        return super().sanitize(sanitize_qwen3_next_projection_weights(weights))
 
 
 @register_module(task_type=TaskType.BASE_MODULE, config=Qwen3_5MoeConfig, model_type="qwen3_5_moe")
@@ -345,8 +350,6 @@ class Qwen3_5MoeForConditionalGeneration(EasyMLXBaseModule):
         """
         sanitized = {}
         for key, value in weights.items():
-            if key.startswith("mtp."):
-                continue
             new_key = key.replace("model.visual.", "model.vision_tower.")
             new_key = new_key.replace(".mlp.linear_fc1.", ".mlp.fc1.")
             new_key = new_key.replace(".mlp.linear_fc2.", ".mlp.fc2.")
@@ -354,10 +357,8 @@ class Qwen3_5MoeForConditionalGeneration(EasyMLXBaseModule):
             new_key = new_key.replace("model.vision_tower.merger.linear_fc2.", "model.vision_tower.merger.fc2.")
             if new_key.endswith("patch_embed.proj.weight") and value.ndim == 5:
                 value = value.sum(axis=2).transpose(0, 2, 3, 1)
-            if new_key.endswith("conv1d.weight") and value.ndim == 3:
-                value = value.transpose(0, 2, 1)
             sanitized[new_key] = value
-        return sanitized
+        return sanitize_qwen3_next_projection_weights(sanitized)
 
     def __call__(
         self,

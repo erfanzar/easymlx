@@ -26,6 +26,7 @@ It provides three main capabilities:
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import hashlib
 import json
@@ -38,7 +39,7 @@ from mlx.utils import tree_flatten
 
 from ..base_config import EasyMLXBaseConfig
 from ..errors import EasyMLXRuntimeError
-from ..etils import MODEL_WEIGHTS_GLOB, MODEL_WEIGHTS_NAME
+from ..etils import MODEL_WEIGHTS_GLOB, MODEL_WEIGHTS_NAME, QuantizationConfig, QuantizationMode
 
 _HF_SUPPORT_FILES = (
     "generation_config.json",
@@ -51,6 +52,191 @@ _HF_SUPPORT_FILES = (
     "vocab.json",
 )
 _CONVERTED_SOURCE_METADATA = "easymlx_source.json"
+
+
+@contextlib.contextmanager
+def _no_weight_init():
+    """Suppress random weight initialisation during model construction.
+
+    MLX modules (``nn.Linear``, ``nn.Embedding``, …) allocate random
+    weights in ``__init__``.  When we are about to overwrite every
+    parameter with pretrained weights, building the random computation
+    graph is wasted work.  This context manager temporarily replaces
+    ``mx.random.uniform`` and ``mx.random.normal`` with zero-returning
+    stubs so that model construction is essentially free.
+    """
+    orig_uniform = mx.random.uniform
+    orig_normal = mx.random.normal
+
+    def _zero_uniform(*_a, shape=(), dtype=mx.float32, **_kw):
+        return mx.zeros(shape, dtype=dtype)
+
+    def _zero_normal(*_a, shape=(), dtype=mx.float32, **_kw):
+        return mx.zeros(shape, dtype=dtype)
+
+    mx.random.uniform = _zero_uniform
+    mx.random.normal = _zero_normal
+    try:
+        yield
+    finally:
+        mx.random.uniform = orig_uniform
+        mx.random.normal = orig_normal
+
+
+_QUANT_MODE_DEFAULTS: dict[str, dict[str, int]] = {
+    "affine": {"bits": 4, "group_size": 64},
+    "mxfp4": {"bits": 4, "group_size": 32},
+    "mxfp8": {"bits": 8, "group_size": 32},
+    "nvfp4": {"bits": 4, "group_size": 16},
+}
+
+
+def _parse_quantization_config(
+    quantization: QuantizationConfig | QuantizationMode,
+) -> dict:
+    """Parse a quantization spec into a validated kwargs dict.
+
+    Args:
+        quantization: A mode string or a :class:`QuantizationConfig` dict.
+
+    Returns:
+        A dict with ``mode``, ``bits``, ``group_size`` ready for
+        :func:`mlx.nn.quantize` / :func:`mx.quantize`.
+
+    Raises:
+        ValueError: If the mode is not recognised.
+    """
+    if isinstance(quantization, str):
+        quantization = QuantizationConfig(mode=quantization)
+
+    mode = quantization.get("mode", "affine")
+    if mode not in _QUANT_MODE_DEFAULTS:
+        raise ValueError(f"Unknown quantization mode '{mode}'. Supported: {tuple(_QUANT_MODE_DEFAULTS)}")
+
+    defaults = _QUANT_MODE_DEFAULTS[mode]
+    return {
+        "mode": mode,
+        "bits": quantization.get("bits", defaults["bits"]),
+        "group_size": quantization.get("group_size", defaults["group_size"]),
+    }
+
+
+def _validate_quantization_kernel(quant_kwargs: dict) -> None:
+    """Run a tiny dummy quantize+matmul to verify the Metal kernel loads.
+
+    Raises:
+        RuntimeError: With a user-friendly message if the kernel is
+            unavailable on the current device.
+    """
+    gs = quant_kwargs["group_size"]
+    bits = quant_kwargs["bits"]
+    mode = quant_kwargs["mode"]
+    try:
+        dummy_w = mx.ones((gs, gs))
+        quant_result = mx.quantize(dummy_w, gs, bits, mode=mode)
+        q, scales = quant_result[0], quant_result[1]
+        biases = quant_result[2] if len(quant_result) > 2 else None
+        out = mx.quantized_matmul(
+            mx.ones((1, gs)),
+            q,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=gs,
+            bits=bits,
+            mode=mode,
+        )
+        mx.eval(out)
+    except RuntimeError as exc:
+        if "Unable to load kernel" in str(exc):
+            device_info = mx.metal.device_info()
+            device_name = device_info.get("device_name", "unknown")
+            raise RuntimeError(
+                f"Quantization mode '{mode}' is not supported on {device_name} "
+                f"(arch={device_info.get('architecture', '?')}). "
+                f"The required Metal kernel is not available in MLX {mx.__version__}. "
+                f"Try mode='affine' (bits=4, group_size=64) which works on all Apple Silicon, "
+                f"or upgrade MLX: pip install -U mlx"
+            ) from exc
+        raise
+
+
+def _quantize_weights(
+    weights: dict[str, mx.array],
+    quantized_weight_keys: frozenset[str],
+    quant_kwargs: dict,
+) -> dict[str, mx.array]:
+    """Quantize full-precision weights that belong to quantized modules.
+
+    For every key in *weights* that appears in *quantized_weight_keys*
+    **and** has a floating-point dtype, the value is replaced with the
+    three arrays produced by :func:`mx.quantize` (packed weight, scales,
+    biases).  All other entries pass through unchanged.
+
+    This lets us quantize weights while streaming shards, so full-precision
+    data for the whole model never needs to live in memory at once.
+
+    Args:
+        weights: Flat weight dictionary (already sanitized / cast).
+        quantized_weight_keys: Set of ``"prefix.weight"`` keys whose
+            corresponding module was converted to ``QuantizedLinear``
+            (or ``QuantizedEmbedding``).
+        quant_kwargs: ``dict(mode=..., bits=..., group_size=...)``.
+
+    Returns:
+        A new dictionary with quantized entries replacing the originals.
+    """
+    group_size = quant_kwargs["group_size"]
+    bits = quant_kwargs["bits"]
+    mode = quant_kwargs["mode"]
+
+    out: dict[str, mx.array] = {}
+    for key, value in weights.items():
+        if key in quantized_weight_keys and mx.issubdtype(value.dtype, mx.floating):
+            quant_result = mx.quantize(value, group_size, bits, mode=mode)
+            prefix = key.rsplit(".weight", 1)[0]
+            out[f"{prefix}.weight"] = quant_result[0]
+            out[f"{prefix}.scales"] = quant_result[1]
+            if len(quant_result) > 2:
+                out[f"{prefix}.biases"] = quant_result[2]
+        else:
+            out[key] = value
+    return out
+
+
+def _apply_quantization(
+    model: EasyBridgeMixin,
+    quantization: QuantizationConfig | QuantizationMode | None,
+) -> None:
+    """Parse, validate, and apply quantization to a model in-place.
+
+    Convenience wrapper used by external callers (e.g. auto-model classes).
+    ``from_pretrained`` uses the lower-level helpers directly so it can
+    quantize per-shard for better memory behaviour.
+
+    Args:
+        model: The model to quantize.
+        quantization: Mode string or :class:`QuantizationConfig` dict.
+            ``None`` / ``""`` is a no-op.
+    """
+    import logging
+
+    import mlx.nn as nn
+
+    if quantization is None or quantization == "":
+        return
+
+    quant_kwargs = _parse_quantization_config(quantization)
+    logger = logging.getLogger("easymlx.quantization")
+    logger.info(
+        "Quantizing model: mode=%s, bits=%d, group_size=%d",
+        quant_kwargs["mode"],
+        quant_kwargs["bits"],
+        quant_kwargs["group_size"],
+    )
+    _validate_quantization_kernel(quant_kwargs)
+    nn.quantize(model, **quant_kwargs)
+    logger.info("Quantization complete")
 
 
 def _resolve_model_path(
@@ -402,7 +588,8 @@ class EasyBridgeMixin:
         elif not isinstance(config, config_class):  # pragma: no cover
             raise TypeError(f"Unsupported config type: {type(config)}")
 
-        model = cls(config)
+        with _no_weight_init():
+            model = cls(config)
         weight_files = _resolve_weight_files(model_path)
         if not weight_files:
             raise FileNotFoundError(f"No weights found under {model_path!s}. Expected {MODEL_WEIGHTS_GLOB!r}.")
@@ -451,6 +638,7 @@ class EasyBridgeMixin:
         converted_cache_dir: str | os.PathLike | None = None,
         force_conversion: bool = False,
         copy_support_files: bool = True,
+        quantization: QuantizationConfig | QuantizationMode | None = None,
     ):
         """Load a pretrained model from a local directory or Hub ID.
 
@@ -535,7 +723,9 @@ class EasyBridgeMixin:
         elif not isinstance(config, config_class):  # pragma: no cover
             raise TypeError(f"Unsupported config type: {type(config)}")
 
-        model = cls(config)
+        # Build the model skeleton without allocating random weights.
+        with _no_weight_init():
+            model = cls(config)
 
         weight_files = _resolve_weight_files(model_path, weights_name=weights_name)
 
@@ -544,23 +734,98 @@ class EasyBridgeMixin:
                 f"No weights found under {model_path!s}. Expected {MODEL_WEIGHTS_GLOB!r} (or pass weights_name=...)."
             )
 
-        weights: dict[str, mx.array] = {}
-        for weight_file in weight_files:
-            weights.update(_load_weights_file(weight_file))
-
-        sanitize = getattr(model, "sanitize", None)
-        if callable(sanitize):
-            sanitized = sanitize(weights)
-            if sanitized is not None:
-                weights = sanitized
+        sanitize_fn = getattr(model, "sanitize", None)
+        if not callable(sanitize_fn):
+            sanitize_fn = None
 
         cast_dtype = dtype or config.mlx_dtype
-        weights = _cast_weights(weights, dtype=cast_dtype)
 
         if device is not None:
             mx.set_default_device(device)
 
-        model.load_weights(list(weights.items()), strict=strict)
+        # ------------------------------------------------------------------
+        # Shard-level quantization: if the caller requested quantization we
+        # convert the model's Linear/Embedding modules to their quantized
+        # variants *first* (on the zero-init skeleton — essentially free),
+        # then quantize each shard's fp weights on-the-fly as they stream
+        # in.  This way full-precision data only exists for one shard at a
+        # time → peak memory ≈ quantized-model + one-fp-shard.
+        # ------------------------------------------------------------------
+        quant_kwargs: dict | None = None
+        quantized_weight_keys: frozenset[str] = frozenset()
+
+        if quantization is not None:
+            import logging
+
+            import mlx.nn as nn
+
+            quant_kwargs = _parse_quantization_config(quantization)
+            _validate_quantization_kernel(quant_kwargs)
+
+            logger = logging.getLogger("easymlx.quantization")
+            logger.info(
+                "Quantizing model: mode=%s, bits=%d, group_size=%d",
+                quant_kwargs["mode"],
+                quant_kwargs["bits"],
+                quant_kwargs["group_size"],
+            )
+
+            # Set up QuantizedLinear / QuantizedEmbedding structure.
+            nn.quantize(model, **quant_kwargs)
+
+            # Collect the weight keys the model now expects in quantized
+            # form so we can transform each shard to match.
+            quantized_weight_keys = frozenset(
+                k.rsplit(".scales", 1)[0] + ".weight"
+                for k, _ in tree_flatten(model.parameters())
+                if k.endswith(".scales")
+            )
+
+        # ------------------------------------------------------------------
+        # Stream weights shard-by-shard.  After loading each shard we
+        # immediately evaluate its arrays so the mmap-backed lazy data is
+        # materialised into real (and possibly quantized) memory and the
+        # file pages can be reclaimed.  This keeps the memory watermark
+        # proportional to (quantized-model-so-far + one-shard) instead of
+        # (entire-fp-model + quantized-model).
+        # ------------------------------------------------------------------
+        loaded_keys: set[str] = set()
+        for weight_file in weight_files:
+            shard = _load_weights_file(weight_file)
+            if sanitize_fn is not None:
+                sanitized = sanitize_fn(shard)
+                if sanitized is not None:
+                    shard = sanitized
+            shard = _cast_weights(shard, dtype=cast_dtype)
+
+            if quant_kwargs is not None:
+                shard = _quantize_weights(shard, quantized_weight_keys, quant_kwargs)
+
+            shard_items = list(shard.items())
+            loaded_keys.update(k for k, _ in shard_items)
+            model.load_weights(shard_items, strict=False)
+
+            # Eagerly evaluate this shard so its backing mmap pages can be
+            # released before the next shard is opened.
+            if not lazy:
+                mx.eval([v for _, v in shard_items])
+
+            del shard, shard_items
+
+        if strict:
+            model_keys = {k for k, _ in tree_flatten(model.parameters())}
+            missing = model_keys - loaded_keys
+            extra = loaded_keys - model_keys
+            if missing or extra:
+                parts: list[str] = []
+                if missing:
+                    parts.append(f"Missing keys in checkpoint: {missing}")
+                if extra:
+                    parts.append(f"Unexpected keys in checkpoint: {extra}")
+                raise ValueError(". ".join(parts))
+
+        # Catch any remaining un-evaluated params (e.g. norms, biases not
+        # covered by shards).  For already-evaluated arrays this is a no-op.
         if not lazy:
             mx.eval(model.parameters())
         model.eval()
