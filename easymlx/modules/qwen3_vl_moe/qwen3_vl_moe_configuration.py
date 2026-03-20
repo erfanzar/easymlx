@@ -23,6 +23,25 @@ from easymlx.infra.factory import register_config
 
 
 class Qwen3VLMoeVisionConfig(EasyMLXBaseConfig):
+    """Configuration for the Qwen3-VL-MoE vision encoder.
+
+    Attributes:
+        depth: Number of transformer blocks in the vision encoder.
+        hidden_size: Hidden dimensionality of vision transformer layers.
+        hidden_act: Activation function name for the vision MLP layers.
+        intermediate_size: Dimensionality of the feed-forward hidden layer.
+        num_heads: Number of attention heads in each vision block.
+        in_channels: Number of input image channels (e.g., 3 for RGB).
+        patch_size: Size of each image patch for the patch embedding.
+        spatial_merge_size: Factor for spatial merging of vision tokens.
+        temporal_patch_size: Patch size along the temporal axis for video.
+        out_hidden_size: Output projection dimensionality after the vision encoder.
+        num_position_embeddings: Maximum number of position embeddings.
+        deepstack_visual_indexes: Layer indices for deep-stack visual features.
+        tokens_per_second: Number of tokens generated per second for video.
+        initializer_range: Standard deviation for weight initialization.
+    """
+
     def __init__(
         self,
         *,
@@ -60,6 +79,44 @@ class Qwen3VLMoeVisionConfig(EasyMLXBaseConfig):
 
 
 class Qwen3VLMoeTextConfig(EasyMLXBaseConfig):
+    """Configuration for the Qwen3-VL-MoE text decoder.
+
+    Extends the standard Qwen3-VL text config with Mixture-of-Experts
+    parameters including expert count, routing, and sparse layer scheduling.
+
+    Attributes:
+        vocab_size: Size of the token vocabulary.
+        hidden_size: Hidden dimensionality of transformer layers.
+        intermediate_size: Dimensionality of the dense MLP hidden layer.
+        num_hidden_layers: Number of transformer decoder layers.
+        num_attention_heads: Number of query attention heads.
+        num_key_value_heads: Number of key/value heads for grouped-query attention.
+        head_dim: Dimensionality of each attention head (computed if None).
+        hidden_act: Activation function name for MLP layers.
+        max_position_embeddings: Maximum sequence length for position embeddings.
+        initializer_range: Standard deviation for weight initialization.
+        rms_norm_eps: Epsilon for RMSNorm layers.
+        use_cache: Whether to use KV caching during generation.
+        tie_word_embeddings: Whether input and output embeddings share weights.
+        rope_theta: Base frequency for rotary position embeddings.
+        attention_bias: Whether attention projections include bias terms.
+        attention_dropout: Dropout probability for attention weights.
+        rope_scaling: Optional dictionary configuring RoPE scaling.
+        use_sliding_window: Whether to enable sliding window attention.
+        sliding_window: Size of the sliding window (in tokens).
+        max_window_layers: Layer index threshold above which sliding window is used.
+        decoder_sparse_step: Interval at which MoE layers replace dense MLPs.
+        moe_intermediate_size: Intermediate size for each MoE expert.
+        num_experts_per_tok: Number of experts activated per token (top-k).
+        num_experts: Total number of experts in the MoE layers.
+        norm_topk_prob: Whether to normalize the top-k routing probabilities.
+        output_router_logits: Whether to output router logits for auxiliary losses.
+        router_aux_loss_coef: Coefficient for the router auxiliary loss.
+        mlp_only_layers: Layer indices that always use a dense MLP (no MoE).
+        layer_types: Per-layer attention type list (``"full_attention"`` or
+            ``"sliding_attention"``).
+    """
+
     def __init__(
         self,
         *,
@@ -126,6 +183,12 @@ class Qwen3VLMoeTextConfig(EasyMLXBaseConfig):
         self.layer_types = layer_types
 
     def finalize(self) -> None:
+        """Finalize configuration by computing derived values.
+
+        Computes ``head_dim`` from ``hidden_size`` and ``num_attention_heads``
+        if not explicitly set. Initializes ``mlp_only_layers`` to an empty list
+        and builds ``layer_types`` based on sliding window settings.
+        """
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
         if self.layer_types is None:
@@ -139,6 +202,22 @@ class Qwen3VLMoeTextConfig(EasyMLXBaseConfig):
 
 @register_config("qwen3_vl_moe")
 class Qwen3VLMoeConfig(EasyMLXBaseConfig):
+    """Top-level configuration for the Qwen3-VL-MoE vision-language model.
+
+    Composes a ``Qwen3VLMoeVisionConfig`` for the vision encoder and a
+    ``Qwen3VLMoeTextConfig`` for the MoE text decoder. Sub-configs can be
+    passed as class instances or plain dictionaries.
+
+    Attributes:
+        model_type: Identifier string (``"qwen3_vl_moe"``).
+        vision_config: Vision encoder sub-configuration.
+        text_config: MoE text decoder sub-configuration.
+        image_token_id: Token ID used for image placeholders in the input.
+        video_token_id: Token ID used for video placeholders in the input.
+        vision_start_token_id: Token ID marking the start of vision tokens.
+        vision_end_token_id: Token ID marking the end of vision tokens.
+    """
+
     model_type = "qwen3_vl_moe"
 
     def __init__(

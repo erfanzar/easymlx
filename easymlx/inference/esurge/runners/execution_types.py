@@ -203,7 +203,7 @@ class ExecutionResult:
         step_id: Step counter matching the originating request.
         updates: Per-request :class:`ExecutionUpdate` objects.
         output: Raw model forward-pass output.
-        logits: Optional NumPy logits array.
+        logits: Optional runner-native logits array.
         elapsed_seconds: Wall-clock execution time in seconds.
         error: Error message if the step failed.
         metadata: Arbitrary step-level metadata.

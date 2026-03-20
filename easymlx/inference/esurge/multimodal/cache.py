@@ -60,14 +60,14 @@ class VisionEncoderCache:
         self.misses = 0
 
     @staticmethod
-    def compute_hash(pixel_values: np.ndarray) -> str:
+    def compute_hash(pixel_values: Any) -> str:
         """Compute an MD5 hash for a pixel-value array.
 
         For large arrays (> 1 million elements) a strided subsample is
         hashed instead of the full buffer to keep latency low.
 
         Args:
-            pixel_values: NumPy array of pixel data to hash.
+            pixel_values: Pixel data to hash.
 
         Returns:
             Hex-encoded MD5 digest string.
@@ -78,12 +78,13 @@ class VisionEncoderCache:
             >>> isinstance(h, str) and len(h) == 32
             True
         """
-        shape_bytes = np.asarray(pixel_values.shape, dtype=np.int32).tobytes()
-        if pixel_values.size > 1_000_000:
-            sampled = pixel_values.flat[::100]
+        array = np.asarray(pixel_values)
+        shape_bytes = np.asarray(array.shape, dtype=np.int32).tobytes()
+        if array.size > 1_000_000:
+            sampled = array.flat[::100]
             content_bytes = sampled.tobytes()
         else:
-            content_bytes = pixel_values.tobytes()
+            content_bytes = array.tobytes()
         return hashlib.md5(shape_bytes + content_bytes).hexdigest()
 
     def get(self, hash_key: str) -> Any | None:

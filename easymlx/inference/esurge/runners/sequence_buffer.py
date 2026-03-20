@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import numpy as np
+import mlx.core as mx
 
 
 @dataclass(slots=True)
@@ -90,7 +90,7 @@ class SequenceBuffer:
         self._rows: list[SequenceRow | None] = []
         self._req_id_to_index: dict[str, int] = {}
         self._mutation_counter: int = 0
-        self._cached_page_table: np.ndarray | None = None
+        self._cached_page_table: mx.array | None = None
         self._page_table_version: int = -1
 
     def __len__(self) -> int:
@@ -454,7 +454,7 @@ class SequenceBuffer:
         while self._rows and self._rows[-1] is None:
             self._rows.pop()
 
-    def page_table(self, *, pad_value: int = -1, max_pages_per_row: int | None = None) -> np.ndarray:
+    def page_table(self, *, pad_value: int = -1, max_pages_per_row: int | None = None) -> mx.array:
         """Build a dense page-table matrix from row page ids.
 
         Caches the result until the buffer is modified (rows added/removed
@@ -466,7 +466,7 @@ class SequenceBuffer:
                 the maximum page count across all active rows.
 
         Returns:
-            A 2-D ``int32`` NumPy array of shape
+            A rank-2 ``int32`` MLX array of shape
             ``(row_capacity, max_pages_per_row)``.
         """
         version = getattr(self, "_page_table_version", -1)
@@ -478,13 +478,13 @@ class SequenceBuffer:
         if max_pages_per_row is None:
             max_pages_per_row = max((len(row.page_ids) for row in self._rows if row is not None), default=0)
         max_pages_per_row = max(int(max_pages_per_row), 0)
-        table = np.full((len(self._rows), max_pages_per_row), int(pad_value), dtype=np.int32)
+        table = mx.full((len(self._rows), max_pages_per_row), int(pad_value), dtype=mx.int32)
         if max_pages_per_row > 0:
             for row_index, row in enumerate(self._rows):
                 if row is None or not row.page_ids:
                     continue
                 page_ids = row.page_ids[:max_pages_per_row]
-                table[row_index, : len(page_ids)] = np.asarray(page_ids, dtype=np.int32)
+                table[row_index, : len(page_ids)] = mx.array(page_ids, dtype=mx.int32)
         self._cached_page_table = table
         self._page_table_version = current
         return table

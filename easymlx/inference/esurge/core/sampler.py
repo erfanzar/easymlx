@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
+import mlx.core as mx
 
 from ..sampling_params import SamplingParams
 
@@ -46,11 +46,11 @@ def sampling_params_to_kwargs(sampling_params: SamplingParams | None) -> dict[st
     return sampling_params.to_generation_kwargs()
 
 
-def argmax_token(logits: np.ndarray) -> int:
+def argmax_token(logits: Any) -> int:
     """Select the token id with the highest logit score (greedy decoding).
 
     Args:
-        logits: A rank-1 numpy array of logit values whose length equals
+        logits: A rank-1 array of logit values whose length equals
             the vocabulary size.
 
     Returns:
@@ -59,7 +59,9 @@ def argmax_token(logits: np.ndarray) -> int:
     Raises:
         ValueError: If *logits* is not a 1-D array.
     """
-    arr = np.asarray(logits)
+    arr = logits if isinstance(logits, mx.array) else mx.array(logits)
     if arr.ndim != 1:
         raise ValueError(f"Expected rank-1 logits, got shape={arr.shape}")
-    return int(np.argmax(arr))
+    token_id = mx.argmax(arr, axis=-1).astype(mx.int32)
+    mx.eval(token_id)
+    return int(token_id.item())

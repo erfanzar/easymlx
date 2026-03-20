@@ -61,6 +61,22 @@ class Qwen2VLVisionConfig(EasyMLXBaseConfig):
         initializer_range: float = 0.02,
         **kwargs,
     ):
+        """Initialize the Qwen2-VL vision encoder configuration.
+
+        Args:
+            depth: Number of vision transformer blocks.
+            embed_dim: Dimensionality of the vision transformer embeddings.
+            hidden_size: Dimensionality of the vision MLP intermediate layer.
+            hidden_act: Activation function name for the vision MLP.
+            mlp_ratio: MLP expansion ratio.
+            num_heads: Number of attention heads in the vision transformer.
+            in_channels: Number of input image channels.
+            patch_size: Size of each image patch.
+            spatial_merge_size: Spatial merge factor for patch tokens.
+            temporal_patch_size: Temporal patch size for video inputs.
+            initializer_range: Standard deviation for weight initialization.
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.embed_dim = embed_dim
@@ -127,6 +143,33 @@ class Qwen2VLTextConfig(EasyMLXBaseConfig):
         layer_types: list[str] | None = None,
         **kwargs,
     ):
+        """Initialize the Qwen2-VL text decoder configuration.
+
+        Args:
+            vocab_size: Size of the token vocabulary.
+            hidden_size: Dimensionality of the text transformer hidden states.
+            intermediate_size: Dimensionality of the MLP intermediate layer.
+            num_hidden_layers: Number of transformer decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of key/value heads for GQA. Defaults
+                to ``num_attention_heads`` when ``None``.
+            hidden_act: Activation function name for MLP layers.
+            max_position_embeddings: Maximum sequence length.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: Epsilon for RMS normalization.
+            use_cache: Whether KV caching is enabled.
+            tie_word_embeddings: Whether input/output embeddings share weights.
+            rope_theta: Base frequency for rotary positional embeddings.
+            use_sliding_window: Whether sliding-window attention is enabled.
+            sliding_window: Size of the sliding attention window.
+            max_window_layers: Layer index threshold for sliding window.
+            attention_dropout: Dropout rate for attention weights.
+            rope_scaling: Optional RoPE scaling configuration dictionary.
+            rope_parameters: Alternative key for RoPE scaling parameters.
+            layer_types: Per-layer attention type strings. Auto-generated
+                from sliding window settings when ``None``.
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -206,6 +249,22 @@ class Qwen2VLModelConfig(EasyMLXBaseConfig):
         eos_token_id: list[int] | None = None,
         **kwargs,
     ):
+        """Initialize the fully-resolved Qwen2-VL runtime model configuration.
+
+        Args:
+            text_config: Text decoder configuration. Accepts a
+                ``Qwen2VLTextConfig`` instance or a dict of keyword arguments.
+            vision_config: Vision encoder configuration. Accepts a
+                ``Qwen2VLVisionConfig`` instance or a dict of keyword arguments.
+            vocab_size: Size of the token vocabulary.
+            image_token_id: Token ID for image placeholders.
+            video_token_id: Token ID for video placeholders.
+            vision_start_token_id: Token ID marking vision content start.
+            vision_end_token_id: Token ID marking vision content end.
+            pad_token_id: Padding token ID.
+            eos_token_id: End-of-sequence token ID(s).
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         if text_config is not None and isinstance(text_config, dict):
             text_config = Qwen2VLTextConfig(**text_config)

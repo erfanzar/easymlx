@@ -28,7 +28,6 @@ import time
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 
 from easymlx.workers.loggers import get_logger
 
@@ -39,8 +38,8 @@ from .sequence_buffer import SequenceBuffer
 
 logger = get_logger("eSurgeRunner")
 
-_MLX_NO_PRIMITIVE_MSG = "without a primitive"
 _CACHE_MAXSIZE = 64
+_MLX_NO_PRIMITIVE_MSG = "Attempting to eval an array without a primitive"
 
 
 class _CompiledPagedCacheProxy:
@@ -142,45 +141,25 @@ def _call_with_filtered_kwargs(callable_obj: Any, /, **kwargs: Any) -> Any:
     return callable_obj(**filtered)
 
 
-def _as_numpy_logits(output: Any) -> np.ndarray:
-    """Extract logits from a model output and convert to a 2-D NumPy array.
-
-    Handles raw ``mx.array`` outputs, dict-wrapped outputs, and NumPy
-    arrays.  3-D tensors are sliced to the last position along axis 1;
-    1-D tensors are expanded.
-
-    Args:
-        output: Raw model output (object with ``.logits``, dict, or
-            array).
-
-    Returns:
-        A ``float`` NumPy array of shape ``(batch_size, vocab_size)``.
-
-    Raises:
-        RuntimeError: If the resulting array has an unsupported number
-            of dimensions.
-    """
+def _as_mx_logits(output: Any) -> mx.array:
+    """Extract logits from a model output as a 2-D MLX array."""
     logits = getattr(output, "logits", output)
     if isinstance(logits, dict):
         logits = logits.get("logits", logits)
-    if isinstance(logits, mx.array) and logits.ndim == 3:
+    if not isinstance(logits, mx.array):
+        logits = mx.array(logits)
+    if logits.ndim == 3:
         logits = logits[:, -1, :]
-    if isinstance(logits, mx.array):
-        if logits.dtype == mx.bfloat16 or not mx.issubdtype(logits.dtype, mx.floating):
-            logits = logits.astype(mx.float32)
-        array = np.array(logits)
-    else:
-        array = np.asarray(logits)
-        if array.ndim == 3:
-            array = array[:, -1, :]
-    if array.ndim == 2:
-        return array
-    if array.ndim == 1:
-        return np.expand_dims(array, axis=0)
-    raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}")
+    if logits.ndim == 1:
+        logits = mx.expand_dims(logits, axis=0)
+    if logits.ndim != 2:
+        raise RuntimeError(f"Unsupported logits shape from runner: {logits.shape}")
+    if logits.dtype != mx.float32:
+        logits = logits.astype(mx.float32)
+    return logits
 
 
-def _argmax_token_ids(output: Any) -> np.ndarray:
+def _argmax_token_ids(output: Any) -> list[int]:
     """Return greedy token IDs from a raw model output.
 
     Extracts the final-step logits and performs argmax on-device when
@@ -191,126 +170,126 @@ def _argmax_token_ids(output: Any) -> np.ndarray:
             array).
 
     Returns:
-        A 1-D integer NumPy array of sampled token IDs.
+        A 1-D list of sampled token IDs.
 
     Raises:
         RuntimeError: If the resulting logits have an unsupported
             number of dimensions.
     """
-    logits = getattr(output, "logits", output)
-    if isinstance(logits, dict):
-        logits = logits.get("logits", logits)
-    if isinstance(logits, mx.array):
-        if logits.ndim == 3:
-            logits = logits[:, -1, :]
-        try:
-            token_ids = mx.argmax(logits, axis=-1)
-            mx.eval(token_ids)
-            array = np.asarray(token_ids, dtype=np.int64)
-        except RuntimeError as exc:
-            if _MLX_NO_PRIMITIVE_MSG not in str(exc):
-                raise
-            array = np.asarray(logits)
-            if array.ndim == 2:
-                array = np.argmax(array, axis=-1)
-            elif array.ndim == 1:
-                array = np.asarray([int(np.argmax(array))], dtype=np.int64)
-            else:
-                raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}") from exc
-    else:
-        array = np.asarray(logits)
-        if array.ndim == 3:
-            array = array[:, -1, :]
-        if array.ndim == 2:
-            array = np.argmax(array, axis=-1)
-        elif array.ndim == 1:
-            array = np.asarray([int(np.argmax(array))], dtype=np.int64)
-        else:
-            raise RuntimeError(f"Unsupported logits shape from runner: {array.shape}")
-    if array.ndim == 0:
-        return np.asarray([int(array)], dtype=np.int64)
-    if array.ndim == 1:
-        return array.astype(np.int64, copy=False)
-    raise RuntimeError(f"Unsupported token-id shape from runner: {array.shape}")
+    token_ids = mx.argmax(_as_mx_logits(output), axis=-1).astype(mx.int64)
+    _safe_eval(token_ids)
+    values = token_ids.tolist()
+    if isinstance(values, list):
+        return [int(token_id) for token_id in values]
+    return [int(values)]
 
 
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    """Compute a numerically stable softmax over the last axis.
-
-    Args:
-        logits: 1-D logit array.
-
-    Returns:
-        Probability array with the same shape.
-
-    Raises:
-        RuntimeError: If the resulting distribution is not finite.
-    """
-    shifted = logits - np.max(logits)
-    exp_logits = np.exp(shifted)
-    denom = np.sum(exp_logits)
-    if denom <= 0 or not np.isfinite(denom):
-        raise RuntimeError("Sampling distribution is not finite.")
-    return exp_logits / denom
+def _safe_eval(*arrays: mx.array) -> None:
+    """Evaluate arrays, ignoring MLX's no-primitive error for materialized values."""
+    filtered = [array for array in arrays if array is not None]
+    if not filtered:
+        return
+    try:
+        mx.eval(*filtered)
+    except RuntimeError as exc:
+        if _MLX_NO_PRIMITIVE_MSG not in str(exc):
+            raise
 
 
-def _sample_next_token(
-    logits: np.ndarray,
-    *,
-    sampling_params: SamplingParams | None,
-    rng: np.random.Generator,
-) -> int:
-    """Sample a single next token from logit scores.
-
-    Applies temperature scaling, top-k filtering, and nucleus (top-p)
-    filtering according to *sampling_params*.  When ``do_sample`` is
-    ``False`` (or *sampling_params* is ``None``), greedy argmax decoding
-    is used.
-
-    Args:
-        logits: 1-D logit array of shape ``(vocab_size,)``.
-        sampling_params: Sampling configuration.  ``None`` triggers
-            greedy decoding.
-        rng: NumPy random generator for stochastic sampling.
-
-    Returns:
-        The sampled token ID.
-
-    Raises:
-        ValueError: If ``temperature <= 0`` when ``do_sample=True``.
-    """
-    if sampling_params is None:
-        return int(np.argmax(logits))
-
-    do_sample = bool(sampling_params.do_sample)
-    temperature = float(sampling_params.temperature)
-    top_k = int(sampling_params.top_k)
-    top_p = float(sampling_params.top_p)
-
-    if not do_sample:
-        return int(np.argmax(logits))
+def _apply_temperature_mx(logits: mx.array, temperature: float) -> mx.array:
+    """Scale MLX logits by temperature for sampling."""
     if temperature <= 0:
         raise ValueError("temperature must be > 0 when do_sample=True")
+    if temperature == 1.0:
+        return logits
+    return logits / float(temperature)
 
-    logits = np.asarray(logits, dtype=np.float64) / temperature
 
-    if top_k > 0 and top_k < logits.shape[0]:
-        threshold = np.partition(logits, -top_k)[-top_k]
-        logits = np.where(logits < threshold, -np.inf, logits)
+def _restrict_top_k_mx(logits: mx.array, top_k: int) -> tuple[mx.array, mx.array | None]:
+    """Restrict MLX logits to a sorted top-k shortlist when requested."""
+    if top_k <= 0:
+        return logits, None
+    vocab = int(logits.shape[-1])
+    if top_k >= vocab:
+        return logits, None
 
-    if 0.0 < top_p < 1.0:
-        sorted_idx = np.argsort(logits)[::-1]
-        sorted_logits = logits[sorted_idx]
-        sorted_probs = _softmax(sorted_logits)
-        cumulative_probs = np.cumsum(sorted_probs)
-        keep = cumulative_probs <= top_p
-        keep[0] = True
-        filtered = np.full_like(logits, -np.inf)
-        filtered[sorted_idx[keep]] = logits[sorted_idx[keep]]
-        logits = filtered
+    top_indices = mx.argpartition(-logits, kth=top_k - 1, axis=-1)[..., :top_k].astype(mx.int32)
+    top_logits = mx.take_along_axis(logits, top_indices, axis=-1)
+    order = mx.argsort(top_logits, axis=-1)[:, ::-1]
+    top_logits = mx.take_along_axis(top_logits, order, axis=-1)
+    top_indices = mx.take_along_axis(top_indices, order, axis=-1).astype(mx.int32)
+    return top_logits, top_indices
 
-    probs = _softmax(logits)
-    return int(rng.choice(logits.shape[0], p=probs))
+
+def _apply_top_p_mx(logits: mx.array, top_p: float, *, assume_sorted: bool = False) -> mx.array:
+    """Apply nucleus filtering to MLX logits."""
+    if not (0.0 < top_p <= 1.0):
+        raise ValueError("top_p must be in (0, 1]")
+    if top_p == 1.0:
+        return logits
+
+    if assume_sorted:
+        sorted_logits = logits
+        sorted_idx = None
+    else:
+        sorted_idx = mx.argsort(logits, axis=-1)[:, ::-1]
+        sorted_logits = mx.take_along_axis(logits, sorted_idx, axis=-1)
+
+    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    cum_probs = mx.cumsum(sorted_probs, axis=-1)
+    keep_sorted = cum_probs <= float(top_p)
+    keep_sorted = mx.concatenate(
+        [
+            mx.ones((keep_sorted.shape[0], 1), dtype=mx.bool_),
+            keep_sorted[:, 1:],
+        ],
+        axis=-1,
+    )
+
+    very_neg = mx.finfo(sorted_logits.dtype).min
+    if assume_sorted:
+        return mx.where(keep_sorted, sorted_logits, very_neg)
+
+    keep = mx.put_along_axis(mx.zeros_like(keep_sorted), sorted_idx, keep_sorted, axis=-1)
+    return mx.where(keep, logits, very_neg)
+
+
+def _apply_repetition_penalty_row_mx(logits_row: mx.array, token_ids: list[int], repetition_penalty: float) -> mx.array:
+    """Apply the standard repetition penalty to one logit row."""
+    if repetition_penalty == 1.0 or not token_ids:
+        return logits_row
+    if repetition_penalty <= 0.0:
+        raise ValueError("repetition_penalty must be > 0")
+
+    unique_token_ids = sorted({int(token_id) for token_id in token_ids})
+    if not unique_token_ids:
+        return logits_row
+
+    row = mx.expand_dims(logits_row, axis=0)
+    token_idx = mx.array([unique_token_ids], dtype=mx.int32)
+    selected = mx.take_along_axis(row, token_idx, axis=-1)
+    penalized = mx.where(
+        selected < 0,
+        selected * float(repetition_penalty),
+        selected / float(repetition_penalty),
+    )
+    return mx.put_along_axis(row, token_idx, penalized, axis=-1)[0]
+
+
+def _apply_presence_penalty_row_mx(logits_row: mx.array, token_ids: list[int], presence_penalty: float) -> mx.array:
+    """Apply an additive presence penalty to one logit row."""
+    if presence_penalty == 0.0 or not token_ids:
+        return logits_row
+
+    unique_token_ids = sorted({int(token_id) for token_id in token_ids})
+    if not unique_token_ids:
+        return logits_row
+
+    row = mx.expand_dims(logits_row, axis=0)
+    token_idx = mx.array([unique_token_ids], dtype=mx.int32)
+    selected = mx.take_along_axis(row, token_idx, axis=-1)
+    penalized = selected - float(presence_penalty)
+    return mx.put_along_axis(row, token_idx, penalized, axis=-1)[0]
 
 
 class ModelRunner:
@@ -383,7 +362,7 @@ class ModelRunner:
         self.memory_utilization = float(memory_utilization)
         self.supports_async_overlap = bool(supports_async_overlap)
         self.use_compiled_forward = bool(use_compiled_forward)
-        self._rng = np.random.default_rng(seed)
+        self._sample_key = mx.random.key(seed)
         self._page_size = self._infer_page_size()
         self.log_it = logger.info if verbose else logger.debug
         self._model_signature = inspect.signature(self.model)
@@ -440,6 +419,8 @@ class ModelRunner:
         self._perf_tps_ema = 0.0
         self._compiled_cache: dict[tuple[int, int], Any] = {}
         self._compiled_forwards: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
+        self._compiled_samplers: dict[tuple[tuple[int, ...], bool, float, int, float], Any] = {}
+        self._compiled_batch_padders: dict[tuple[int, int], Any] = {}
         self._failed_compiled_forward_keys: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
 
         logger.debug("ModelRunner initialization complete")
@@ -479,6 +460,15 @@ class ModelRunner:
             return self._decode_step_fn(**kwargs)
         return self._decode_step_fn(
             **{name: value for name, value in kwargs.items() if name in self._decode_step_param_names}
+        )
+
+    def _can_use_decode_step(self, query_lens: list[int], *, has_extra: bool) -> bool:
+        """Return whether this runner can use the model's decode fast path."""
+        return bool(
+            callable(self._decode_step_fn)
+            and not has_extra
+            and query_lens
+            and all(int(query_len) == 1 for query_len in query_lens)
         )
 
     def _query_start_loc_for(self, query_lens: tuple[int, ...]) -> Any:
@@ -607,7 +597,7 @@ class ModelRunner:
                 if compiled_entry is not None:
                     self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
                     logits = compiled_entry["fn"](dummy_ids)
-                    mx.eval(logits)
+                    _safe_eval(logits)
                     self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
                 else:
                     out = self._call_model(
@@ -617,7 +607,7 @@ class ModelRunner:
                         return_dict=True,
                     )
                     logits = getattr(out, "logits", out)
-                mx.eval(logits)
+                _safe_eval(logits)
                 self._compiled_cache[key] = True
             except Exception as exc:
                 compile_key = (
@@ -852,7 +842,17 @@ class ModelRunner:
                 block_tables[row_index, :] = -1
             if kv_lens is not None and row_index < kv_lens.shape[0]:
                 kv_lens[row_index] = 0
-        mx.eval(*[c.block_tables for c in self.kv_caches if hasattr(c, "block_tables")])
+        _safe_eval(*[c.block_tables for c in self.kv_caches if hasattr(c, "block_tables")])
+
+    @staticmethod
+    def _page_ids_array(page_ids: list[int]) -> mx.array:
+        """Convert page ids into an MLX int32 vector."""
+        return mx.array(page_ids, dtype=mx.int32)
+
+    @staticmethod
+    def _copy_cache_row(table: mx.array, row_index: int) -> mx.array:
+        """Return a detached MLX copy of one cache-table row."""
+        return mx.take(table, mx.array([int(row_index)], dtype=mx.int32), axis=0)[0]
 
     def _zero_pages(self, page_ids: list["int"]) -> None:
         """Zero out the key and value caches for the given page IDs.
@@ -886,11 +886,7 @@ class ModelRunner:
                 page_value_cache[filtered] = 0
             touched_caches.append(key_cache)
         if touched_caches:
-            try:
-                mx.eval(*touched_caches)
-            except RuntimeError as exc:
-                if _MLX_NO_PRIMITIVE_MSG not in str(exc):
-                    raise
+            _safe_eval(*touched_caches)
 
     def _assign_row_mapping(
         self,
@@ -928,7 +924,7 @@ class ModelRunner:
             block_tables[row_index, :] = -1
             count = min(len(page_ids), block_tables.shape[1])
             if count:
-                block_tables[row_index, :count] = np.asarray(page_ids[:count], dtype=np.int32)
+                block_tables[row_index, :count] = self._page_ids_array(page_ids[:count])
             kv_lens[row_index] = max(int(cached_tokens), 0)
 
     def bind_request(self, request: EngineRequest, row_index: int) -> None:
@@ -1004,9 +1000,9 @@ class ModelRunner:
             kv_lens = getattr(cache, "kv_lens", None)
             if block_tables is None or kv_lens is None:
                 continue
-            from_table = np.array(block_tables[from_index], copy=True)
+            from_table = self._copy_cache_row(block_tables, from_index)
             from_kv_len = int(kv_lens[from_index])
-            to_table = np.array(block_tables[to_index], copy=True)
+            to_table = self._copy_cache_row(block_tables, to_index)
             to_kv_len = int(kv_lens[to_index])
             block_tables[to_index] = from_table
             kv_lens[to_index] = from_kv_len
@@ -1034,7 +1030,7 @@ class ModelRunner:
                 kv_lens = getattr(cache, "kv_lens", None)
                 if block_tables is None or kv_lens is None:
                     continue
-                block_tables[to_index] = np.array(block_tables[from_index], copy=True)
+                block_tables[to_index] = self._copy_cache_row(block_tables, from_index)
                 kv_lens[to_index] = int(kv_lens[from_index])
                 block_tables[from_index, :] = -1
                 kv_lens[from_index] = 0
@@ -1042,8 +1038,35 @@ class ModelRunner:
         return moves
 
     @staticmethod
-    def _pad_batch_token_ids(sequences: list[ScheduledSequence]) -> tuple[np.ndarray, list["int"]]:
-        """Pad variable-length token ID sequences into a 2-D array.
+    def _flatten_sequence_tokens(sequences: list[ScheduledSequence]) -> tuple[mx.array, list[int]]:
+        """Flatten token IDs for a scheduled batch into one MLX vector."""
+        query_lens = [len(sequence.token_ids) for sequence in sequences]
+        flat_token_ids = [int(token_id) for sequence in sequences for token_id in sequence.token_ids]
+        return mx.array(flat_token_ids, dtype=mx.int32), query_lens
+
+    def _get_compiled_batch_padder(self, batch_size: int, max_query_len: int) -> Any:
+        """Return an ``mx.compile``'d helper that pads flattened token IDs."""
+        key = (int(batch_size), int(max_query_len))
+        cached = self._compiled_batch_padders.get(key)
+        if cached is not None:
+            return cached
+
+        def compiled_padder(flat_token_ids: mx.array, query_lens: mx.array) -> mx.array:
+            positions = mx.arange(max_query_len, dtype=mx.int32)[None, :]
+            query_lens = query_lens.astype(mx.int32)
+            row_offsets = mx.cumsum(query_lens, axis=0).astype(mx.int32) - query_lens
+            mask = positions < query_lens[:, None]
+            safe_size = max(int(flat_token_ids.shape[0]), 1)
+            safe_indices = mx.minimum(row_offsets[:, None] + positions, safe_size - 1)
+            gathered = mx.take(flat_token_ids, safe_indices.reshape((-1,)), axis=0).reshape((batch_size, max_query_len))
+            return mx.where(mask, gathered, mx.zeros((batch_size, max_query_len), dtype=mx.int32))
+
+        cached = mx.compile(compiled_padder)
+        self._compiled_batch_padders[key] = cached
+        return cached
+
+    def _pad_batch_token_ids(self, sequences: list[ScheduledSequence]) -> tuple[mx.array, list["int"]]:
+        """Pad variable-length token ID sequences into a rank-2 MLX array.
 
         Args:
             sequences: Scheduled sequences for this step.
@@ -1053,13 +1076,13 @@ class ModelRunner:
             has shape ``(num_seqs, max_query_len)`` and *query_lens*
             lists per-sequence lengths.
         """
-        query_lens = [len(sequence.token_ids) for sequence in sequences]
+        flat_token_ids, query_lens = self._flatten_sequence_tokens(sequences)
         max_query_len = max(query_lens, default=0)
-        batch = np.zeros((len(sequences), max_query_len), dtype=np.int32)
-        for row_index, sequence in enumerate(sequences):
-            if query_lens[row_index] == 0:
-                continue
-            batch[row_index, : query_lens[row_index]] = np.asarray(sequence.token_ids, dtype=np.int32)
+        if not sequences or max_query_len == 0:
+            return mx.zeros((len(sequences), max_query_len), dtype=mx.int32), query_lens
+        compiled_padder = self._get_compiled_batch_padder(len(sequences), max_query_len)
+        query_lens_array = mx.array(query_lens, dtype=mx.int32)
+        batch = compiled_padder(flat_token_ids, query_lens_array)
         return batch, query_lens
 
     @staticmethod
@@ -1097,9 +1120,11 @@ class ModelRunner:
                 query_lens,
                 bool(self.kv_caches),
             )
+            use_decode_step = False
 
             if self.kv_caches:
-                batch_token_ids = mx.array(np.asarray(sequence.token_ids, dtype=np.int32))
+                batch_token_ids = mx.array(sequence.token_ids, dtype=mx.int32)
+                use_decode_step = self._can_use_decode_step(query_lens, has_extra=has_extra)
 
                 if not has_extra:
                     compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
@@ -1108,7 +1133,7 @@ class ModelRunner:
                             self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
                             compiled_fn = compiled_entry["fn"]
                             logits = compiled_fn(batch_token_ids)
-                            mx.eval(logits)
+                            _safe_eval(logits)
                             self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
                             raw_output = {"logits": logits}
                             return raw_output
@@ -1127,22 +1152,29 @@ class ModelRunner:
                     tuple(int(slot_id) for slot_id in slot_ids),
                 )
             else:
-                batch_token_ids = mx.array(np.asarray(sequence.token_ids, dtype=np.int32)[None, :])
+                batch_token_ids = mx.array([sequence.token_ids], dtype=mx.int32)
                 cache_views = None
                 cache_metadata = None
 
-            raw_output = self._call_model(
-                input_ids=batch_token_ids,
-                cache_views=cache_views,
-                cache_metadata=cache_metadata,
-                query_lens=query_lens,
-                positions=positions,
-                slot_ids=slot_ids,
-                return_dict=True,
-                multimodal_inputs=multimodal,
-                multimodal=multimodal,
-                **extra,
-            )
+            if use_decode_step:
+                raw_output = self._call_decode_step(
+                    input_ids=batch_token_ids,
+                    cache_views=cache_views,
+                    cache_metadata=cache_metadata,
+                )
+            else:
+                raw_output = self._call_model(
+                    input_ids=batch_token_ids,
+                    cache_views=cache_views,
+                    cache_metadata=cache_metadata,
+                    query_lens=query_lens,
+                    positions=positions,
+                    slot_ids=slot_ids,
+                    return_dict=True,
+                    multimodal_inputs=multimodal,
+                    multimodal=multimodal,
+                    **extra,
+                )
             return raw_output
 
         batch_token_ids, query_lens = self._pad_batch_token_ids(request.sequences)
@@ -1159,11 +1191,11 @@ class ModelRunner:
         extra.pop("kv_caches", None)
 
         has_extra = multimodal is not None or extra
+        use_decode_step = False
 
         if self.kv_caches:
-            batch_token_ids = mx.array(
-                np.concatenate([np.asarray(seq.token_ids, dtype=np.int32) for seq in request.sequences])
-            )
+            batch_token_ids, query_lens = self._flatten_sequence_tokens(request.sequences)
+            use_decode_step = self._can_use_decode_step(query_lens, has_extra=has_extra)
 
             if not has_extra:
                 compiled_entry = self._get_compiled_forward(slot_ids, query_lens)
@@ -1172,10 +1204,10 @@ class ModelRunner:
                         self._refresh_compiled_cache_state(compiled_entry, self.kv_caches)
                         compiled_fn = compiled_entry["fn"]
                         logits = compiled_fn(batch_token_ids)
-                        mx.eval(logits)
+                        _safe_eval(logits)
                         self._sync_compiled_cache_state(compiled_entry, self.kv_caches)
                         raw_output = {"logits": logits}
-                        return raw_output, _as_numpy_logits(raw_output)
+                        return raw_output
                     except (RuntimeError, ValueError):
                         key = (
                             tuple(int(slot_id) for slot_id in slot_ids),
@@ -1192,26 +1224,31 @@ class ModelRunner:
             )
         else:
             batch_token_ids, query_lens = self._pad_batch_token_ids(request.sequences)
-            if not isinstance(batch_token_ids, mx.array):
-                batch_token_ids = mx.array(batch_token_ids)
             cache_views = None
             cache_metadata = None
 
-        raw_output = self._call_model(
-            input_ids=batch_token_ids,
-            cache_views=cache_views,
-            cache_metadata=cache_metadata,
-            query_lens=query_lens,
-            positions=positions,
-            slot_ids=slot_ids,
-            return_dict=True,
-            multimodal_inputs=multimodal,
-            multimodal=multimodal,
-            **extra,
-        )
+        if use_decode_step:
+            raw_output = self._call_decode_step(
+                input_ids=batch_token_ids,
+                cache_views=cache_views,
+                cache_metadata=cache_metadata,
+            )
+        else:
+            raw_output = self._call_model(
+                input_ids=batch_token_ids,
+                cache_views=cache_views,
+                cache_metadata=cache_metadata,
+                query_lens=query_lens,
+                positions=positions,
+                slot_ids=slot_ids,
+                return_dict=True,
+                multimodal_inputs=multimodal,
+                multimodal=multimodal,
+                **extra,
+            )
         return raw_output
 
-    def _forward_step(self, request: ExecutionRequest) -> tuple[Any, np.ndarray]:
+    def _forward_step(self, request: ExecutionRequest) -> tuple[Any, mx.array]:
         """Execute a single model forward pass for the given execution request.
 
         Constructs the input tensors, cache views, and metadata, then
@@ -1222,10 +1259,10 @@ class ModelRunner:
 
         Returns:
             A ``(raw_output, logits)`` tuple where *logits* is a 2-D
-            NumPy array of shape ``(batch_size, vocab_size)``.
+            MLX array of shape ``(batch_size, vocab_size)``.
         """
         raw_output = self._forward_step_raw(request)
-        return raw_output, _as_numpy_logits(raw_output)
+        return raw_output, _as_mx_logits(raw_output)
 
     def _apply_updates_to_sequence_buffer(self, updates: list[ExecutionUpdate]) -> None:
         """Propagate execution updates into the sequence buffer.
@@ -1240,26 +1277,205 @@ class ModelRunner:
             if update.num_computed_tokens is not None:
                 self.sequence_buffer.set_num_computed_tokens(update.request_id, update.num_computed_tokens)
 
-    def sample_next_token(self, logits: np.ndarray, *, sampling_params: SamplingParams | None) -> int:
+    def _sampling_histories_for_sequences(
+        self,
+        sequences: list[ScheduledSequence],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Return full-token and generated-token histories for scheduled rows."""
+        token_histories: list[list[int]] = []
+        generated_token_histories: list[list[int]] = []
+        for sequence in sequences:
+            if self.sequence_buffer.has_request(sequence.request_id):
+                row = self.sequence_buffer.get_row(sequence.request_id)
+                token_histories.append(row.all_token_ids)
+                generated_token_histories.append(list(row.output_token_ids))
+            else:
+                token_histories.append(list(sequence.token_ids))
+                generated_token_histories.append([])
+        return token_histories, generated_token_histories
+
+    def _apply_penalties_mx(
+        self,
+        logits: mx.array,
+        sampling_params_by_row: list[SamplingParams | None],
+        *,
+        token_histories: list[list[int]] | None = None,
+        generated_token_histories: list[list[int]] | None = None,
+    ) -> mx.array:
+        """Apply presence/repetition penalties before sampling."""
+        if token_histories is None:
+            token_histories = [[] for _ in sampling_params_by_row]
+        if generated_token_histories is None:
+            generated_token_histories = [[] for _ in sampling_params_by_row]
+        if len(token_histories) != len(sampling_params_by_row):
+            raise ValueError("token histories count must match sampling params count")
+        if len(generated_token_histories) != len(sampling_params_by_row):
+            raise ValueError("generated token histories count must match sampling params count")
+
+        any_penalty = False
+        adjusted_rows: list[mx.array] = []
+        for row_index, params in enumerate(sampling_params_by_row):
+            row_logits = logits[row_index]
+            if params is None:
+                adjusted_rows.append(row_logits)
+                continue
+
+            repetition_penalty = float(getattr(params, "repetition_penalty", 1.0) or 1.0)
+            presence_penalty = float(getattr(params, "presence_penalty", 0.0) or 0.0)
+
+            if repetition_penalty != 1.0:
+                row_logits = _apply_repetition_penalty_row_mx(
+                    row_logits,
+                    token_histories[row_index],
+                    repetition_penalty,
+                )
+                any_penalty = True
+            if presence_penalty != 0.0:
+                row_logits = _apply_presence_penalty_row_mx(
+                    row_logits,
+                    generated_token_histories[row_index],
+                    presence_penalty,
+                )
+                any_penalty = True
+
+            adjusted_rows.append(row_logits)
+
+        if not any_penalty:
+            return logits
+        return mx.stack(adjusted_rows, axis=0)
+
+    def sample_next_token(
+        self,
+        logits: Any,
+        *,
+        sampling_params: SamplingParams | None,
+        prompt_token_ids: list[int] | None = None,
+        generated_token_ids: list[int] | None = None,
+    ) -> int:
         """Sample a single token using the runner's RNG state.
 
         Args:
             logits: Logit scores for one sequence.
             sampling_params: Sampling configuration for the sequence.
+            prompt_token_ids: Prompt-history token IDs for repetition penalty.
+            generated_token_ids: Generated-history token IDs for penalties.
 
         Returns:
             The sampled token ID.
         """
-        return _sample_next_token(
+        return self._sample_next_tokens_mx(
             logits,
-            sampling_params=sampling_params,
-            rng=self._rng,
+            [sampling_params],
+            token_histories=[list(prompt_token_ids or []) + list(generated_token_ids or [])],
+            generated_token_histories=[list(generated_token_ids or [])],
+        )[0]
+
+    def _next_sample_key(self) -> mx.array:
+        """Split and advance the runner-local MLX RNG key."""
+        keys = mx.random.split(self._sample_key, num=2)
+        self._sample_key = keys[0]
+        return keys[1]
+
+    def _get_compiled_sampler(
+        self,
+        logits_shape: tuple[int, ...],
+        *,
+        do_sample: bool,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> Any:
+        """Return a cached ``mx.compile`` sampler for one shape/parameter tuple."""
+        key = (tuple(int(dim) for dim in logits_shape), do_sample, float(temperature), int(top_k), float(top_p))
+        cached = self._compiled_samplers.get(key)
+        if cached is not None:
+            return cached
+
+        def compiled_sampler(logits: mx.array, rng_key: mx.array) -> mx.array:
+            working_logits = logits.astype(mx.float32)
+            if not do_sample:
+                return mx.argmax(working_logits, axis=-1).astype(mx.int32)
+
+            working_logits = _apply_temperature_mx(working_logits, temperature)
+            shortlist_logits, shortlist_indices = _restrict_top_k_mx(working_logits, top_k)
+            shortlist_logits = _apply_top_p_mx(
+                shortlist_logits,
+                top_p,
+                assume_sorted=shortlist_indices is not None,
+            )
+            sampled_positions = mx.random.categorical(
+                shortlist_logits,
+                axis=-1,
+                key=rng_key,
+            ).astype(mx.int32)
+            if shortlist_indices is None:
+                return sampled_positions
+            return mx.take_along_axis(
+                shortlist_indices,
+                sampled_positions[:, None],
+                axis=-1,
+            )[:, 0].astype(mx.int32)
+
+        cached = mx.compile(compiled_sampler)
+        self._compiled_samplers[key] = cached
+        return cached
+
+    def _sample_next_tokens_mx(
+        self,
+        logits: Any,
+        sampling_params_by_row: list[SamplingParams | None],
+        *,
+        token_histories: list[list[int]] | None = None,
+        generated_token_histories: list[list[int]] | None = None,
+    ) -> list[int]:
+        """Sample one token per row from MLX logits without host logits copies."""
+        logits = _as_mx_logits(logits)
+        if int(logits.shape[0]) != len(sampling_params_by_row):
+            raise ValueError("sampling params count must match logits batch size")
+        logits = self._apply_penalties_mx(
+            logits,
+            sampling_params_by_row,
+            token_histories=token_histories,
+            generated_token_histories=generated_token_histories,
         )
+
+        grouped_rows: dict[tuple[bool, float, int, float], list[int]] = {}
+        for row_index, params in enumerate(sampling_params_by_row):
+            if params is None:
+                key = (False, 1.0, 0, 1.0)
+            else:
+                do_sample = bool(params.do_sample)
+                key = (
+                    do_sample,
+                    float(params.temperature) if do_sample else 1.0,
+                    int(params.top_k) if do_sample else 0,
+                    float(params.top_p) if do_sample else 1.0,
+                )
+            grouped_rows.setdefault(key, []).append(row_index)
+
+        sampled_token_ids = [0] * len(sampling_params_by_row)
+        for (do_sample, temperature, top_k, top_p), row_indices in grouped_rows.items():
+            row_selector = mx.array(row_indices, dtype=mx.int32)
+            group_logits = mx.take(logits, row_selector, axis=0)
+            compiled_sampler = self._get_compiled_sampler(
+                tuple(int(dim) for dim in group_logits.shape),
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+            rng_key = self._next_sample_key() if do_sample else self._sample_key
+            group_tokens = compiled_sampler(group_logits, rng_key)
+            _safe_eval(group_tokens)
+
+            for row_index, token_id in zip(row_indices, group_tokens.tolist(), strict=False):
+                sampled_token_ids[row_index] = int(token_id)
+        return sampled_token_ids
 
     def sample_greedy_token_from_output(self, output: Any) -> int:
         """Greedily sample the next token from a raw model output."""
         token_ids = _argmax_token_ids(output)
-        if token_ids.size == 0:
+        if not token_ids:
             raise RuntimeError("Runner produced no greedy token IDs.")
         return int(token_ids[0])
 
@@ -1291,19 +1507,26 @@ class ModelRunner:
             )
 
         t_fwd = time.perf_counter()
-        raw_output, logits = self._forward_step(request)
+        raw_output = self._forward_step_raw(request)
         t_fwd_done = time.perf_counter()
-        if logits.shape[0] < len(request.sequences):
+
+        logits = _as_mx_logits(raw_output)
+        if int(logits.shape[0]) < len(request.sequences):
             raise RuntimeError(
                 f"Runner produced {logits.shape[0]} logits rows for {len(request.sequences)} scheduled sequences"
             )
+        sampling_params_by_row = [request.sampling_for(sequence.request_id) for sequence in request.sequences]
+        token_histories, generated_token_histories = self._sampling_histories_for_sequences(request.sequences)
+        sampled_tokens = self._sample_next_tokens_mx(
+            logits,
+            sampling_params_by_row,
+            token_histories=token_histories,
+            generated_token_histories=generated_token_histories,
+        )
 
         updates: list[ExecutionUpdate] = []
-        for index, sequence in enumerate(request.sequences):
+        for sequence, sampled_token in zip(request.sequences, sampled_tokens, strict=False):
             num_computed_tokens = int(sequence.num_computed_tokens) + len(sequence.token_ids)
-            sequence_logits = np.asarray(logits[index], dtype=np.float64)
-            sampling_params = request.sampling_for(sequence.request_id)
-            sampled_token = self.sample_next_token(sequence_logits, sampling_params=sampling_params)
             updates.append(
                 ExecutionUpdate(
                     request_id=sequence.request_id,

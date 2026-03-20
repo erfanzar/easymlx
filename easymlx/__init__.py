@@ -141,6 +141,11 @@ _import_structure = {
         "GptOssForCausalLM",
         "GptOssModel",
     ],
+    "modules.helium": [
+        "HeliumConfig",
+        "HeliumForCausalLM",
+        "HeliumModel",
+    ],
     "modules.llama": [
         "LlamaConfig",
         "LlamaForCausalLM",
@@ -152,6 +157,26 @@ _import_structure = {
         "Llama4Model",
         "Llama4VisionConfig",
         "Llama4TextConfig",
+    ],
+    "modules.llama4_text": [
+        "Llama4TextConfig",
+        "Llama4TextForCausalLM",
+        "Llama4TextModel",
+    ],
+    "modules.ministral3": [
+        "Ministral3Config",
+        "Ministral3ForCausalLM",
+        "Ministral3Model",
+    ],
+    "modules.mistral3": [
+        "Mistral3Config",
+        "Mistral3ForCausalLM",
+        "Mistral3Model",
+    ],
+    "modules.pixtral": [
+        "PixtralConfig",
+        "PixtralForCausalLM",
+        "PixtralModel",
     ],
     "modules.qwen": [
         "QwenConfig",
@@ -223,6 +248,105 @@ _import_structure = {
         "Qwen3_5MoeTextConfig",
         "Qwen3_5MoeVisionConfig",
     ],
+    "modules.afm7": ["Afm7Config", "Afm7ForCausalLM", "Afm7Model"],
+    "modules.afmoe": ["AfmoeConfig", "AfmoeForCausalLM", "AfmoeModel"],
+    "modules.apertus": ["ApertusConfig", "ApertusForCausalLM", "ApertusModel"],
+    "modules.baichuan_m1": ["BaichuanM1Config", "BaichuanM1ForCausalLM", "BaichuanM1Model"],
+    "modules.bailing_moe": ["BailingMoeConfig", "BailingMoeForCausalLM", "BailingMoeModel"],
+    "modules.bailing_moe_linear": ["BailingMoeLinearConfig", "BailingMoeLinearForCausalLM", "BailingMoeLinearModel"],
+    "modules.bitnet": ["BitNetConfig", "BitNetForCausalLM", "BitNetModel"],
+    "modules.cohere": ["CohereConfig", "CohereForCausalLM", "CohereModel"],
+    "modules.cohere2": ["Cohere2Config", "Cohere2ForCausalLM", "Cohere2Model"],
+    "modules.dbrx": ["DBRXConfig", "DBRXForCausalLM", "DBRXModel"],
+    "modules.deepseek": ["DeepseekConfig", "DeepseekForCausalLM", "DeepseekModel"],
+    "modules.deepseek_v2": ["DeepseekV2Config", "DeepseekV2ForCausalLM", "DeepseekV2Model"],
+    "modules.deepseek_v3": ["DeepseekV3Config", "DeepseekV3ForCausalLM", "DeepseekV3Model"],
+    "modules.deepseek_v32": ["DeepseekV32Config", "DeepseekV32ForCausalLM", "DeepseekV32Model"],
+    "modules.dots1": ["Dots1Config", "Dots1ForCausalLM", "Dots1Model"],
+    "modules.ernie4_5": ["Ernie45Config", "Ernie45ForCausalLM", "Ernie45Model"],
+    "modules.ernie4_5_moe": ["Ernie45MoeConfig", "Ernie45MoeForCausalLM", "Ernie45MoeModel"],
+    "modules.exaone": ["ExaoneConfig", "ExaoneForCausalLM", "ExaoneModel"],
+    "modules.exaone4": ["Exaone4Config", "Exaone4ForCausalLM", "Exaone4Model"],
+    "modules.exaone_moe": ["ExaoneMoeConfig", "ExaoneMoeForCausalLM", "ExaoneMoeModel"],
+    "modules.falcon_h1": ["FalconH1Config", "FalconH1ForCausalLM", "FalconH1Model"],
+    "modules.gemma": ["GemmaConfig", "GemmaForCausalLM", "GemmaModel"],
+    "modules.gemma2": ["Gemma2Config", "Gemma2ForCausalLM", "Gemma2Model"],
+    "modules.gemma3": ["Gemma3Config", "Gemma3ForCausalLM", "Gemma3Model"],
+    "modules.gemma3_text": ["Gemma3TextConfig", "Gemma3TextForCausalLM", "Gemma3TextModel"],
+    "modules.gemma3n": ["Gemma3NConfig", "Gemma3NForCausalLM", "Gemma3NModel"],
+    "modules.gpt2": ["GPT2Config", "GPT2ForCausalLM", "GPT2Model"],
+    "modules.gpt_bigcode": ["GPTBigCodeConfig", "GPTBigCodeForCausalLM", "GPTBigCodeModel"],
+    "modules.gpt_neox": ["GPTNeoXConfig", "GPTNeoXForCausalLM", "GPTNeoXModel"],
+    "modules.granite": ["GraniteConfig", "GraniteForCausalLM", "GraniteModel"],
+    "modules.granitemoe": ["GraniteMoeConfig", "GraniteMoeForCausalLM", "GraniteMoeModel"],
+    "modules.granitemoehybrid": ["GraniteMoeHybridConfig", "GraniteMoeHybridForCausalLM", "GraniteMoeHybridModel"],
+    "modules.hunyuan": ["HunyuanConfig", "HunyuanForCausalLM", "HunyuanModel"],
+    "modules.hunyuan_v1_dense": ["HunyuanV1DenseConfig", "HunyuanV1DenseForCausalLM", "HunyuanV1DenseModel"],
+    "modules.internlm2": ["InternLM2Config", "InternLM2ForCausalLM", "InternLM2Model"],
+    "modules.internlm3": ["InternLM3Config", "InternLM3ForCausalLM", "InternLM3Model"],
+    "modules.iquestloopcoder": ["IQuestLoopCoderConfig", "IQuestLoopCoderForCausalLM", "IQuestLoopCoderModel"],
+    "modules.jamba": ["JambaConfig", "JambaForCausalLM", "JambaModel"],
+    "modules.kimi_k25": ["KimiK25Config", "KimiK25ForCausalLM", "KimiK25Model"],
+    "modules.kimi_linear": ["KimiLinearConfig", "KimiLinearForCausalLM", "KimiLinearModel"],
+    "modules.kimi_vl": ["KimiVLConfig", "KimiVLForCausalLM", "KimiVLModel"],
+    "modules.klear": ["KlearConfig", "KlearForCausalLM", "KlearModel"],
+    "modules.lfm2": ["Lfm2Config", "Lfm2ForCausalLM", "Lfm2Model"],
+    "modules.lfm2_moe": ["Lfm2MoeConfig", "Lfm2MoeForCausalLM", "Lfm2MoeModel"],
+    "modules.lfm2_vl": ["Lfm2VlConfig", "Lfm2VlForCausalLM", "Lfm2VlModel"],
+    "modules.lille_130m": ["Lille130mConfig", "Lille130mForCausalLM", "Lille130mModel"],
+    "modules.longcat_flash": ["LongcatFlashConfig", "LongcatFlashForCausalLM", "LongcatFlashModel"],
+    "modules.longcat_flash_ngram": ["LongcatFlashNgramConfig", "LongcatFlashNgramForCausalLM", "LongcatFlashNgramModel"],
+    "modules.mamba": ["MambaConfig", "MambaForCausalLM", "MambaModel"],
+    "modules.mamba2": ["Mamba2Config", "Mamba2ForCausalLM", "Mamba2Model"],
+    "modules.minicpm": ["MiniCPMConfig", "MiniCPMForCausalLM", "MiniCPMModel"],
+    "modules.minicpm3": ["MiniCPM3Config", "MiniCPM3ForCausalLM", "MiniCPM3Model"],
+    "modules.mimo": ["MiMoConfig", "MiMoForCausalLM", "MiMoModel"],
+    "modules.mimo_v2_flash": ["MiMoV2FlashConfig", "MiMoV2FlashForCausalLM", "MiMoV2FlashModel"],
+    "modules.minimax": ["MiniMaxConfig", "MiniMaxForCausalLM", "MiniMaxModel"],
+    "modules.mixtral": ["MixtralConfig", "MixtralForCausalLM", "MixtralModel"],
+    "modules.nanochat": ["NanochatConfig", "NanochatForCausalLM", "NanochatModel"],
+    "modules.nemotron": ["NemotronConfig", "NemotronForCausalLM", "NemotronModel"],
+    "modules.nemotron_h": ["NemotronHConfig", "NemotronHForCausalLM", "NemotronHModel"],
+    "modules.nemotron_nas": ["NemotronNASConfig", "NemotronNASForCausalLM", "NemotronNASModel"],
+    "modules.olmo": ["OlmoConfig", "OlmoForCausalLM", "OlmoModel"],
+    "modules.olmo2": ["Olmo2Config", "Olmo2ForCausalLM", "Olmo2Model"],
+    "modules.olmo3": ["OLMo3Config", "OLMo3ForCausalLM", "OLMo3Model"],
+    "modules.olmoe": ["OlmoeConfig", "OlmoeForCausalLM", "OlmoeModel"],
+    "modules.openelm": ["OpenELMConfig", "OpenELMForCausalLM", "OpenELMModel"],
+    "modules.phi": ["PhiConfig", "PhiForCausalLM", "PhiModel"],
+    "modules.phi3": ["Phi3Config", "Phi3ForCausalLM", "Phi3Model"],
+    "modules.phi3small": ["Phi3SmallConfig", "Phi3SmallForCausalLM", "Phi3SmallModel"],
+    "modules.phimoe": ["PhimoeConfig", "PhimoeForCausalLM", "PhimoeModel"],
+    "modules.phixtral": ["PhixtralConfig", "PhixtralForCausalLM", "PhixtralModel"],
+    "modules.plamo": ["PlamoConfig", "PlamoForCausalLM", "PlamoModel"],
+    "modules.plamo2": ["Plamo2Config", "Plamo2ForCausalLM", "Plamo2Model"],
+    "modules.recurrent_gemma": ["RecurrentGemmaConfig", "RecurrentGemmaForCausalLM", "RecurrentGemmaModel"],
+    "modules.rwkv7": ["Rwkv7Config", "Rwkv7ForCausalLM", "Rwkv7Model"],
+    "modules.seed_oss": ["SeedOssConfig", "SeedOssForCausalLM", "SeedOssModel"],
+    "modules.solar_open": [
+        "SolarOpenConfig",
+        "SolarOpenForCausalLM",
+        "SolarOpenModel",
+    ],
+    "modules.smollm3": [
+        "SmolLM3Config",
+        "SmolLM3ForCausalLM",
+        "SmolLM3Model",
+        "SmolLM3NoPE",
+        "Smollm3Config",
+        "Smollm3ForCausalLM",
+        "Smollm3Model",
+        "Smollm3NoPE",
+    ],
+    "modules.stablelm": ["StableLMConfig", "StableLMForCausalLM", "StableLMModel"],
+    "modules.starcoder2": ["Starcoder2Config", "Starcoder2ForCausalLM", "Starcoder2Model"],
+    "modules.step3p5": ["Step3p5Config", "Step3p5ForCausalLM", "Step3p5Model"],
+    "modules.telechat3": [
+        "Telechat3Config",
+        "Telechat3ForCausalLM",
+        "Telechat3Model",
+    ],
+    "modules.youtu_llm": ["YouTuLLMConfig", "YouTuLLMForCausalLM", "YouTuLLMModel"],
     "operations.kernels.gated_delta_rule": [
         "GatedDeltaRuleOp",
         "GatedDeltaRuleOutput",
@@ -248,6 +372,9 @@ if _tp.TYPE_CHECKING:
         VLMCausalLMOutput,
     )
     from .layers.attention import AttentionMechanisms, AttentionPerformer, FlexibleAttentionModule
+    from .modules.afm7 import Afm7Config, Afm7ForCausalLM, Afm7Model
+    from .modules.afmoe import AfmoeConfig, AfmoeForCausalLM, AfmoeModel
+    from .modules.apertus import ApertusConfig, ApertusForCausalLM, ApertusModel
     from .modules.auto import (
         AutoEasyMLXConfig,
         AutoEasyMLXModel,
@@ -260,6 +387,29 @@ if _tp.TYPE_CHECKING:
         AutoEasyMLXModelForTokenClassification,
         get_modules_by_type,
     )
+    from .modules.baichuan_m1 import BaichuanM1Config, BaichuanM1ForCausalLM, BaichuanM1Model
+    from .modules.bailing_moe import BailingMoeConfig, BailingMoeForCausalLM, BailingMoeModel
+    from .modules.bailing_moe_linear import BailingMoeLinearConfig, BailingMoeLinearForCausalLM, BailingMoeLinearModel
+    from .modules.bitnet import BitNetConfig, BitNetForCausalLM, BitNetModel
+    from .modules.cohere import CohereConfig, CohereForCausalLM, CohereModel
+    from .modules.cohere2 import Cohere2Config, Cohere2ForCausalLM, Cohere2Model
+    from .modules.dbrx import DBRXConfig, DBRXForCausalLM, DBRXModel
+    from .modules.deepseek import DeepseekConfig, DeepseekForCausalLM, DeepseekModel
+    from .modules.deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV2Model
+    from .modules.deepseek_v3 import DeepseekV3Config, DeepseekV3ForCausalLM, DeepseekV3Model
+    from .modules.deepseek_v32 import DeepseekV32Config, DeepseekV32ForCausalLM, DeepseekV32Model
+    from .modules.dots1 import Dots1Config, Dots1ForCausalLM, Dots1Model
+    from .modules.ernie4_5 import Ernie45Config, Ernie45ForCausalLM, Ernie45Model
+    from .modules.ernie4_5_moe import Ernie45MoeConfig, Ernie45MoeForCausalLM, Ernie45MoeModel
+    from .modules.exaone import ExaoneConfig, ExaoneForCausalLM, ExaoneModel
+    from .modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4Model
+    from .modules.exaone_moe import ExaoneMoeConfig, ExaoneMoeForCausalLM, ExaoneMoeModel
+    from .modules.falcon_h1 import FalconH1Config, FalconH1ForCausalLM, FalconH1Model
+    from .modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaModel
+    from .modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2Model
+    from .modules.gemma3 import Gemma3Config, Gemma3ForCausalLM, Gemma3Model
+    from .modules.gemma3_text import Gemma3TextConfig, Gemma3TextForCausalLM, Gemma3TextModel
+    from .modules.gemma3n import Gemma3NConfig, Gemma3NForCausalLM, Gemma3NModel
     from .modules.glm import GlmConfig, GlmForCausalLM, GlmModel
     from .modules.glm4 import Glm4Config, Glm4ForCausalLM, Glm4Model
     from .modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM, Glm4MoeModel
@@ -273,7 +423,28 @@ if _tp.TYPE_CHECKING:
         Glm4VMoeVisionConfig,
     )
     from .modules.glm46v import Glm46VConfig, Glm46VForConditionalGeneration, Glm46VModel
+    from .modules.gpt2 import GPT2Config, GPT2ForCausalLM, GPT2Model
+    from .modules.gpt_bigcode import GPTBigCodeConfig, GPTBigCodeForCausalLM, GPTBigCodeModel
+    from .modules.gpt_neox import GPTNeoXConfig, GPTNeoXForCausalLM, GPTNeoXModel
     from .modules.gpt_oss import GptOssConfig, GptOssForCausalLM, GptOssModel
+    from .modules.granite import GraniteConfig, GraniteForCausalLM, GraniteModel
+    from .modules.granitemoe import GraniteMoeConfig, GraniteMoeForCausalLM, GraniteMoeModel
+    from .modules.granitemoehybrid import GraniteMoeHybridConfig, GraniteMoeHybridForCausalLM, GraniteMoeHybridModel
+    from .modules.helium import HeliumConfig, HeliumForCausalLM, HeliumModel
+    from .modules.hunyuan import HunyuanConfig, HunyuanForCausalLM, HunyuanModel
+    from .modules.hunyuan_v1_dense import HunyuanV1DenseConfig, HunyuanV1DenseForCausalLM, HunyuanV1DenseModel
+    from .modules.internlm2 import InternLM2Config, InternLM2ForCausalLM, InternLM2Model
+    from .modules.internlm3 import InternLM3Config, InternLM3ForCausalLM, InternLM3Model
+    from .modules.iquestloopcoder import IQuestLoopCoderConfig, IQuestLoopCoderForCausalLM, IQuestLoopCoderModel
+    from .modules.jamba import JambaConfig, JambaForCausalLM, JambaModel
+    from .modules.kimi_k25 import KimiK25Config, KimiK25ForCausalLM, KimiK25Model
+    from .modules.kimi_linear import KimiLinearConfig, KimiLinearForCausalLM, KimiLinearModel
+    from .modules.kimi_vl import KimiVLConfig, KimiVLForCausalLM, KimiVLModel
+    from .modules.klear import KlearConfig, KlearForCausalLM, KlearModel
+    from .modules.lfm2 import Lfm2Config, Lfm2ForCausalLM, Lfm2Model
+    from .modules.lfm2_moe import Lfm2MoeConfig, Lfm2MoeForCausalLM, Lfm2MoeModel
+    from .modules.lfm2_vl import Lfm2VlConfig, Lfm2VlForCausalLM, Lfm2VlModel
+    from .modules.lille_130m import Lille130mConfig, Lille130mForCausalLM, Lille130mModel
     from .modules.llama import LlamaConfig, LlamaForCausalLM, LlamaModel
     from .modules.llama4 import (
         Llama4Config,
@@ -282,6 +453,40 @@ if _tp.TYPE_CHECKING:
         Llama4TextConfig,
         Llama4VisionConfig,
     )
+    from .modules.llama4_text import Llama4TextForCausalLM, Llama4TextModel
+    from .modules.longcat_flash import LongcatFlashConfig, LongcatFlashForCausalLM, LongcatFlashModel
+    from .modules.longcat_flash_ngram import (
+        LongcatFlashNgramConfig,
+        LongcatFlashNgramForCausalLM,
+        LongcatFlashNgramModel,
+    )
+    from .modules.mamba import MambaConfig, MambaForCausalLM, MambaModel
+    from .modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+    from .modules.mimo import MiMoConfig, MiMoForCausalLM, MiMoModel
+    from .modules.mimo_v2_flash import MiMoV2FlashConfig, MiMoV2FlashForCausalLM, MiMoV2FlashModel
+    from .modules.minicpm import MiniCPMConfig, MiniCPMForCausalLM, MiniCPMModel
+    from .modules.minicpm3 import MiniCPM3Config, MiniCPM3ForCausalLM, MiniCPM3Model
+    from .modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
+    from .modules.ministral3 import Ministral3Config, Ministral3ForCausalLM, Ministral3Model
+    from .modules.mistral3 import Mistral3Config, Mistral3ForCausalLM, Mistral3Model
+    from .modules.mixtral import MixtralConfig, MixtralForCausalLM, MixtralModel
+    from .modules.nanochat import NanochatConfig, NanochatForCausalLM, NanochatModel
+    from .modules.nemotron import NemotronConfig, NemotronForCausalLM, NemotronModel
+    from .modules.nemotron_h import NemotronHConfig, NemotronHForCausalLM, NemotronHModel
+    from .modules.nemotron_nas import NemotronNASConfig, NemotronNASForCausalLM, NemotronNASModel
+    from .modules.olmo import OlmoConfig, OlmoForCausalLM, OlmoModel
+    from .modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2Model
+    from .modules.olmo3 import OLMo3Config, OLMo3ForCausalLM, OLMo3Model
+    from .modules.olmoe import OlmoeConfig, OlmoeForCausalLM, OlmoeModel
+    from .modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
+    from .modules.phi import PhiConfig, PhiForCausalLM, PhiModel
+    from .modules.phi3 import Phi3Config, Phi3ForCausalLM, Phi3Model
+    from .modules.phi3small import Phi3SmallConfig, Phi3SmallForCausalLM, Phi3SmallModel
+    from .modules.phimoe import PhimoeConfig, PhimoeForCausalLM, PhimoeModel
+    from .modules.phixtral import PhixtralConfig, PhixtralForCausalLM, PhixtralModel
+    from .modules.pixtral import PixtralConfig, PixtralForCausalLM, PixtralModel
+    from .modules.plamo import PlamoConfig, PlamoForCausalLM, PlamoModel
+    from .modules.plamo2 import Plamo2Config, Plamo2ForCausalLM, Plamo2Model
     from .modules.qwen import QwenConfig, QwenForCausalLM, QwenModel
     from .modules.qwen2 import Qwen2Config, Qwen2ForCausalLM, Qwen2Model
     from .modules.qwen2_moe import Qwen2MoeConfig, Qwen2MoeForCausalLM, Qwen2MoeModel
@@ -324,6 +529,25 @@ if _tp.TYPE_CHECKING:
         Qwen3VLMoeTextConfig,
         Qwen3VLMoeVisionConfig,
     )
+    from .modules.recurrent_gemma import RecurrentGemmaConfig, RecurrentGemmaForCausalLM, RecurrentGemmaModel
+    from .modules.rwkv7 import Rwkv7Config, Rwkv7ForCausalLM, Rwkv7Model
+    from .modules.seed_oss import SeedOssConfig, SeedOssForCausalLM, SeedOssModel
+    from .modules.smollm3 import (
+        SmolLM3Config,
+        Smollm3Config,
+        SmolLM3ForCausalLM,
+        Smollm3ForCausalLM,
+        SmolLM3Model,
+        Smollm3Model,
+        SmolLM3NoPE,
+        Smollm3NoPE,
+    )
+    from .modules.solar_open import SolarOpenConfig, SolarOpenForCausalLM, SolarOpenModel
+    from .modules.stablelm import StableLMConfig, StableLMForCausalLM, StableLMModel
+    from .modules.starcoder2 import Starcoder2Config, Starcoder2ForCausalLM, Starcoder2Model
+    from .modules.step3p5 import Step3p5Config, Step3p5ForCausalLM, Step3p5Model
+    from .modules.telechat3 import Telechat3Config, Telechat3ForCausalLM, Telechat3Model
+    from .modules.youtu_llm import YouTuLLMConfig, YouTuLLMForCausalLM, YouTuLLMModel
     from .operations import AttentionOutput, OperationImpl, OperationRegistry
     from .operations.kernels.gated_delta_rule import GatedDeltaRuleOp, GatedDeltaRuleOutput
     from .utils import LazyModule, ModelConverter, Registry, StateDictConverter, TensorConverter, is_package_available

@@ -79,6 +79,36 @@ class Llama4VisionConfig(EasyMLXBaseConfig):
         rope_theta: float = 10000.0,
         **kwargs,
     ):
+        """Initialize the Llama4 vision encoder configuration.
+
+        Args:
+            hidden_size: Dimensionality of vision transformer hidden states.
+            hidden_act: Activation function name for vision MLP layers.
+            num_hidden_layers: Number of vision transformer blocks.
+            num_attention_heads: Number of attention heads per block.
+            num_channels: Number of input image channels (e.g. 3 for RGB).
+            intermediate_size: Vision MLP intermediate dimensionality.
+            vision_output_dim: Output projection dimensionality.
+            image_size: Expected input image resolution in pixels.
+            patch_size: Patch embedding convolution kernel and stride size.
+            norm_eps: Epsilon for layer normalization.
+            vision_feature_layer: Index of the layer whose output is used
+                as features.
+            vision_feature_select_strategy: Strategy for selecting vision
+                features (e.g. ``"default"``).
+            initializer_range: Standard deviation for weight initialization.
+            pixel_shuffle_ratio: Ratio for pixel shuffle operations.
+            projector_input_dim: Input dimensionality of the multi-modal
+                projector.
+            projector_output_dim: Output dimensionality of the multi-modal
+                projector.
+            multi_modal_projector_bias: Whether to use bias in the
+                multi-modal projector.
+            projector_dropout: Dropout rate in the multi-modal projector.
+            attention_dropout: Dropout rate for attention weights.
+            rope_theta: Base frequency for rotary positional embeddings.
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.hidden_act = hidden_act
@@ -189,6 +219,52 @@ class Llama4TextConfig(EasyMLXBaseConfig):
         attention_bias: bool = False,
         **kwargs,
     ):
+        """Initialize the Llama4 text decoder configuration.
+
+        Args:
+            vocab_size: Size of the token vocabulary.
+            hidden_size: Dimensionality of the text transformer hidden states.
+            intermediate_size: MoE expert intermediate dimensionality.
+            intermediate_size_mlp: Dense MLP intermediate dimensionality.
+            num_hidden_layers: Total number of transformer decoder layers.
+            num_attention_heads: Number of query attention heads.
+            num_key_value_heads: Number of key/value heads for GQA. Defaults
+                to ``num_attention_heads`` when ``None``.
+            head_dim: Dimensionality per head. Defaults to
+                ``hidden_size // num_attention_heads`` when ``None``.
+            hidden_act: Activation function name for MLP layers.
+            max_position_embeddings: Maximum sequence length for RoPE.
+            initializer_range: Standard deviation for weight initialization.
+            rms_norm_eps: Epsilon for RMS normalization.
+            use_cache: Whether KV caching is enabled during generation.
+            pad_token_id: Token ID used for padding.
+            bos_token_id: Token ID for beginning-of-sequence.
+            eos_token_id: Token ID for end-of-sequence.
+            tie_word_embeddings: Whether input/output embeddings share weights.
+            rope_theta: Base frequency for rotary positional embeddings.
+            attention_dropout: Dropout rate for attention weights.
+            num_experts_per_tok: Number of experts activated per token in MoE.
+            num_local_experts: Total number of experts in MoE layers.
+            moe_layers: Explicit list of layer indices using MoE. Auto-derived
+                from ``interleave_moe_layer_step`` when ``None``.
+            interleave_moe_layer_step: Step interval for interleaving MoE layers.
+            use_qk_norm: Whether to apply RMS normalization to Q and K.
+            output_router_logits: Whether to return router logits.
+            router_aux_loss_coef: Coefficient for the router auxiliary loss.
+            router_jitter_noise: Jitter noise added to router inputs.
+            rope_scaling: Optional RoPE scaling configuration dictionary.
+            no_rope_layers: Per-layer flags for skipping RoPE. Auto-derived
+                from ``no_rope_layer_interval`` when ``None``.
+            no_rope_layer_interval: Interval for determining no-RoPE layers.
+            attention_chunk_size: Window size for chunked attention layers.
+            attn_temperature_tuning: Temperature tuning factor for attention.
+            floor_scale: Floor scale parameter for attention temperature.
+            attn_scale: Attention scaling factor.
+            layer_types: Per-layer attention type strings. Auto-generated
+                from ``no_rope_layers`` when ``None``.
+            attention_bias: Whether to use bias in attention projections.
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -291,6 +367,23 @@ class Llama4ModelConfig(EasyMLXBaseConfig):
         eos_token_id: int | None = None,
         **kwargs,
     ):
+        """Initialize the fully-resolved Llama4 runtime model configuration.
+
+        Args:
+            text_config: Finalized text decoder configuration. Accepts a
+                ``Llama4TextConfig`` instance or a dict of keyword arguments.
+            vision_config: Finalized vision encoder configuration. Accepts a
+                ``Llama4VisionConfig`` instance or a dict of keyword arguments.
+            boi_token_index: Token index for beginning-of-image.
+            eoi_token_index: Token index for end-of-image.
+            image_token_index: Token index representing an image placeholder.
+            boi_token_id: Token ID for beginning-of-image.
+            eoi_token_id: Token ID for end-of-image.
+            image_token_id: Token ID for image placeholder.
+            pad_token_id: Optional padding token ID.
+            eos_token_id: Optional end-of-sequence token ID.
+            **kwargs: Additional keyword arguments forwarded to the base class.
+        """
         super().__init__(**kwargs)
         if text_config is not None and isinstance(text_config, dict):
             text_config = Llama4TextConfig(**text_config)

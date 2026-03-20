@@ -353,6 +353,10 @@ class CompletionRequest(BaseModel):
         temperature: Sampling temperature (0.0 = greedy, higher = more random).
         top_p: Nucleus sampling probability threshold.
         top_k: Top-k sampling parameter (0 = disabled).
+        presence_penalty: Additive penalty applied to generated tokens
+            that already appeared in the output.
+        repetition_penalty: Multiplicative penalty applied to tokens
+            that already appeared in the prompt/output history.
         n: Number of completions to generate per prompt.
         stop: Stop sequence(s) that terminate generation.
         stream: Whether to stream the response as Server-Sent Events.
@@ -364,6 +368,8 @@ class CompletionRequest(BaseModel):
     temperature: float = Field(1.0, ge=0.0)
     top_p: float = Field(1.0, ge=0.0, le=1.0)
     top_k: int = Field(0, ge=0)
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     n: int = Field(1, ge=1)
     stop: list["str"] | str | None = None
     stream: bool = False
@@ -393,6 +399,10 @@ class ChatCompletionRequest(BaseModel):
         temperature: Sampling temperature (0.0 = greedy, higher = more random).
         top_p: Nucleus sampling probability threshold.
         top_k: Top-k sampling parameter (0 = disabled).
+        presence_penalty: Additive penalty applied to generated tokens
+            that already appeared in the output.
+        repetition_penalty: Multiplicative penalty applied to tokens
+            that already appeared in the prompt/output history.
         n: Number of chat completion choices to generate.
         stop: Stop sequence(s) that terminate generation.
         stream: Whether to stream the response as Server-Sent Events.
@@ -410,6 +420,8 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(1.0, ge=0.0)
     top_p: float = Field(1.0, ge=0.0, le=1.0)
     top_k: int = Field(0, ge=0)
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     n: int = Field(1, ge=1)
     stop: list["str"] | str | None = None
     stream: bool = False
@@ -434,6 +446,10 @@ class ResponsesRequest(BaseModel):
         temperature: Sampling temperature (0.0 = greedy, higher = more random).
         top_p: Nucleus sampling probability threshold.
         top_k: Top-k sampling parameter (0 = disabled).
+        presence_penalty: Additive penalty applied to generated tokens
+            that already appeared in the output.
+        repetition_penalty: Multiplicative penalty applied to tokens
+            that already appeared in the prompt/output history.
         stream: Whether to stream the response as Server-Sent Events.
         tools: Tool definitions available to the model.
         functions: Legacy function definitions (converted to tools internally).
@@ -455,6 +471,8 @@ class ResponsesRequest(BaseModel):
     temperature: float = Field(1.0, ge=0.0)
     top_p: float = Field(1.0, ge=0.0, le=1.0)
     top_k: int = Field(0, ge=0)
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     stream: bool = False
     tools: list[dict[str, Any]] | None = None
     functions: list[dict[str, Any]] | None = None

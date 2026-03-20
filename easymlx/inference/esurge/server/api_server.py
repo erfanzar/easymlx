@@ -279,6 +279,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
         temperature: float,
         top_p: float,
         top_k: int,
+        presence_penalty: float = 0.0,
+        repetition_penalty: float = 1.0,
         stop: list["str"] | str | None = None,
         tools: list[dict[str, Any]] | None = None,
         functions: list[dict[str, Any]] | None = None,
@@ -291,6 +293,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
             temperature: Sampling temperature.
             top_p: Nucleus sampling probability.
             top_k: Top-k sampling parameter.
+            presence_penalty: Additive penalty for generated-token repeats.
+            repetition_penalty: Multiplicative penalty for prompt/output repeats.
             stop: Stop sequence(s).
             tools: Tool definitions for function calling.
             functions: Legacy function definitions.
@@ -305,6 +309,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
             temperature=float(temperature),
             top_p=float(top_p),
             top_k=int(top_k),
+            presence_penalty=float(presence_penalty),
+            repetition_penalty=float(repetition_penalty),
             stop=[stop] if isinstance(stop, str) else stop,
             do_sample=bool(float(temperature) > 0 and (float(temperature) != 0.0 or top_k or top_p < 1.0)),
             tools=merged_tools,
@@ -975,6 +981,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
                 temperature=payload.temperature,
                 top_p=payload.top_p,
                 top_k=payload.top_k,
+                presence_penalty=payload.presence_penalty,
+                repetition_penalty=payload.repetition_penalty,
                 stop=payload.stop,
             )
             if payload.stream:
@@ -1029,6 +1037,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
                 temperature=payload.temperature,
                 top_p=payload.top_p,
                 top_k=payload.top_k,
+                presence_penalty=payload.presence_penalty,
+                repetition_penalty=payload.repetition_penalty,
                 stop=payload.stop,
                 tools=payload.tools,
                 functions=payload.functions,
@@ -1129,6 +1139,8 @@ class eSurgeApiServer(AuthEndpointsMixin):
                 temperature=payload.temperature,
                 top_p=payload.top_p,
                 top_k=payload.top_k,
+                presence_penalty=payload.presence_penalty,
+                repetition_penalty=payload.repetition_penalty,
                 tools=payload.tools,
                 functions=payload.functions,
                 tool_choice=payload.tool_choice,

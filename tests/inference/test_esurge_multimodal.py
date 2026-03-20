@@ -18,6 +18,7 @@ import base64
 import io
 from dataclasses import dataclass, field
 
+import mlx.core as mx
 import numpy as np
 from PIL import Image
 
@@ -105,8 +106,8 @@ def test_extract_media_from_messages_supports_data_url_and_video() -> None:
 def test_process_images_flat_patch_fallback_returns_grid() -> None:
     manager = MultimodalManager(processor=None, model=_DummyModel())
     pixel_values, image_grid_thw = manager.process_images([_make_image(50, 50)])
-    assert isinstance(pixel_values, np.ndarray)
-    assert isinstance(image_grid_thw, np.ndarray)
+    assert isinstance(pixel_values, mx.array)
+    assert isinstance(image_grid_thw, mx.array)
     assert pixel_values.ndim == 2
     assert image_grid_thw.shape[1] == 3
 
@@ -122,6 +123,17 @@ def test_process_images_to_features_attaches_cached_embeddings() -> None:
     second = manager.process_images_to_features([image], request_idx=1)
     assert len(second) == 1
     assert second[0].has_cached_embeddings
+
+
+def test_process_images_to_features_skips_hashing_when_cache_disabled() -> None:
+    manager = MultimodalManager(processor=None, model=_DummyModel(), enable_cache=False)
+    image = _make_image(48, 48, 99)
+
+    features = manager.process_images_to_features([image], request_idx=0)
+
+    assert len(features) == 1
+    assert features[0].mm_hash == ""
+    assert isinstance(features[0].pixel_values, mx.array)
 
 
 def test_prepare_builds_batched_multimodal_input() -> None:
@@ -151,3 +163,5 @@ def test_prepare_builds_batched_multimodal_input() -> None:
     assert prepared.batched.has_vision
     assert prepared.batched.num_images == 1
     assert prepared.batched.num_videos == 1
+    assert isinstance(prepared.batched.pixel_values, mx.array)
+    assert isinstance(prepared.batched.pixel_values_videos, mx.array)

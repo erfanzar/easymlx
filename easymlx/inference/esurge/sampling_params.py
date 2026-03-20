@@ -41,6 +41,10 @@ class SamplingParams:
             nucleus sampling.
         do_sample: Whether to use stochastic sampling.  ``False``
             selects greedy (argmax) decoding.
+        presence_penalty: Additive penalty applied once to tokens that
+            already appeared in the generated output.
+        repetition_penalty: Multiplicative penalty applied to tokens
+            that already appeared in the full prompt+output history.
         stop: Optional list of stop strings that terminate generation.
         eos_token_id: End-of-sequence token ID override.
         pad_token_id: Padding token ID override.
@@ -63,6 +67,8 @@ class SamplingParams:
     top_k: int = 0
     top_p: float = 1.0
     do_sample: bool = False
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
     stop: list["str"] | None = None
     eos_token_id: int | None = None
     pad_token_id: int | None = None
@@ -89,6 +95,8 @@ class SamplingParams:
             "top_k": int(self.top_k),
             "top_p": float(self.top_p),
             "do_sample": bool(self.do_sample),
+            "presence_penalty": float(self.presence_penalty),
+            "repetition_penalty": float(self.repetition_penalty),
             "eos_token_id": self.eos_token_id,
             "pad_token_id": self.pad_token_id,
             "include_stop_str_in_output": bool(self.include_stop_str_in_output),

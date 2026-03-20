@@ -19,6 +19,7 @@ import json
 from fastapi.testclient import TestClient
 
 from easymlx.inference.esurge import CompletionOutput, RequestOutput
+from easymlx.inference.esurge.server.api_models import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 from easymlx.inference.esurge.server.api_server import eSurgeApiServer
 
 
@@ -26,9 +27,10 @@ class DummyEngine:
     def __init__(self) -> None:
         self.max_model_len = 64
         self.max_num_seqs = 1
+        self.last_sampling_params = None
 
     def generate(self, prompts, sampling_params):
-        del sampling_params
+        self.last_sampling_params = sampling_params
         prompt = prompts[0] if isinstance(prompts, list) else prompts
         return [
             RequestOutput(
@@ -78,8 +80,8 @@ class DummyEngine:
         yield from self.generate(prompts, sampling_params)
 
     def chat(self, messages, sampling_params=None, *, tools=None, **_kwargs):
-        del messages, sampling_params, tools
-        return self.generate(["chat"], None)[0]
+        del messages, tools
+        return self.generate(["chat"], sampling_params)[0]
 
 
 def lookup(city: str) -> dict[str, str]:
@@ -136,6 +138,55 @@ def test_completion_endpoint():
     assert resp.status_code == 200
     body = resp.json()
     assert body["choices"][0]["text"] == "hello"
+
+
+def test_server_request_models_accept_penalty_fields():
+    completion = CompletionRequest(
+        model="dummy",
+        prompt="Hi",
+        presence_penalty=0.25,
+        repetition_penalty=1.4,
+    )
+    chat = ChatCompletionRequest(
+        model="dummy",
+        messages=[{"role": "user", "content": "Hi"}],
+        presence_penalty=0.5,
+        repetition_penalty=1.2,
+    )
+    responses = ResponsesRequest(
+        model="dummy",
+        input="Hi",
+        presence_penalty=0.75,
+        repetition_penalty=1.1,
+    )
+
+    assert completion.presence_penalty == 0.25
+    assert completion.repetition_penalty == 1.4
+    assert chat.presence_penalty == 0.5
+    assert chat.repetition_penalty == 1.2
+    assert responses.presence_penalty == 0.75
+    assert responses.repetition_penalty == 1.1
+
+
+def test_completion_endpoint_passes_penalties_to_sampling_params():
+    engine = DummyEngine()
+    server = eSurgeApiServer({"dummy": engine})
+    client = TestClient(server.app)
+
+    resp = client.post(
+        "/v1/completions",
+        json={
+            "model": "dummy",
+            "prompt": "Hi",
+            "presence_penalty": 0.6,
+            "repetition_penalty": 1.4,
+        },
+    )
+
+    assert resp.status_code == 200
+    assert engine.last_sampling_params is not None
+    assert engine.last_sampling_params.presence_penalty == 0.6
+    assert engine.last_sampling_params.repetition_penalty == 1.4
 
 
 def test_chat_completion_endpoint():

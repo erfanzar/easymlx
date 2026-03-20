@@ -33,6 +33,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 
 
@@ -83,40 +84,42 @@ class MultiModalFeature:
 
     mm_hash: str
     modality: str
-    pixel_values: np.ndarray | None
-    grid_thw: np.ndarray | None
+    pixel_values: mx.array | np.ndarray | None
+    grid_thw: mx.array | np.ndarray | None
     placeholder_range: PlaceholderRange | None = None
     cached_embeddings: Any | None = None
     request_idx: int = 0
 
     @staticmethod
-    def _compute_hash(pixel_values: np.ndarray) -> str:
+    def _compute_hash(pixel_values: Any) -> str:
         """Compute an MD5 hash over pixel-value shape and content.
 
         For arrays with more than 1 million elements, a strided
         subsample is hashed to reduce latency.
 
         Args:
-            pixel_values: NumPy array to hash.
+            pixel_values: Pixel array to hash.
 
         Returns:
             Hex-encoded MD5 digest string.
         """
-        shape_bytes = np.asarray(pixel_values.shape, dtype=np.int32).tobytes()
-        if pixel_values.size > 1_000_000:
-            sampled = pixel_values.flat[::100]
+        array = np.asarray(pixel_values)
+        shape_bytes = np.asarray(array.shape, dtype=np.int32).tobytes()
+        if array.size > 1_000_000:
+            sampled = array.flat[::100]
             content_bytes = sampled.tobytes()
         else:
-            content_bytes = pixel_values.tobytes()
+            content_bytes = array.tobytes()
         return hashlib.md5(shape_bytes + content_bytes).hexdigest()
 
     @classmethod
     def from_image(
         cls,
-        pixel_values: np.ndarray,
-        grid_thw: np.ndarray | None = None,
+        pixel_values: mx.array | np.ndarray,
+        grid_thw: mx.array | np.ndarray | None = None,
         placeholder_range: PlaceholderRange | None = None,
         request_idx: int = 0,
+        mm_hash: str | None = None,
     ) -> MultiModalFeature:
         """Construct a feature for an image.
 
@@ -130,7 +133,7 @@ class MultiModalFeature:
             A :class:`MultiModalFeature` with ``modality="image"``.
         """
         return cls(
-            mm_hash=cls._compute_hash(pixel_values),
+            mm_hash=cls._compute_hash(pixel_values) if mm_hash is None else str(mm_hash),
             modality="image",
             pixel_values=pixel_values,
             grid_thw=grid_thw,
@@ -141,10 +144,11 @@ class MultiModalFeature:
     @classmethod
     def from_video(
         cls,
-        pixel_values: np.ndarray,
-        grid_thw: np.ndarray | None = None,
+        pixel_values: mx.array | np.ndarray,
+        grid_thw: mx.array | np.ndarray | None = None,
         placeholder_range: PlaceholderRange | None = None,
         request_idx: int = 0,
+        mm_hash: str | None = None,
     ) -> MultiModalFeature:
         """Construct a feature for a video clip.
 
@@ -158,7 +162,7 @@ class MultiModalFeature:
             A :class:`MultiModalFeature` with ``modality="video"``.
         """
         return cls(
-            mm_hash=cls._compute_hash(pixel_values),
+            mm_hash=cls._compute_hash(pixel_values) if mm_hash is None else str(mm_hash),
             modality="video",
             pixel_values=pixel_values,
             grid_thw=grid_thw,
@@ -215,10 +219,10 @@ class BatchedMultiModalInputs:
             indices within ``video_features``.
     """
 
-    pixel_values: np.ndarray | None = None
-    image_grid_thw: np.ndarray | None = None
-    pixel_values_videos: np.ndarray | None = None
-    video_grid_thw: np.ndarray | None = None
+    pixel_values: mx.array | np.ndarray | None = None
+    image_grid_thw: mx.array | np.ndarray | None = None
+    pixel_values_videos: mx.array | np.ndarray | None = None
+    video_grid_thw: mx.array | np.ndarray | None = None
     image_features: list[MultiModalFeature] = field(default_factory=list)
     video_features: list[MultiModalFeature] = field(default_factory=list)
     request_to_image_indices: dict[int, list["int"]] = field(default_factory=dict)
@@ -259,20 +263,31 @@ class BatchedMultiModalInputs:
         if image_features:
             image_pixels = [f.pixel_values for f in image_features if f.pixel_values is not None]
             if image_pixels:
-                pixel_values = np.concatenate(image_pixels, axis=0)
+                pixel_values = mx.concatenate(
+                    [mx.array(pv) if not isinstance(pv, mx.array) else pv for pv in image_pixels], axis=0
+                )
             image_grids = [f.grid_thw for f in image_features if f.grid_thw is not None]
             if image_grids:
-                image_grid_thw = np.concatenate(image_grids, axis=0)
+                image_grid_thw = mx.concatenate(
+                    [mx.array(grid) if not isinstance(grid, mx.array) else grid for grid in image_grids],
+                    axis=0,
+                )
 
         pixel_values_videos = None
         video_grid_thw = None
         if video_features:
             video_pixels = [f.pixel_values for f in video_features if f.pixel_values is not None]
             if video_pixels:
-                pixel_values_videos = np.concatenate(video_pixels, axis=0)
+                pixel_values_videos = mx.concatenate(
+                    [mx.array(pv) if not isinstance(pv, mx.array) else pv for pv in video_pixels],
+                    axis=0,
+                )
             video_grids = [f.grid_thw for f in video_features if f.grid_thw is not None]
             if video_grids:
-                video_grid_thw = np.concatenate(video_grids, axis=0)
+                video_grid_thw = mx.concatenate(
+                    [mx.array(grid) if not isinstance(grid, mx.array) else grid for grid in video_grids],
+                    axis=0,
+                )
 
         return cls(
             pixel_values=pixel_values,

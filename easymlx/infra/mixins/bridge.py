@@ -30,8 +30,10 @@ import contextlib
 import glob
 import hashlib
 import json
+import mmap
 import os
 import shutil
+import struct
 from pathlib import Path
 
 import mlx.core as mx
@@ -194,8 +196,9 @@ def _quantize_weights(
     for key, value in weights.items():
         if key in quantized_weight_keys and mx.issubdtype(value.dtype, mx.floating):
             quant_result = mx.quantize(value, group_size, bits, mode=mode)
-            prefix = key.rsplit(".weight", 1)[0]
-            out[f"{prefix}.weight"] = quant_result[0]
+            # key is already "prefix.weight"; reuse it directly.
+            out[key] = quant_result[0]
+            prefix = key[: -len(".weight")]
             out[f"{prefix}.scales"] = quant_result[1]
             if len(quant_result) > 2:
                 out[f"{prefix}.biases"] = quant_result[2]
@@ -308,32 +311,83 @@ def _resolve_weight_files(model_path: Path, *, weights_name: str | None = None) 
     return [fallback] if fallback.exists() else []
 
 
-def _load_safetensors_file(path: Path) -> dict[str, mx.array]:
-    """Load a safetensors file using the ``safetensors`` library.
+_SAFETENSORS_DTYPE_MAP: dict[str, tuple[mx.Dtype, int]] = {
+    "BOOL": (mx.bool_, 1),
+    "U8": (mx.uint8, 1),
+    "I8": (mx.int8, 1),
+    "U16": (mx.uint16, 2),
+    "I16": (mx.int16, 2),
+    "U32": (mx.uint32, 4),
+    "I32": (mx.int32, 4),
+    "U64": (mx.uint64, 8),
+    "I64": (mx.int64, 8),
+    "F16": (mx.float16, 2),
+    "BF16": (mx.bfloat16, 2),
+    "F32": (mx.float32, 4),
+    "F64": (mx.float64, 8),
+}
 
-    The tensors are loaded via NumPy and then converted to ``mx.array``.
+
+def _load_safetensors_file(path: Path) -> dict[str, mx.array]:
+    """Load a safetensors file by parsing the binary format directly.
+
+    Handles dtypes that ``mx.load`` or numpy cannot read natively,
+    including ``BF16`` and ``F8_E5M2``/``F8_E4M3``.
 
     Args:
         path: Path to a ``.safetensors`` file.
 
     Returns:
         A dictionary mapping parameter names to MLX arrays.
-
-    Raises:
-        EasyMLXRuntimeError: If the ``safetensors`` package is not
-            installed.
     """
-    try:
-        from safetensors import safe_open
-    except Exception as exc:  # pragma: no cover
-        raise EasyMLXRuntimeError(
-            f"Could not load raw Hugging Face safetensors from {path!s}; install `safetensors`."
-        ) from exc
+    import numpy as np
 
     weights: dict[str, mx.array] = {}
-    with safe_open(str(path), framework="np") as handle:
-        for key in handle.keys():
-            weights[key] = mx.array(handle.get_tensor(key))
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        header_size = struct.unpack("<Q", mm[:8])[0]
+        header = json.loads(mm[8 : 8 + header_size])
+        data_offset = 8 + header_size
+
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            dtype_str: str = meta["dtype"]
+            shape: list[int] = meta["shape"]
+            start, end = meta["data_offsets"]
+            raw = mm[data_offset + start : data_offset + end]
+
+            if dtype_str in ("F8_E5M2", "F8_E4M3FN", "F8_E4M3"):
+                # FP8 E5M2 has same exponent layout as float16 — left-shift by 8.
+                # FP8 E4M3 needs exponent bias adjustment: bias 7 -> bias 15.
+                u8 = np.frombuffer(raw, dtype=np.uint8).astype(np.uint16)
+                if dtype_str == "F8_E5M2":
+                    f16_bits = u8 << 8
+                else:
+                    # E4M3: sign(1) exp(4) man(3) -> sign(1) exp(5) man(10)
+                    sign = (u8 >> 7) & 1
+                    exp = (u8 >> 3) & 0xF
+                    man = u8 & 0x7
+                    # Re-bias exponent: E4M3 bias=7, F16 bias=15
+                    new_exp = np.where(exp == 0, np.uint16(0), exp.astype(np.uint16) - 7 + 15)
+                    f16_bits = (sign << 15) | (new_exp << 10) | (man.astype(np.uint16) << 7)
+                arr = mx.array(f16_bits.reshape(shape)).view(mx.float16)
+            elif dtype_str in _SAFETENSORS_DTYPE_MAP:
+                mlx_dtype, itemsize = _SAFETENSORS_DTYPE_MAP[dtype_str]
+                if dtype_str == "BF16":
+                    np_arr = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+                    arr = mx.array(np_arr).view(mx.bfloat16)
+                else:
+                    np_dtype = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}[itemsize]
+                    np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+                    arr = mx.array(np_arr).view(mlx_dtype)
+            else:
+                raise EasyMLXRuntimeError(
+                    f"Unsupported safetensors dtype {dtype_str!r} for tensor {key!r} in {path!s}."
+                )
+            weights[key] = arr
+
+        mm.close()
     return weights
 
 
@@ -494,6 +548,24 @@ def _has_converted_checkpoint(path: Path, *, weights_name: str) -> bool:
     return (path / "config.json").exists() and (path / weights_name).exists()
 
 
+def _resolve_config(
+    cls: type,
+    config: EasyMLXBaseConfig | dict | str | os.PathLike | None,
+    model_path: Path,
+) -> EasyMLXBaseConfig:
+    """Resolve a config argument into an ``EasyMLXBaseConfig`` instance."""
+    config_class = getattr(cls, "config_class", None) or EasyMLXBaseConfig
+    if config is None:
+        return config_class.from_pretrained(str(model_path))
+    if isinstance(config, (str, os.PathLike)):
+        return config_class.from_pretrained(str(config))
+    if isinstance(config, dict):
+        return config_class(**config)
+    if not isinstance(config, config_class):  # pragma: no cover
+        raise TypeError(f"Unsupported config type: {type(config)}")
+    return config
+
+
 class EasyBridgeMixin:
     """Mixin providing model saving, loading, and HuggingFace conversion.
 
@@ -578,15 +650,7 @@ class EasyBridgeMixin:
             local_files_only=local_files_only,
         )
 
-        config_class = getattr(cls, "config_class", None) or EasyMLXBaseConfig
-        if config is None:
-            config = config_class.from_pretrained(str(model_path))
-        elif isinstance(config, (str, os.PathLike)):
-            config = config_class.from_pretrained(str(config))
-        elif isinstance(config, dict):
-            config = config_class(**config)
-        elif not isinstance(config, config_class):  # pragma: no cover
-            raise TypeError(f"Unsupported config type: {type(config)}")
+        config = _resolve_config(cls, config, model_path)
 
         with _no_weight_init():
             model = cls(config)
@@ -713,15 +777,7 @@ class EasyBridgeMixin:
                 local_files_only=local_files_only,
             )
 
-        config_class = EasyMLXBaseConfig if cls.config_class is None else cls.config_class
-        if config is None:
-            config = config_class.from_pretrained(str(model_path))
-        elif isinstance(config, (str, os.PathLike)):
-            config = config_class.from_pretrained(str(config))
-        elif isinstance(config, dict):
-            config = config_class(**config)
-        elif not isinstance(config, config_class):  # pragma: no cover
-            raise TypeError(f"Unsupported config type: {type(config)}")
+        config = _resolve_config(cls, config, model_path)
 
         # Build the model skeleton without allocating random weights.
         with _no_weight_init():

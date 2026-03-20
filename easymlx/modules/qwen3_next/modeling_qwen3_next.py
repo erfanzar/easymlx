@@ -71,9 +71,17 @@ def _resolve_module_activation_dtype(module: nn.Module, fallback: mx.Dtype) -> m
     """Return a real floating activation dtype for ``module``.
 
     Quantized MLX linears store packed weights in integer dtypes, so using
-    ``module.weight.dtype`` for activations is incorrect. Prefer any floating
-    parameter/bias dtype exposed by the module and otherwise fall back to the
+    ``module.weight.dtype`` for activations is incorrect. This function
+    inspects common floating-point attributes (bias, scales, weight) and
+    returns the first valid floating dtype found, falling back to the
     provided runtime dtype.
+
+    Args:
+        module: The MLX module to inspect.
+        fallback: Fallback dtype if no floating-point parameter is found.
+
+    Returns:
+        A floating-point ``mx.Dtype`` suitable for activation computation.
     """
 
     for attr in ("bias", "biases", "scales", "weight"):
@@ -87,11 +95,19 @@ def _resolve_module_activation_dtype(module: nn.Module, fallback: mx.Dtype) -> m
 
 
 def sanitize_qwen3_next_projection_weights(weights: dict[str, mx.array]) -> dict[str, mx.array]:
-    """Sanitize Qwen3-Next weights (conv1d HF→MLX layout, mtp removal).
+    """Sanitize Qwen3-Next weights for HuggingFace to MLX conversion.
 
-    HuggingFace Conv1d stores weights as ``(out, in/groups, kernel)``
-    while MLX uses ``(out, kernel, in/groups)``.  This function transposes
-    any ``conv1d.weight`` tensors and drops multi-token prediction heads.
+    Performs two transformations:
+    1. Transposes ``conv1d.weight`` tensors from HuggingFace layout
+       ``(out, in/groups, kernel)`` to MLX layout ``(out, kernel, in/groups)``.
+    2. Drops multi-token prediction (``mtp.*``) head weights.
+
+    Args:
+        weights: Raw weight dictionary from a HuggingFace checkpoint.
+
+    Returns:
+        Sanitized weight dictionary with transposed conv1d weights and
+        dropped mtp head weights.
     """
     out: dict[str, mx.array] = {}
     for key, value in weights.items():
@@ -185,14 +201,40 @@ class Qwen3NextRMSNormGated(nn.Module):
 
 
 class _PartialRoPE(nn.Module):
-    """Apply rotary embeddings only to the leading ``rotary_dim`` dimensions."""
+    """Apply rotary embeddings only to the leading ``rotary_dim`` dimensions.
+
+    When ``partial_rotary_factor`` is less than 1.0, only the first
+    ``rotary_dim`` dimensions of each head receive RoPE; the remaining
+    dimensions pass through unchanged.
+
+    Attributes:
+        rope: The underlying rotary embedding module.
+        rotary_dim: Number of leading dimensions to apply RoPE to.
+    """
 
     def __init__(self, rope: nn.Module, rotary_dim: int):
+        """Initialize the partial RoPE wrapper.
+
+        Args:
+            rope: A rotary embedding module that operates on tensors of
+                shape ``(..., rotary_dim)``.
+            rotary_dim: Number of leading dimensions to apply RoPE to.
+        """
         super().__init__()
         self.rope = rope
         self.rotary_dim = int(rotary_dim)
 
     def __call__(self, x: mx.array, offset: int | mx.array = 0) -> mx.array:
+        """Apply partial rotary embeddings.
+
+        Args:
+            x: Input tensor of shape ``(..., head_dim)``.
+            offset: Position offset for the rotary embedding computation.
+
+        Returns:
+            Tensor of the same shape with RoPE applied to the first
+            ``rotary_dim`` dimensions.
+        """
         if self.rotary_dim <= 0 or self.rotary_dim >= x.shape[-1]:
             return self.rope(x, offset=offset)
         x_rot = self.rope(x[..., : self.rotary_dim], offset=offset)
@@ -322,12 +364,33 @@ class Qwen3NextFullAttention(nn.Module):
 
 
 def _shift_conv_state_left(conv_state: mx.array, new_value: mx.array) -> mx.array:
-    """Shift conv rolling buffer left, append new token at the right."""
+    """Shift a rolling convolution buffer left and append a new token.
+
+    Args:
+        conv_state: Rolling buffer of shape ``(batch, channels, kernel_size)``.
+        new_value: New token values of shape ``(batch, channels)``.
+
+    Returns:
+        Updated buffer of the same shape with the oldest entry dropped and
+        ``new_value`` appended at the right.
+    """
     return mx.concatenate([conv_state[:, :, 1:], new_value[:, :, None]], axis=-1)
 
 
 def _manual_depthwise_conv(conv_state: mx.array, kernel: mx.array) -> mx.array:
-    """Single-step depthwise conv from cached state: sum(state * kernel, axis=-1) then silu."""
+    """Compute a single-step depthwise convolution from a cached state buffer.
+
+    Performs ``silu(sum(state * kernel, axis=-1))`` for efficient decode-time
+    convolution without requiring a full Conv1d forward pass.
+
+    Args:
+        conv_state: Cached convolution state of shape
+            ``(batch, channels, kernel_size)``.
+        kernel: Convolution kernel of shape ``(channels, kernel_size)``.
+
+    Returns:
+        Convolution output of shape ``(batch, channels)`` after SiLU activation.
+    """
     state = conv_state if conv_state.dtype == mx.float32 else conv_state.astype(mx.float32)
     kernel = kernel if kernel.dtype == mx.float32 else kernel.astype(mx.float32)
     return nn.silu(mx.sum(state * kernel[None, :, :], axis=-1))
@@ -368,20 +431,17 @@ class Qwen3NextLinearAttention(nn.Module):
         self.key_dim = self.num_k_heads * self.head_k_dim
         self.value_dim = self.num_v_heads * self.head_v_dim
         self.expand_ratio = self.num_v_heads // self.num_k_heads
-        self.conv_value_dim = self.num_v_heads * self.head_v_dim
-        self.conv_dim = self.key_dim * 2 + self.conv_value_dim
+        self.conv_dim = self.key_dim * 2 + self.value_dim
         self.d_conv = int(getattr(config, "linear_conv_kernel_dim", 4))
 
-        qkv_dim = self.key_dim * 2 + self.conv_value_dim
-        self.in_proj_qkv = nn.Linear(config.hidden_size, qkv_dim, bias=False)
-        self.in_proj_z = nn.Linear(config.hidden_size, self.conv_value_dim, bias=False)
+        self.in_proj_qkv = nn.Linear(config.hidden_size, self.conv_dim, bias=False)
+        self.in_proj_z = nn.Linear(config.hidden_size, self.value_dim, bias=False)
         self.in_proj_b = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(config.hidden_size, self.num_v_heads, bias=False)
-        self.out_proj = nn.Linear(self.conv_value_dim, config.hidden_size, bias=False)
+        self.out_proj = nn.Linear(self.value_dim, config.hidden_size, bias=False)
         self.norm = Qwen3NextRMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.gdr_op = GatedDeltaRuleOp()
         self._decode_query_scale = float(self.head_k_dim**-0.5)
-        self._decode_identity_conv_kernel = mx.ones((self.conv_dim, self.d_conv), dtype=mx.float32)
 
         conv_cls = getattr(nn, "Conv1d", None)
         self.conv1d = None
@@ -393,6 +453,8 @@ class Qwen3NextLinearAttention(nn.Module):
                 groups=self.conv_dim,
                 bias=False,
             )
+        else:
+            self._decode_identity_conv_kernel = mx.ones((self.conv_dim, self.d_conv), dtype=mx.float32)
 
         self.A_log = mx.zeros((self.num_v_heads,))
         self.dt_bias = mx.ones((self.num_v_heads,))
@@ -404,7 +466,11 @@ class Qwen3NextLinearAttention(nn.Module):
         self._decode_conv_kernel: mx.array | None = None
 
     def _refresh_decode_cache(self) -> None:
-        """Refresh decode-only tensors that stay constant within a generation."""
+        """Refresh decode-only tensors that stay constant within a generation.
+
+        Pre-computes the decay base, dt bias, and convolution kernel in
+        float32 so that the decode path avoids redundant casts per step.
+        """
         self._decode_decay_base = -mx.exp(self.A_log.astype(mx.float32))
         self._decode_dt_bias = self.dt_bias.astype(mx.float32)
         if self.conv1d is None:
@@ -416,7 +482,12 @@ class Qwen3NextLinearAttention(nn.Module):
         self._decode_conv_kernel = kernel
 
     def _ensure_decode_cache(self) -> tuple[mx.array, mx.array, mx.array]:
-        """Return cached decode invariants, refreshing them if needed."""
+        """Return cached decode invariants, refreshing them if needed.
+
+        Returns:
+            A tuple of ``(decay_base, dt_bias, conv_kernel)`` arrays in
+            float32, ready for single-step decode computation.
+        """
         if self._decode_decay_base is None or self._decode_dt_bias is None or self._decode_conv_kernel is None:
             self._refresh_decode_cache()
         assert self._decode_decay_base is not None
@@ -425,7 +496,14 @@ class Qwen3NextLinearAttention(nn.Module):
         return self._decode_decay_base, self._decode_dt_bias, self._decode_conv_kernel
 
     def reset_state(self, batch_size: int = 1):
-        """Reset conv and recurrent states for a new generation."""
+        """Reset convolution and recurrent states for a new generation.
+
+        Initializes the rolling convolution buffer and the recurrent state
+        matrix to zeros, and refreshes the decode cache invariants.
+
+        Args:
+            batch_size: Batch size for the new generation session.
+        """
         conv_dtype = _resolve_module_activation_dtype(self.in_proj_qkv, mx.float16)
         self._conv_state = mx.zeros(
             (batch_size, self.conv_dim, self.d_conv),

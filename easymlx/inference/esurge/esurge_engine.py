@@ -32,7 +32,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
-import numpy as np
+import mlx.core as mx
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizerBase
 
 from easymlx.inference.reasoning import ReasoningParserManager, detect_reasoning_parser
@@ -311,6 +311,41 @@ class _RuntimeRequestState:
         self.done.set()
 
 
+@dataclass(slots=True)
+class _MemoryUtilizationSummary:
+    """Estimated memory-utilization state derived from the allocated KV cache.
+
+    Attributes:
+        requested_utilization: User-requested memory utilization fraction.
+        allocated_utilization: Approximate fraction of device memory used by
+            the allocated KV cache.
+        estimated_token_capacity: Approximate total cache-token capacity
+            implied by the requested memory utilization, derived from the
+            current allocation.
+        runtime_token_capacity: Total runtime token cap from
+            ``max_model_len * max_num_seqs``.
+        requested_budget_bytes: Requested cache-memory budget in bytes.
+        allocated_cache_bytes: Estimated bytes consumed by the allocated KV
+            caches.
+        available_memory_bytes: Device memory budget used for the estimate.
+        runtime_capped: Whether runtime caps are lower than the requested
+            memory-based estimate.
+        approximate_sequence_capacity: Whether the requested memory budget is
+            tighter than the runtime token cap, making usable per-sequence
+            length workload-dependent.
+    """
+
+    requested_utilization: float
+    allocated_utilization: float | None
+    estimated_token_capacity: int | None
+    runtime_token_capacity: int
+    requested_budget_bytes: int | None
+    allocated_cache_bytes: int | None
+    available_memory_bytes: int | None
+    runtime_capped: bool = False
+    approximate_sequence_capacity: bool = False
+
+
 class eSurge:
     """Paged attention inference engine with EasyDeL-like public methods.
 
@@ -447,6 +482,8 @@ class eSurge:
         self.cache_config = cache_config
         self.ignore_stop_strings_in_reasoning = bool(ignore_stop_strings_in_reasoning)
         self.memory_utilization = float(memory_utilization)
+        self.effective_memory_utilization = float(self.memory_utilization)
+        self.estimated_memory_token_capacity: int | None = None
         self.silent_mode = bool(silent_mode)
         self.runner_verbose = bool(runner_verbose)
         self._info = logger.info if not self.silent_mode else (lambda *a, **kw: None)
@@ -468,7 +505,9 @@ class eSurge:
         self._runtime_states: dict[str, _RuntimeRequestState] = {}
         self._step_counter = 0
         self._controller_started = False
+        self._memory_utilization_summary: _MemoryUtilizationSummary | None = None
 
+        requested_tool_parser = tool_parser
         model_type = str(
             getattr(self.model, "_model_type", None)
             or getattr(getattr(self.model, "config", None), "model_type", "")
@@ -480,6 +519,7 @@ class eSurge:
             reasoning_parser = detect_reasoning_parser(model_type=model_type, tokenizer=self.tokenizer)
         self.tool_parser_name = tool_parser
         self.reasoning_parser_name = reasoning_parser
+        self._tool_parser_autodetected = requested_tool_parser is None and tool_parser is not None
         self._tool_parser_class = ToolParserManager.get_tool_parser(tool_parser) if tool_parser else None
         self._reasoning_parser_class = (
             ReasoningParserManager.get_reasoning_parser(reasoning_parser) if reasoning_parser else None
@@ -576,13 +616,16 @@ class eSurge:
                 f"KV heads      : {num_kv_heads} x {head_dim}d",
                 f"Algorithms    : {algo_str}",
                 f"Cache         : {' | '.join(cache_parts)}",
-                f"Memory util   : {self.memory_utilization:.0%}",
+                self._format_memory_utilization_line(),
                 f"Runtime       : max_model_len={self.max_model_len:,} | "
                 f"max_num_seqs={self.max_num_seqs} | "
                 f"max_batched_tokens={self.scheduler_config.max_num_batched_tokens or self.max_model_len:,}",
                 f"Tool parser   : {tool_parser or 'none'}",
                 f"Reason parser : {reasoning_parser or 'none'}",
             ]
+            memory_note = self._format_memory_utilization_note()
+            if memory_note is not None:
+                lines.insert(7, memory_note)
             self._info("\n".join(lines))
         except Exception as exc:
             logger.debug("Could not generate startup summary: %s", exc)
@@ -590,6 +633,12 @@ class eSurge:
     def _initialize_runtime(self) -> None:
         """Bootstrap the model runner, scheduler, execution manager, and background thread."""
         kv_caches = self._init_paged_cache()
+        self._memory_utilization_summary = self._build_memory_utilization_summary(kv_caches)
+        if self._memory_utilization_summary is not None:
+            if self._memory_utilization_summary.allocated_utilization is not None:
+                self.effective_memory_utilization = self._memory_utilization_summary.allocated_utilization
+            if self._memory_utilization_summary.estimated_token_capacity is not None:
+                self.estimated_memory_token_capacity = self._memory_utilization_summary.estimated_token_capacity
         self._reset_recurrent_states()
         self._info("Initializing paged runtime with %d KV cache layers", len(kv_caches))
         supports_async_overlap = bool(getattr(self.model, "supports_async_overlap", False))
@@ -719,7 +768,7 @@ class eSurge:
                 batch_size=self.max_num_seqs,
                 max_length=self.max_model_len,
                 page_size=self.cache_config.page_size,
-                dtype=np.float16,
+                dtype=mx.float16,
                 cache_type="paged",
             )
             if isinstance(result, (list, tuple)):
@@ -754,12 +803,158 @@ class eSurge:
             num_seqs=self.max_num_seqs,
             max_seq_len=self.max_model_len,
             page_size=self.cache_config.page_size,
-            dtype=np.float16,
+            dtype=mx.float16,
         )
         cache_list = list(caches)
         if not cache_list:
             raise ValueError("Paged cache initialization returned no caches.")
         return cache_list
+
+    @staticmethod
+    def _sum_nbytes(value: Any, seen: set[int]) -> int:
+        """Recursively sum ``nbytes`` for arrays nested inside *value*."""
+        if value is None:
+            return 0
+        if isinstance(value, (str, bytes, bytearray, int, float, bool)):
+            return 0
+
+        value_id = id(value)
+        if value_id in seen:
+            return 0
+
+        if isinstance(value, dict):
+            seen.add(value_id)
+            return sum(eSurge._sum_nbytes(item, seen) for item in value.values())
+        if isinstance(value, (list, tuple, set, frozenset)):
+            seen.add(value_id)
+            return sum(eSurge._sum_nbytes(item, seen) for item in value)
+
+        nbytes = getattr(value, "nbytes", None)
+        if isinstance(nbytes, int):
+            seen.add(value_id)
+            return int(nbytes)
+
+        total = 0
+        slots = getattr(type(value), "__slots__", ())
+        if slots:
+            seen.add(value_id)
+            for name in slots:
+                if isinstance(name, str) and hasattr(value, name):
+                    total += eSurge._sum_nbytes(getattr(value, name), seen)
+            return total
+
+        try:
+            attrs = vars(value)
+        except TypeError:
+            return 0
+
+        seen.add(value_id)
+        return sum(eSurge._sum_nbytes(item, seen) for item in attrs.values())
+
+    @staticmethod
+    def _available_device_memory_bytes() -> int | None:
+        """Return the device-memory budget used for cache-utilization estimates."""
+        try:
+            device_info = mx.device_info()
+        except Exception:
+            try:
+                device_info = mx.metal.device_info()
+            except Exception:
+                return None
+
+        recommended = int(device_info.get("max_recommended_working_set_size") or 0)
+        total = int(device_info.get("memory_size") or 0)
+        candidates = [value for value in (recommended, total) if value > 0]
+        if not candidates:
+            return None
+        return min(candidates)
+
+    def _build_memory_utilization_summary(self, kv_caches: list[Any]) -> _MemoryUtilizationSummary | None:
+        """Estimate requested versus allocated cache utilization.
+
+        The estimate is derived from the actual KV-cache allocation and the
+        current device-memory budget. It is intentionally approximate and is
+        used for startup reporting only.
+        """
+        available_memory_bytes = self._available_device_memory_bytes()
+        if available_memory_bytes is None or available_memory_bytes <= 0:
+            return None
+
+        allocated_cache_bytes = self._sum_nbytes(kv_caches, seen=set())
+        runtime_token_capacity = max(self.max_model_len * self.max_num_seqs, 0)
+        if allocated_cache_bytes <= 0 or runtime_token_capacity <= 0:
+            return _MemoryUtilizationSummary(
+                requested_utilization=self.memory_utilization,
+                allocated_utilization=None,
+                estimated_token_capacity=None,
+                runtime_token_capacity=runtime_token_capacity,
+                requested_budget_bytes=None,
+                allocated_cache_bytes=allocated_cache_bytes or None,
+                available_memory_bytes=available_memory_bytes,
+            )
+
+        requested_budget_bytes = max(int(available_memory_bytes * self.memory_utilization), 0)
+        allocated_utilization = allocated_cache_bytes / available_memory_bytes
+        estimated_token_capacity = None
+        if requested_budget_bytes > 0:
+            estimated_token_capacity = max(
+                int((runtime_token_capacity * requested_budget_bytes) / allocated_cache_bytes),
+                0,
+            )
+
+        runtime_capped = estimated_token_capacity is not None and estimated_token_capacity >= runtime_token_capacity
+        approximate_sequence_capacity = (
+            estimated_token_capacity is not None and estimated_token_capacity < runtime_token_capacity
+        )
+
+        return _MemoryUtilizationSummary(
+            requested_utilization=self.memory_utilization,
+            allocated_utilization=allocated_utilization,
+            estimated_token_capacity=estimated_token_capacity,
+            runtime_token_capacity=runtime_token_capacity,
+            requested_budget_bytes=requested_budget_bytes,
+            allocated_cache_bytes=allocated_cache_bytes,
+            available_memory_bytes=available_memory_bytes,
+            runtime_capped=runtime_capped,
+            approximate_sequence_capacity=approximate_sequence_capacity,
+        )
+
+    def _format_memory_utilization_line(self) -> str:
+        """Return the startup-summary line for memory utilization."""
+        summary = self._memory_utilization_summary
+        if summary is None:
+            return f"Memory util   : requested={self.memory_utilization:.0%}"
+
+        parts = [f"requested={summary.requested_utilization:.0%}"]
+        if summary.allocated_utilization is not None:
+            parts.append(f"allocated~{summary.allocated_utilization:.0%}")
+        if summary.estimated_token_capacity is not None:
+            parts.append(f"est_capacity~{summary.estimated_token_capacity:,} tok")
+        return f"Memory util   : {' | '.join(parts)}"
+
+    def _format_memory_utilization_note(self) -> str | None:
+        """Return an explanatory memory-summary note when the estimate is useful."""
+        summary = self._memory_utilization_summary
+        if summary is None or summary.estimated_token_capacity is None:
+            return None
+
+        runtime_cap = summary.runtime_token_capacity
+        if summary.runtime_capped:
+            return (
+                "Memory note   : runtime cap "
+                f"{runtime_cap:,} tok ({self.max_model_len:,} x {self.max_num_seqs}) "
+                f"is below the ~{summary.estimated_token_capacity:,} tok implied by requested "
+                "memory_utilization, so the effective allocation is reduced to the runtime cap."
+            )
+
+        if summary.approximate_sequence_capacity:
+            return (
+                "Memory note   : requested memory_utilization implies ~"
+                f"{summary.estimated_token_capacity:,} total cache tok, below the runtime cap of "
+                f"{runtime_cap:,}. This is not an exact per-sequence limit: usable sequence "
+                "length depends on concurrent sequence lengths and page rounding."
+            )
+        return None
 
     def _resolve_generation_kwargs(
         self,
@@ -804,6 +999,14 @@ class eSurge:
             A tool parser instance, or ``None`` if no parser is configured.
         """
         return self._tool_parser_class(self.tokenizer) if self._tool_parser_class is not None else None
+
+    def _should_enable_tool_parser_for_request(self, gen_kwargs: dict[str, Any]) -> bool:
+        """Whether a request should instantiate / use a tool parser."""
+        if self._tool_parser_class is None:
+            return False
+        if not self._tool_parser_autodetected:
+            return True
+        return bool(gen_kwargs.get("tools"))
 
     def _new_reasoning_parser(self) -> Any | None:
         """Create a fresh reasoning parser instance for a new request.
@@ -947,6 +1150,10 @@ class eSurge:
         Returns:
             A fully populated :class:`RequestOutput`.
         """
+        previous_text = state.last_emitted_text if incremental else ""
+        previous_reasoning = state.last_emitted_reasoning if incremental else ""
+        previous_tool_calls = state.last_emitted_tool_calls if incremental else None
+        previous_seq = state.last_emitted_update_seq if incremental else 0
         parsed = self._parse_text_output(
             state.decoded_text(self.tokenizer),
             stop=state.stop,
@@ -959,11 +1166,6 @@ class eSurge:
         reasoning_content = parsed["reasoning_content"]
         tool_calls = parsed["tool_calls"]
         finish_reason = parsed["finish_reason"]
-
-        previous_text = state.last_emitted_text if incremental else ""
-        previous_reasoning = state.last_emitted_reasoning if incremental else ""
-        previous_tool_calls = state.last_emitted_tool_calls if incremental else None
-        previous_seq = state.last_emitted_update_seq if incremental else 0
         delta_text = self._delta_text(text, previous_text)
         reasoning_now = reasoning_content or ""
         delta_reasoning = self._delta_text(reasoning_now, previous_reasoning) if reasoning_now else None
@@ -1021,7 +1223,7 @@ class eSurge:
         prompts: list["str"],
         *,
         max_new_tokens: int,
-    ) -> tuple[np.ndarray, np.ndarray, list[list["int"]]]:
+    ) -> tuple[mx.array, mx.array, list[list["int"]]]:
         """Tokenize, truncate, and pad a list of prompt strings.
 
         Args:
@@ -1031,14 +1233,16 @@ class eSurge:
 
         Returns:
             A 3-tuple of ``(input_ids, attention_mask, prompt_token_ids)``
-            where the first two are padded numpy arrays and the third is a
+            where the first two are padded MLX arrays and the third is a
             list of per-prompt unpadded token id lists.
         """
-        enc = self.tokenizer(prompts, return_tensors="np", padding=True)
-        input_ids = enc["input_ids"]
+        enc = self.tokenizer(prompts, padding=True)
+        input_ids = [list(map(int, row_ids)) for row_ids in enc["input_ids"]]
         attention_mask = enc.get("attention_mask")
         if attention_mask is None:
-            attention_mask = np.ones_like(input_ids)
+            attention_mask = [[1] * len(row_ids) for row_ids in input_ids]
+        else:
+            attention_mask = [list(map(int, row_mask)) for row_mask in attention_mask]
 
         pad_token_id = self.tokenizer.pad_token_id
         if pad_token_id is None:
@@ -1057,7 +1261,7 @@ class eSurge:
             allowed_prompt = max(1, self.max_model_len - self.reserve_tokens)
 
         for row_ids, row_mask in zip(input_ids, attention_mask, strict=False):
-            tokens = row_ids[row_mask.astype(bool)].tolist()
+            tokens = [int(token_id) for token_id, keep in zip(row_ids, row_mask, strict=False) if int(keep) != 0]
             if self.auto_truncate_prompt and len(tokens) > allowed_prompt:
                 tokens, _ = truncate_tokens(tokens, allowed_prompt, mode=self.truncate_mode)
             prompt_token_ids.append(tokens)
@@ -1069,8 +1273,8 @@ class eSurge:
             truncated_masks.append([1] * len(tokens) + [0] * pad_len)
 
         return (
-            np.array(truncated_ids, dtype=np.int32),
-            np.array(truncated_masks, dtype=np.int32),
+            mx.array(truncated_ids, dtype=mx.int32),
+            mx.array(truncated_masks, dtype=mx.int32),
             prompt_token_ids,
         )
 
@@ -1092,6 +1296,8 @@ class eSurge:
             "top_k",
             "top_p",
             "do_sample",
+            "presence_penalty",
+            "repetition_penalty",
             "stop",
             "eos_token_id",
             "pad_token_id",
@@ -1108,6 +1314,8 @@ class eSurge:
             top_k=int(gen_kwargs.get("top_k", 0) or 0),
             top_p=float(gen_kwargs.get("top_p", 1.0) or 1.0),
             do_sample=bool(gen_kwargs.get("do_sample", False)),
+            presence_penalty=float(gen_kwargs.get("presence_penalty", 0.0) or 0.0),
+            repetition_penalty=float(gen_kwargs.get("repetition_penalty", 1.0) or 1.0),
             stop=list(gen_kwargs.get("stop")) if gen_kwargs.get("stop") is not None else None,
             eos_token_id=gen_kwargs.get("eos_token_id"),
             pad_token_id=gen_kwargs.get("pad_token_id"),
@@ -1170,9 +1378,10 @@ class eSurge:
         request_sampling_params = self._sampling_params_from_generation_kwargs(gen_kwargs, max_new_tokens=max_new_tokens)
         request_metadata = self._request_metadata_from_generation_kwargs(gen_kwargs)
         request_priority = int(gen_kwargs.get("priority", 0) or 0)
+        enable_tool_parser = self._should_enable_tool_parser_for_request(gen_kwargs)
         for idx, prompt in enumerate(prompts):
             prompt_ids = list(prompt_token_ids[idx])
-            tool_parser_instance = self._new_tool_parser()
+            tool_parser_instance = self._new_tool_parser() if enable_tool_parser else None
             reasoning_parser_instance = self._new_reasoning_parser()
             if reasoning_parser_instance is not None:
                 try:
@@ -1717,7 +1926,7 @@ class eSurge:
         runner: "ModelRunner",
         execution_request: ExecutionRequest,
         step_output: "SchedulerStepOutput",
-    ) -> tuple[Any, np.ndarray]:
+    ) -> tuple[Any, Any]:
         """Run one forward step, optionally dispatching to distributed workers."""
         dispatch = self._dispatch_distributed_step(step_output) if self._distributed_controller is not None else None
         raw_output, logits = runner._forward_step(execution_request)
@@ -1727,15 +1936,20 @@ class eSurge:
     def _sync_sample_token(
         self,
         raw_output: Any,
-        logits: np.ndarray,
+        logits: Any,
         runner: "ModelRunner",
         greedy_sampling: bool,
         sampling_params: SamplingParams | None,
+        request: EngineRequest,
     ) -> int:
         """Sample a single token from logits."""
-        if greedy_sampling:
-            return int(np.argmax(logits[0]))
-        return runner.sample_next_token(logits[0], sampling_params=sampling_params)
+        del raw_output, greedy_sampling
+        return runner.sample_next_token(
+            logits[0],
+            sampling_params=sampling_params,
+            prompt_token_ids=request.prompt_token_ids,
+            generated_token_ids=request.generated_token_ids,
+        )
 
     def _sync_check_stop_reason(
         self,
@@ -1914,7 +2128,7 @@ class eSurge:
                     continue
 
                 sampled_token = self._sync_sample_token(
-                    raw_output, logits, runner, greedy_sampling, request.sampling_params
+                    raw_output, logits, runner, greedy_sampling, request.sampling_params, request
                 )
                 request.append_generated_token(sampled_token)
                 runner.sequence_buffer.append_output_tokens(request_id, [sampled_token])
@@ -1941,7 +2155,7 @@ class eSurge:
                 runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
 
                 sampled_token = self._sync_sample_token(
-                    raw_output, logits, runner, greedy_sampling, request.sampling_params
+                    raw_output, logits, runner, greedy_sampling, request.sampling_params, request
                 )
                 request.append_generated_token(sampled_token)
                 runner.sequence_buffer.append_output_tokens(request_id, [sampled_token])
@@ -2103,7 +2317,7 @@ class eSurge:
                             continue
 
                         sampled_token = self._sync_sample_token(
-                            raw_output, logits, runner, greedy_sampling, request.sampling_params
+                            raw_output, logits, runner, greedy_sampling, request.sampling_params, request
                         )
                     else:
                         if sequence is None or execution_request is None or row_index is None:
@@ -2125,7 +2339,7 @@ class eSurge:
                         request.consume_computed_tokens(1)
                         runner.sequence_buffer.set_num_computed_tokens(request_id, request.num_computed_tokens)
                         sampled_token = self._sync_sample_token(
-                            raw_output, logits, runner, greedy_sampling, request.sampling_params
+                            raw_output, logits, runner, greedy_sampling, request.sampling_params, request
                         )
 
                     if request.is_finished:

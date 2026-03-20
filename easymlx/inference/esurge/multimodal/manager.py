@@ -38,14 +38,15 @@ import io
 import os
 from typing import Any
 
+import mlx.core as mx
 import numpy as np
 from PIL import Image
 
 from .cache import VisionEncoderCache
 from .types import BatchedMultiModalInputs, MultiModalFeature, MultimodalInput
 
-CLIP_IMAGE_MEAN = np.asarray([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-CLIP_IMAGE_STD = np.asarray([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+CLIP_IMAGE_MEAN = mx.array([0.48145466, 0.4578275, 0.40821073], dtype=mx.float32)
+CLIP_IMAGE_STD = mx.array([0.26862954, 0.26130258, 0.27577711], dtype=mx.float32)
 DEFAULT_RESOLUTION_BUCKETS = [(32, 32), (64, 64), (128, 128), (384, 384), (512, 512), (768, 768), (1024, 1024)]
 
 
@@ -190,6 +191,14 @@ class MultimodalManager:
                     for h, w in buckets
                 ]
         return sorted(set(buckets))
+
+    @staticmethod
+    def _to_mx_array(value: Any, *, dtype: Any | None = None) -> mx.array:
+        """Convert *value* to an MLX array, preserving existing MLX arrays."""
+        if isinstance(value, mx.array):
+            return value.astype(dtype) if dtype is not None and value.dtype != dtype else value
+        array = mx.array(value)
+        return array.astype(dtype) if dtype is not None and array.dtype != dtype else array
 
     def resize_to_bucket(self, image: Image.Image) -> Image.Image:
         """Resize an image to the nearest model-aware resolution bucket.
@@ -403,7 +412,7 @@ class MultimodalManager:
         return images, videos
 
     @staticmethod
-    def _normalize_rgb(rgb: np.ndarray) -> np.ndarray:
+    def _normalize_rgb(rgb: Any) -> mx.array:
         """Apply CLIP-style mean/std normalization to an RGB float array.
 
         Args:
@@ -414,20 +423,19 @@ class MultimodalManager:
             Normalized float32 array with CLIP mean subtracted and
             divided by CLIP std.
         """
-        if rgb.dtype != np.float32:
-            rgb = rgb.astype(np.float32)
+        rgb = MultimodalManager._to_mx_array(rgb, dtype=mx.float32)
         rgb = rgb / 255.0
         rgb = (rgb - CLIP_IMAGE_MEAN) / CLIP_IMAGE_STD
         return rgb
 
     def _patchify_spatiotemporal(
         self,
-        frames: np.ndarray,
+        frames: Any,
         *,
         patch_size: int,
         temporal_patch_size: int,
         spatial_merge_size: int = 1,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[mx.array, mx.array]:
         """Decompose a video tensor into flat spatiotemporal patches.
 
         The input is reshaped into non-overlapping 3-D patches along the
@@ -451,6 +459,7 @@ class MultimodalManager:
             ValueError: If *frames* does not have 4 dimensions, is not
                 3-channel, or has non-positive patch sizes.
         """
+        frames = self._to_mx_array(frames, dtype=mx.float32)
         if frames.ndim != 4:
             raise ValueError(f"Expected frames with shape [T,H,W,C], got {frames.shape}.")
         t_total, height, width, channels = frames.shape
@@ -471,7 +480,7 @@ class MultimodalManager:
         h_pad = (-height) % spatial_multiple
         w_pad = (-width) % spatial_multiple
         if t_pad or h_pad or w_pad:
-            frames = np.pad(frames, ((0, t_pad), (0, h_pad), (0, w_pad), (0, 0)), mode="edge")
+            frames = mx.pad(frames, ((0, t_pad), (0, h_pad), (0, w_pad), (0, 0)), mode="edge")
 
         t_padded, h_padded, w_padded, _ = frames.shape
         t_groups = t_padded // temporal_patch_size
@@ -482,17 +491,17 @@ class MultimodalManager:
         patches = patches.transpose(0, 2, 4, 1, 3, 5, 6)
         patches = patches.reshape(t_groups * grid_h * grid_w, temporal_patch_size, patch_size, patch_size, channels)
         patches = patches.transpose(0, 4, 1, 2, 3)
-        flat = patches.reshape(patches.shape[0], -1).astype(np.float32, copy=False)
-        grid_thw = np.asarray([t_groups, grid_h, grid_w], dtype=np.int64)
+        flat = patches.reshape(patches.shape[0], -1).astype(mx.float32)
+        grid_thw = mx.array([t_groups, grid_h, grid_w], dtype=mx.int64)
         return flat, grid_thw
 
     def _pad_flat_patches_for_merge(
         self,
-        pixel_values: np.ndarray,
-        grid_thw: np.ndarray,
+        pixel_values: Any,
+        grid_thw: Any,
         *,
         spatial_merge_size: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[mx.array, mx.array]:
         """Pad flat patch grids so spatial dims are divisible by *spatial_merge_size*.
 
         This ensures that the downstream spatial merge layer receives
@@ -510,21 +519,23 @@ class MultimodalManager:
             A ``(pixel_values, grid_thw)`` tuple, potentially padded.
         """
         spatial_merge_size = int(spatial_merge_size or 1)
+        pixel_values = self._to_mx_array(pixel_values)
+        grid_thw = self._to_mx_array(grid_thw, dtype=mx.int64)
         if spatial_merge_size <= 1 or pixel_values.ndim != 2:
             return pixel_values, grid_thw
-        grid_thw = np.asarray(grid_thw, dtype=np.int64)
         if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
             return pixel_values, grid_thw
 
-        sizes = (grid_thw.prod(axis=1)).astype(int)
+        grid_np = np.asarray(grid_thw, dtype=np.int64)
+        sizes = grid_np.prod(axis=1).astype(int)
         if int(sizes.sum()) != int(pixel_values.shape[0]):
             return pixel_values, grid_thw
 
         patch_dim = int(pixel_values.shape[1])
-        out_chunks: list[np.ndarray] = []
-        out_grid: list[np.ndarray] = []
+        out_chunks: list[mx.array] = []
+        out_grid: list[mx.array] = []
         offset = 0
-        for (t, h, w), n in zip(grid_thw, sizes, strict=False):
+        for (t, h, w), n in zip(grid_np, sizes, strict=False):
             t_i, h_i, w_i = int(t), int(h), int(w)
             n_i = int(n)
             chunk = pixel_values[offset : offset + n_i]
@@ -534,23 +545,23 @@ class MultimodalManager:
             new_w = ((w_i + spatial_merge_size - 1) // spatial_merge_size) * spatial_merge_size
             if new_h == h_i and new_w == w_i:
                 out_chunks.append(chunk)
-                out_grid.append(np.asarray([t_i, h_i, w_i], dtype=np.int64))
+                out_grid.append(mx.array([t_i, h_i, w_i], dtype=mx.int64))
                 continue
 
             try:
                 reshaped = chunk.reshape(t_i, h_i, w_i, patch_dim)
             except Exception:
                 out_chunks.append(chunk)
-                out_grid.append(np.asarray([t_i, h_i, w_i], dtype=np.int64))
+                out_grid.append(mx.array([t_i, h_i, w_i], dtype=mx.int64))
                 continue
 
-            padded = np.pad(reshaped, ((0, 0), (0, new_h - h_i), (0, new_w - w_i), (0, 0)), mode="edge")
+            padded = mx.pad(reshaped, ((0, 0), (0, new_h - h_i), (0, new_w - w_i), (0, 0)), mode="edge")
             out_chunks.append(padded.reshape(t_i * new_h * new_w, patch_dim))
-            out_grid.append(np.asarray([t_i, new_h, new_w], dtype=np.int64))
+            out_grid.append(mx.array([t_i, new_h, new_w], dtype=mx.int64))
 
-        return np.concatenate(out_chunks, axis=0), np.stack(out_grid, axis=0)
+        return mx.concatenate(out_chunks, axis=0), mx.stack(out_grid, axis=0)
 
-    def process_images(self, images: list[Image.Image] | None) -> tuple[np.ndarray | None, np.ndarray | None]:
+    def process_images(self, images: list[Image.Image] | None) -> tuple[mx.array | None, mx.array | None]:
         """Preprocess a list of PIL images into pixel-value tensors.
 
         First attempts to use the configured ``processor``.  If the
@@ -591,12 +602,11 @@ class MultimodalManager:
             if isinstance(processed, dict):
                 pixel_values = processed.get("pixel_values")
                 image_grid_thw = processed.get("image_grid_thw")
-                if isinstance(pixel_values, np.ndarray):
-                    if (
-                        isinstance(image_grid_thw, np.ndarray)
-                        and self._supports_flat_patch_inputs()
-                        and spatial_merge_size > 1
-                    ):
+                if pixel_values is not None:
+                    pixel_values = self._to_mx_array(pixel_values)
+                    if image_grid_thw is not None:
+                        image_grid_thw = self._to_mx_array(image_grid_thw, dtype=mx.int64)
+                    if image_grid_thw is not None and self._supports_flat_patch_inputs() and spatial_merge_size > 1:
                         pixel_values, image_grid_thw = self._pad_flat_patches_for_merge(
                             pixel_values,
                             image_grid_thw,
@@ -613,13 +623,13 @@ class MultimodalManager:
 
         patch_size = int(getattr(vision_cfg, "patch_size", 14) or 14)
         temporal_patch_size = int(getattr(vision_cfg, "temporal_patch_size", 2) or 1)
-        pixel_values_list: list[np.ndarray] = []
-        grids: list[np.ndarray] = []
+        pixel_values_list: list[mx.array] = []
+        grids: list[mx.array] = []
 
         for img in bucketed:
-            rgb = np.asarray(img.convert("RGB"), dtype=np.float32)
+            rgb = mx.array(np.asarray(img.convert("RGB"), dtype=np.float32))
             rgb = self._normalize_rgb(rgb)
-            frames = np.repeat(rgb[None, ...], temporal_patch_size, axis=0)
+            frames = mx.repeat(rgb[None, ...], temporal_patch_size, axis=0)
             flat, grid = self._patchify_spatiotemporal(
                 frames,
                 patch_size=patch_size,
@@ -629,15 +639,15 @@ class MultimodalManager:
             pixel_values_list.append(flat)
             grids.append(grid[None, :])
 
-        pixel_values = np.concatenate(pixel_values_list, axis=0) if pixel_values_list else None
-        image_grid_thw = np.concatenate(grids, axis=0).astype(np.int64) if grids else None
+        pixel_values = mx.concatenate(pixel_values_list, axis=0) if pixel_values_list else None
+        image_grid_thw = mx.concatenate(grids, axis=0).astype(mx.int64) if grids else None
         if pixel_values is not None and image_grid_thw is not None and spatial_merge_size > 1:
             pixel_values, image_grid_thw = self._pad_flat_patches_for_merge(
                 pixel_values, image_grid_thw, spatial_merge_size=spatial_merge_size
             )
         return pixel_values, image_grid_thw
 
-    def process_videos(self, videos: list[np.ndarray] | None) -> tuple[np.ndarray | None, np.ndarray | None]:
+    def process_videos(self, videos: list[np.ndarray] | None) -> tuple[mx.array | None, mx.array | None]:
         """Preprocess a list of video arrays into pixel-value tensors.
 
         Mirrors :meth:`process_images` but operates on ``(T, H, W, C)``
@@ -682,12 +692,11 @@ class MultimodalManager:
             if isinstance(processed, dict):
                 pixel_values_videos = processed.get("pixel_values_videos")
                 video_grid_thw = processed.get("video_grid_thw")
-                if isinstance(pixel_values_videos, np.ndarray):
-                    if (
-                        isinstance(video_grid_thw, np.ndarray)
-                        and self._supports_flat_patch_inputs()
-                        and spatial_merge_size > 1
-                    ):
+                if pixel_values_videos is not None:
+                    pixel_values_videos = self._to_mx_array(pixel_values_videos)
+                    if video_grid_thw is not None:
+                        video_grid_thw = self._to_mx_array(video_grid_thw, dtype=mx.int64)
+                    if video_grid_thw is not None and self._supports_flat_patch_inputs() and spatial_merge_size > 1:
                         pixel_values_videos, video_grid_thw = self._pad_flat_patches_for_merge(
                             pixel_values_videos,
                             video_grid_thw,
@@ -704,8 +713,8 @@ class MultimodalManager:
 
         patch_size = int(getattr(vision_cfg, "patch_size", 14) or 14)
         temporal_patch_size = int(getattr(vision_cfg, "temporal_patch_size", 2) or 1)
-        pixel_values_list: list[np.ndarray] = []
-        grids: list[np.ndarray] = []
+        pixel_values_list: list[mx.array] = []
+        grids: list[mx.array] = []
 
         for video in normalized_videos:
             _, height, width, _ = video.shape
@@ -723,7 +732,7 @@ class MultimodalManager:
             else:
                 resized = video
 
-            normalized = self._normalize_rgb(resized.astype(np.float32, copy=False))
+            normalized = self._normalize_rgb(mx.array(resized.astype(np.float32, copy=False)))
             flat, grid = self._patchify_spatiotemporal(
                 normalized,
                 patch_size=patch_size,
@@ -733,8 +742,8 @@ class MultimodalManager:
             pixel_values_list.append(flat)
             grids.append(grid[None, :])
 
-        pixel_values_videos = np.concatenate(pixel_values_list, axis=0) if pixel_values_list else None
-        video_grid_thw = np.concatenate(grids, axis=0).astype(np.int64) if grids else None
+        pixel_values_videos = mx.concatenate(pixel_values_list, axis=0) if pixel_values_list else None
+        video_grid_thw = mx.concatenate(grids, axis=0).astype(mx.int64) if grids else None
         if pixel_values_videos is not None and video_grid_thw is not None and spatial_merge_size > 1:
             pixel_values_videos, video_grid_thw = self._pad_flat_patches_for_merge(
                 pixel_values_videos, video_grid_thw, spatial_merge_size=spatial_merge_size
@@ -786,7 +795,7 @@ class MultimodalManager:
         features: list[MultiModalFeature] = []
         patch_offsets: list["int"] | None = None
         if (
-            isinstance(image_grid_thw, np.ndarray)
+            image_grid_thw is not None
             and image_grid_thw.ndim == 2
             and image_grid_thw.shape[1] == 3
             and pixel_values.ndim == 2
@@ -815,6 +824,7 @@ class MultimodalManager:
                     pixel_values=single_pv,
                     grid_thw=single_grid,
                     request_idx=request_idx,
+                    mm_hash="" if self.cache is None else None,
                 )
             )
 
@@ -849,7 +859,7 @@ class MultimodalManager:
         features: list[MultiModalFeature] = []
         patch_offsets: list["int"] | None = None
         if (
-            isinstance(video_grid_thw, np.ndarray)
+            video_grid_thw is not None
             and video_grid_thw.ndim == 2
             and video_grid_thw.shape[1] == 3
             and pixel_values_videos.ndim == 2
@@ -878,6 +888,7 @@ class MultimodalManager:
                     pixel_values=single_pv,
                     grid_thw=single_grid,
                     request_idx=request_idx,
+                    mm_hash="" if self.cache is None else None,
                 )
             )
 

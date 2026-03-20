@@ -26,6 +26,8 @@ import typing as tp
 import mlx.nn as nn
 
 from .base_config import EasyMLXBaseConfig
+from .factory import TaskType
+from .flops import estimate_module_forward_flops
 from .mixins.bridge import EasyBridgeMixin
 from .mixins.generation import EasyGenerationMixin
 from .mixins.operation_cache import OperationCacheMixin
@@ -86,3 +88,68 @@ class EasyMLXBaseModule(nn.Module, EasyBridgeMixin, EasyGenerationMixin, Operati
                 subclass.
         """
         raise NotImplementedError("Subclasses must implement `__call__`.")
+
+    def get_flops(
+        self,
+        batch_size: int,
+        sequence_length: int,
+        *,
+        use_vision: bool = False,
+        use_audio: bool = False,
+        include_lm_head: bool | None = None,
+        image_size: int | tuple[int, int] | None = None,
+        vision_batch_size: int | None = None,
+        vision_height: int | None = None,
+        vision_width: int | None = None,
+        vision_frames: int | None = None,
+        vision_sequence_length: int | None = None,
+        audio_sequence_length: int | None = None,
+    ) -> int:
+        """Estimate FLOPs for a single forward pass.
+
+        Args:
+            batch_size: Text batch size.
+            sequence_length: Text sequence length processed by the model.
+            use_vision: Whether to include the vision encoder path.
+            use_audio: Whether to include the audio path.
+            include_lm_head: Whether to include the output vocabulary
+                projection. ``None`` infers the value from the module.
+            image_size: Convenience alias for square or ``(height, width)``
+                vision inputs.
+            vision_batch_size: Number of images/videos processed by the
+                vision tower. Defaults to ``batch_size``.
+            vision_height: Vision input height.
+            vision_width: Vision input width.
+            vision_frames: Number of frames per vision item.
+            vision_sequence_length: Exact raw vision token count per item,
+                before model-specific merging/projectors.
+            audio_sequence_length: Reserved for future audio support.
+
+        Returns:
+            Integer FLOPs for one forward pass.
+        """
+        supported_tasks = {
+            TaskType.CAUSAL_LM.value,
+            TaskType.BASE_MODULE.value,
+        }
+        task_type = getattr(self, "_model_task", None)
+        if isinstance(task_type, str) and task_type not in supported_tasks:
+            raise NotImplementedError(
+                f"FLOPs estimation is not supported for task type {task_type!r}; "
+                "supported task types are base modules and causal LMs."
+            )
+        return estimate_module_forward_flops(
+            self,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            use_vision=use_vision,
+            use_audio=use_audio,
+            include_lm_head=include_lm_head,
+            image_size=image_size,
+            vision_batch_size=vision_batch_size,
+            vision_height=vision_height,
+            vision_width=vision_width,
+            vision_frames=vision_frames,
+            vision_sequence_length=vision_sequence_length,
+            audio_sequence_length=audio_sequence_length,
+        )

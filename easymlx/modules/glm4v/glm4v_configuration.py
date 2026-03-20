@@ -75,6 +75,31 @@ class Glm4VTextConfig(EasyMLXBaseConfig):
         use_cache: bool = True,
         **kwargs,
     ):
+        """Initializes the GLM-4V text configuration.
+
+        Args:
+            vocab_size: Vocabulary size. Defaults to 151552.
+            hidden_size: Hidden state dimensionality. Defaults to 4096.
+            eos_token_id: End-of-sequence token IDs. Defaults to
+                ``[151329, 151336, 151338, 151348]``.
+            intermediate_size: MLP intermediate size. Defaults to 13696.
+            max_position_embeddings: Maximum sequence length. Defaults to 65536.
+            num_attention_heads: Number of attention heads. Defaults to 32.
+            num_hidden_layers: Number of decoder layers. Defaults to 40.
+            num_key_value_heads: KV heads for GQA. Defaults to 2.
+            rms_norm_eps: RMSNorm epsilon. Defaults to 1e-5.
+            rope_theta: RoPE base frequency. Defaults to 10000.0.
+            attention_bias: Include attention bias. Defaults to True.
+            attention_dropout: Attention dropout rate. Defaults to 0.0.
+            hidden_act: Activation function. Defaults to ``"silu"``.
+            initializer_range: Weight initialization range. Defaults to 0.02.
+            partial_rotary_factor: Fraction of head dim for RoPE. Defaults to 0.5.
+            rope_scaling: RoPE scaling config. Defaults to M-RoPE with
+                sections ``[8, 12, 12]``.
+            pad_token_id: Padding token ID. Defaults to 151329.
+            use_cache: Enable KV caching. Defaults to True.
+            **kwargs: Additional keyword arguments for the base class.
+        """
         super().__init__(**kwargs)
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -142,6 +167,27 @@ class Glm4VVisionConfig(EasyMLXBaseConfig):
         temporal_patch_size: int = 2,
         **kwargs,
     ):
+        """Initializes the GLM-4V vision configuration.
+
+        Args:
+            depth: Number of vision transformer blocks. Defaults to 24.
+            hidden_size: Vision encoder hidden dim. Defaults to 1536.
+            intermediate_size: Vision MLP intermediate dim. Defaults to 13696.
+            num_heads: Number of vision attention heads. Defaults to 12.
+            patch_size: Spatial patch size. Defaults to 14.
+            window_size: Window size for windowed attention. Defaults to 112.
+            image_size: Default input image size. Defaults to 336.
+            in_channels: Number of input channels. Defaults to 3.
+            rms_norm_eps: RMSNorm epsilon. Defaults to 1e-5.
+            attention_bias: Include attention bias. Defaults to False.
+            attention_dropout: Attention dropout rate. Defaults to 0.0.
+            hidden_act: Activation function. Defaults to ``"silu"``.
+            initializer_range: Weight initialization range. Defaults to 0.02.
+            out_hidden_size: Output hidden dim after merging. Defaults to 4096.
+            spatial_merge_size: Spatial downsampling factor. Defaults to 2.
+            temporal_patch_size: Temporal patch size. Defaults to 2.
+            **kwargs: Additional keyword arguments for the base class.
+        """
         super().__init__(**kwargs)
         self.depth = depth
         self.hidden_size = hidden_size
@@ -210,6 +256,30 @@ class Glm4VModelConfig(EasyMLXBaseConfig):
         eos_token_id: list[int] | None = None,
         **kwargs,
     ):
+        """Initializes the composite GLM-4V model configuration.
+
+        Args:
+            text_config: Text sub-configuration. Accepts a ``Glm4VTextConfig``
+                instance, dictionary, or None.
+            vision_config: Vision sub-configuration. Accepts a
+                ``Glm4VVisionConfig`` instance, dictionary, or None.
+            vocab_size: Vocabulary size. Defaults to 257152.
+            ignore_index: Loss ignore index. Defaults to -100.
+            image_token_index: Image token index. Defaults to 151363.
+            image_token_id: Image token ID. Defaults to 151363.
+            video_token_index: Video token index. Defaults to 151364.
+            video_token_id: Video token ID. Defaults to 151364.
+            vision_start_token_id: Vision start token. Defaults to 151339.
+            vision_end_token_id: Vision end token. Defaults to 151340.
+            image_start_token_id: Image start token. Defaults to None (auto).
+            image_end_token_id: Image end token. Defaults to None (auto).
+            video_start_token_id: Video start token. Defaults to None (auto).
+            video_end_token_id: Video end token. Defaults to None (auto).
+            hidden_size: Hidden state dim. Defaults to 2048.
+            pad_token_id: Padding token ID. Defaults to 0.
+            eos_token_id: EOS token ID(s). Defaults to text config values.
+            **kwargs: Additional keyword arguments for the base class.
+        """
         super().__init__(**kwargs)
         if text_config is not None and isinstance(text_config, dict):
             text_config = Glm4VTextConfig(**text_config)

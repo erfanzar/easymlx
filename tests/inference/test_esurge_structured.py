@@ -21,6 +21,7 @@ import time
 
 import mlx.core as mx
 import numpy as np
+import pytest
 from mlx.utils import tree_flatten
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -28,6 +29,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
 from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
+from easymlx.inference.esurge.esurge_engine import _MemoryUtilizationSummary
 from easymlx.inference.esurge.runners.model_runner import ModelRunner
 from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 
@@ -250,6 +252,91 @@ def test_model_runner_exposes_decode_step_helper():
     np.testing.assert_array_equal(np.asarray(raw_logits).argmax(axis=-1), np.array([5]))
 
 
+def test_esurge_logs_reduced_memory_utilization_when_runtime_cap_is_lower(monkeypatch):
+    import easymlx.inference.esurge.esurge_engine as esurge_engine_module
+
+    messages: list[str] = []
+    monkeypatch.setattr(
+        esurge_engine_module.logger,
+        "info",
+        lambda msg, *args: messages.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        esurge_engine_module.eSurge,
+        "_build_memory_utilization_summary",
+        lambda self, _kv_caches: _MemoryUtilizationSummary(
+            requested_utilization=0.5,
+            allocated_utilization=0.2352941176,
+            estimated_token_capacity=17_000,
+            runtime_token_capacity=8_000,
+            requested_budget_bytes=17_000,
+            allocated_cache_bytes=8_000,
+            available_memory_bytes=34_000,
+            runtime_capped=True,
+        ),
+    )
+
+    engine = eSurge(
+        DummyModel([5]),
+        tokenizer=_build_tokenizer(),
+        max_model_len=8_000,
+        max_num_seqs=1,
+        reserve_tokens=2,
+    )
+    try:
+        summary = "\n".join(messages)
+        assert "Memory util   : requested=50% | allocated~24% | est_capacity~17,000 tok" in summary
+        assert "runtime cap 8,000 tok (8,000 x 1)" in summary
+        assert "reduced to the runtime cap" in summary
+        assert engine.effective_memory_utilization == pytest.approx(0.2352941176)
+        assert engine.estimated_memory_token_capacity == 17_000
+    finally:
+        engine.close()
+
+
+def test_esurge_logs_approximate_sequence_capacity_when_memory_target_is_tighter(monkeypatch):
+    import easymlx.inference.esurge.esurge_engine as esurge_engine_module
+
+    messages: list[str] = []
+    monkeypatch.setattr(
+        esurge_engine_module.logger,
+        "info",
+        lambda msg, *args: messages.append(msg % args if args else msg),
+    )
+    monkeypatch.setattr(
+        esurge_engine_module.eSurge,
+        "_build_memory_utilization_summary",
+        lambda self, _kv_caches: _MemoryUtilizationSummary(
+            requested_utilization=0.5,
+            allocated_utilization=0.67,
+            estimated_token_capacity=6_000,
+            runtime_token_capacity=8_000,
+            requested_budget_bytes=6_000,
+            allocated_cache_bytes=8_000,
+            available_memory_bytes=12_000,
+            approximate_sequence_capacity=True,
+        ),
+    )
+
+    engine = eSurge(
+        DummyModel([5]),
+        tokenizer=_build_tokenizer(),
+        max_model_len=4_000,
+        max_num_seqs=2,
+        reserve_tokens=2,
+    )
+    try:
+        summary = "\n".join(messages)
+        assert "Memory util   : requested=50% | allocated~67% | est_capacity~6,000 tok" in summary
+        assert "below the runtime cap of 8,000" in summary
+        assert "not an exact per-sequence limit" in summary
+        assert "depends on concurrent sequence lengths and page rounding" in summary
+        assert engine.effective_memory_utilization == pytest.approx(0.67)
+        assert engine.estimated_memory_token_capacity == 6_000
+    finally:
+        engine.close()
+
+
 def test_esurge_extracts_tool_calls():
     tokenizer = _build_tokenizer()
     engine = eSurge(
@@ -373,6 +460,33 @@ def test_esurge_sync_stream_is_incremental() -> None:
     assert len(outputs) >= 1
     assert outputs[0].delta_text.strip() == "answer"
     assert outputs[-1].finished is True
+
+
+def test_esurge_autodetected_tool_parser_is_disabled_without_tools() -> None:
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([4, 5]),
+        tokenizer=tokenizer,
+        config=_sync_test_config(),
+        reserve_tokens=2,
+        reasoning_parser="deepseek_r1",
+    )
+
+    try:
+        gen_kwargs = engine._resolve_generation_kwargs(SamplingParams(max_tokens=2))
+        gen_kwargs["max_new_tokens"] = 2
+        states = engine._build_requests(["hello"], gen_kwargs, max_new_tokens=2)
+        outputs = list(engine.stream("hello", SamplingParams(max_tokens=2)))
+    finally:
+        engine.close()
+
+    assert engine.tool_parser_name == "hermes"
+    assert states[0].tool_parser_instance is None
+    assert len(outputs) == 2
+    assert outputs[0].delta_reasoning_content == "plan"
+    assert outputs[0].delta_text == ""
+    assert outputs[1].delta_text == "answer"
+    assert outputs[-1].reasoning_content == "plan"
 
 
 def test_esurge_sync_stream_abort_request() -> None:
