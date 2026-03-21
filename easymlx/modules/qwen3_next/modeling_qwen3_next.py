@@ -151,12 +151,11 @@ class Qwen3NextRMSNorm(nn.Module):
         Returns:
             Normalized tensor of the same shape and original dtype.
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(mx.float32)
         variance = mx.mean(hidden_states**2, axis=-1, keepdims=True)
         hidden_states = hidden_states / mx.sqrt(variance + self.eps)
-        hidden_states = hidden_states * (1.0 + self.weight)
-        return hidden_states.astype(input_dtype)
+        scale = self.weight.astype(hidden_states.dtype)
+        hidden_states = hidden_states * (scale + mx.array(1.0, dtype=hidden_states.dtype))
+        return hidden_states
 
 
 class Qwen3NextRMSNormGated(nn.Module):
@@ -191,13 +190,11 @@ class Qwen3NextRMSNormGated(nn.Module):
         Returns:
             Gated normalized tensor of the same shape and original dtype.
         """
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.astype(mx.float32)
         variance = mx.mean(hidden_states**2, axis=-1, keepdims=True)
         hidden_states = hidden_states / mx.sqrt(variance + self.eps)
         hidden_states = hidden_states * self.weight.astype(hidden_states.dtype)
-        hidden_states = hidden_states * nn.silu(gate.astype(mx.float32))
-        return hidden_states.astype(input_dtype)
+        hidden_states = hidden_states * nn.silu(gate.astype(hidden_states.dtype))
+        return hidden_states
 
 
 class _PartialRoPE(nn.Module):
@@ -391,9 +388,7 @@ def _manual_depthwise_conv(conv_state: mx.array, kernel: mx.array) -> mx.array:
     Returns:
         Convolution output of shape ``(batch, channels)`` after SiLU activation.
     """
-    state = conv_state if conv_state.dtype == mx.float32 else conv_state.astype(mx.float32)
-    kernel = kernel if kernel.dtype == mx.float32 else kernel.astype(mx.float32)
-    return nn.silu(mx.sum(state * kernel[None, :, :], axis=-1))
+    return nn.silu(mx.sum(conv_state * kernel[None, :, :], axis=-1))
 
 
 class Qwen3NextLinearAttention(nn.Module):
@@ -465,28 +460,55 @@ class Qwen3NextLinearAttention(nn.Module):
         self._decode_dt_bias: mx.array | None = None
         self._decode_conv_kernel: mx.array | None = None
 
+    @staticmethod
+    def _compute_decay_base(decay_log: mx.array) -> mx.array:
+        """Return the recurrent decay base in fp32 without widening stored weights."""
+        decay_base = -mx.exp(decay_log)
+        if decay_base.dtype != mx.float32:
+            decay_base = decay_base.astype(mx.float32)
+        return decay_base
+
+    @staticmethod
+    def _compute_log_decay(alpha_raw: mx.array, dt_bias: mx.array, decay_base: mx.array) -> mx.array:
+        """Compute log-space decay from native-dtype activations and fp32 decay coefficients."""
+        if dt_bias.dtype != alpha_raw.dtype:
+            dt_bias = dt_bias.astype(alpha_raw.dtype)
+        alpha_biased = alpha_raw + dt_bias
+        if alpha_biased.dtype != mx.float32:
+            alpha_biased = alpha_biased.astype(mx.float32)
+        return decay_base * nn.softplus(alpha_biased)
+
     def _refresh_decode_cache(self) -> None:
         """Refresh decode-only tensors that stay constant within a generation.
 
-        Pre-computes the decay base, dt bias, and convolution kernel in
-        float32 so that the decode path avoids redundant casts per step.
+        Pre-computes the derived fp32 decay base while keeping the learnable
+        dt bias and convolution kernel in the decode activation dtype so the
+        single-step convolution does not upcast cached activations.
         """
-        self._decode_decay_base = -mx.exp(self.A_log.astype(mx.float32))
-        self._decode_dt_bias = self.dt_bias.astype(mx.float32)
+        activation_dtype = _resolve_module_activation_dtype(self.in_proj_qkv, mx.float16)
+        alpha_dtype = _resolve_module_activation_dtype(self.in_proj_a, activation_dtype)
+
+        self._decode_decay_base = self._compute_decay_base(self.A_log)
+        self._decode_dt_bias = self.dt_bias
+        if self._decode_dt_bias.dtype != alpha_dtype:
+            self._decode_dt_bias = self._decode_dt_bias.astype(alpha_dtype)
         if self.conv1d is None:
             self._decode_conv_kernel = self._decode_identity_conv_kernel
+            if self._decode_conv_kernel.dtype != activation_dtype:
+                self._decode_conv_kernel = self._decode_conv_kernel.astype(activation_dtype)
             return
         kernel = self.conv1d.weight.squeeze(-1)
-        if kernel.dtype != mx.float32:
-            kernel = kernel.astype(mx.float32)
+        if kernel.dtype != activation_dtype:
+            kernel = kernel.astype(activation_dtype)
         self._decode_conv_kernel = kernel
 
     def _ensure_decode_cache(self) -> tuple[mx.array, mx.array, mx.array]:
         """Return cached decode invariants, refreshing them if needed.
 
         Returns:
-            A tuple of ``(decay_base, dt_bias, conv_kernel)`` arrays in
-            float32, ready for single-step decode computation.
+            A tuple of ``(decay_base, dt_bias, conv_kernel)`` arrays where
+            ``decay_base`` is fp32 and the cached bias/kernel stay in the
+            decode activation dtype for single-step convolution.
         """
         if self._decode_decay_base is None or self._decode_dt_bias is None or self._decode_conv_kernel is None:
             self._refresh_decode_cache()
@@ -559,14 +581,16 @@ class Qwen3NextLinearAttention(nn.Module):
 
         if is_decode and self._conv_state is not None:
             decode_decay_base, decode_dt_bias, decode_conv_kernel = self._ensure_decode_cache()
-            alpha_biased = alpha_raw.astype(mx.float32) + decode_dt_bias
-            decay = decode_decay_base * nn.softplus(alpha_biased)
+            decay = self._compute_log_decay(alpha_raw, decode_dt_bias, decode_decay_base)
             conv_x = conv_input[:, 0, :]
             self._conv_state = _shift_conv_state_left(self._conv_state, conv_x)
             conv_out = _manual_depthwise_conv(self._conv_state, decode_conv_kernel)[:, None, :]
         elif self.conv1d is not None:
-            alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
-            decay = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(alpha_biased)
+            decay = self._compute_log_decay(
+                alpha_raw,
+                self.dt_bias,
+                self._compute_decay_base(self.A_log),
+            )
             padded = mx.pad(conv_input, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
             conv_out = nn.silu(self.conv1d(padded))
             if seq_len >= self.d_conv:
@@ -584,8 +608,11 @@ class Qwen3NextLinearAttention(nn.Module):
                     axis=-1,
                 )
         else:
-            alpha_biased = alpha_raw.astype(mx.float32) + self.dt_bias.astype(mx.float32)
-            decay = -mx.exp(self.A_log.astype(mx.float32)) * nn.softplus(alpha_biased)
+            decay = self._compute_log_decay(
+                alpha_raw,
+                self.dt_bias,
+                self._compute_decay_base(self.A_log),
+            )
             conv_out = conv_input
 
         if conv_out.dtype != mx.float32:

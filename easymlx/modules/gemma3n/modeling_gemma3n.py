@@ -460,6 +460,27 @@ class Gemma3NAltUp(nn.Module):
         self.modality_router = nn.Linear(config.hidden_size, config.altup_num_inputs, bias=False)
         self.router_norm = nn.RMSNorm(dims=config.hidden_size, eps=config.rms_norm_eps)
 
+    @staticmethod
+    def _project_coefficients(layer: nn.Linear, x: mx.array, *, clip: float | None) -> mx.array:
+        """Project coefficient inputs without mutating the layer weights.
+
+        The original implementation permanently upcast the coefficient
+        weights to float32 inside the forward path. That widens the
+        resident parameter tensors and slows subsequent matmuls. Keep the
+        layer weights in their native dtype, cast the inputs to match, and
+        only materialize a clipped view when requested.
+        """
+        weight = layer.weight
+        if x.dtype != weight.dtype:
+            x = x.astype(weight.dtype)
+        if clip is not None:
+            weight = mx.clip(weight, -clip, clip)
+        output = x @ weight.T
+        bias = getattr(layer, "bias", None)
+        if bias is not None:
+            output = output + bias
+        return output
+
     def compute_router_modalities(self, x: mx.array) -> mx.array:
         """Compute modality routing weights via tanh-bounded linear.
 
@@ -470,7 +491,12 @@ class Gemma3NAltUp(nn.Module):
             Modality weights of shape ``[..., altup_num_inputs]``.
         """
         router_inputs = self.router_norm(x) * (self.config.hidden_size**-1.0)
-        routed = self.modality_router(router_inputs).astype(mx.float32)
+        router_dtype = self.modality_router.weight.dtype
+        if router_inputs.dtype != router_dtype:
+            router_inputs = router_inputs.astype(router_dtype)
+        routed = self.modality_router(router_inputs)
+        if routed.dtype != mx.float32:
+            routed = routed.astype(mx.float32)
         return mx.tanh(routed)
 
     def predict(self, x: mx.array) -> mx.array:
@@ -488,15 +514,12 @@ class Gemma3NAltUp(nn.Module):
             Predictions of the same shape as ``x``.
         """
         modalities = self.compute_router_modalities(x[self.config.altup_active_idx])
-        self.prediction_coefs.weight = self.prediction_coefs.weight.astype(mx.float32)
-        if self.config.altup_coef_clip is not None:
-            self.prediction_coefs.weight = mx.clip(
-                self.prediction_coefs.weight,
-                -self.config.altup_coef_clip,
-                self.config.altup_coef_clip,
-            )
         all_coefs = (
-            self.prediction_coefs(modalities)
+            self._project_coefficients(
+                self.prediction_coefs,
+                modalities,
+                clip=self.config.altup_coef_clip,
+            ).astype(mx.float32)
             .reshape(
                 *modalities.shape[:-1],
                 self.config.altup_num_inputs,
@@ -528,14 +551,11 @@ class Gemma3NAltUp(nn.Module):
             Corrected predictions of the same shape as ``predictions``.
         """
         modalities = self.compute_router_modalities(activated)
-        self.correction_coefs.weight = self.correction_coefs.weight.astype(mx.float32)
-        if self.config.altup_coef_clip is not None:
-            self.correction_coefs.weight = mx.clip(
-                self.correction_coefs.weight,
-                -self.config.altup_coef_clip,
-                self.config.altup_coef_clip,
-            )
-        all_coefs = self.correction_coefs(modalities) + 1.0
+        all_coefs = self._project_coefficients(
+            self.correction_coefs,
+            modalities,
+            clip=self.config.altup_coef_clip,
+        ).astype(mx.float32) + 1.0
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
         all_coefs = all_coefs.moveaxis(2, 0)

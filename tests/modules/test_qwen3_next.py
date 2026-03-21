@@ -106,6 +106,49 @@ class TestQwen3Next:
         assert mx.issubdtype(output.dtype, mx.floating)
         assert output.shape == hidden_states.shape
 
+    def test_linear_attention_decode_cache_keeps_native_param_dtypes(self):
+        """Decode cache should not widen learned tensors to fp32 outside recurrent math."""
+        config = Qwen3NextConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            max_position_embeddings=128,
+            head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+        )
+        attn = Qwen3NextLinearAttention(config)
+        attn.in_proj_qkv.weight = attn.in_proj_qkv.weight.astype(mx.float16)
+        attn.in_proj_a.weight = attn.in_proj_a.weight.astype(mx.float16)
+        attn.dt_bias = attn.dt_bias.astype(mx.float16)
+        attn.A_log = attn.A_log.astype(mx.float16)
+        if attn.conv1d is not None:
+            attn.conv1d.weight = attn.conv1d.weight.astype(mx.float16)
+
+        attn.reset_state(batch_size=1)
+
+        assert attn._conv_state is not None
+        assert attn._decode_dt_bias is not None
+        assert attn._decode_conv_kernel is not None
+        assert attn._decode_decay_base is not None
+        assert attn._conv_state.dtype == mx.float16
+        assert attn._decode_dt_bias.dtype == mx.float16
+        assert attn._decode_conv_kernel.dtype == mx.float16
+        assert attn._decode_decay_base.dtype == mx.float32
+
+        hidden_states = mx.array(np.random.default_rng(0).standard_normal((1, 1, config.hidden_size)).astype(np.float16))
+        output = attn(hidden_states)
+        mx.eval(output, attn._conv_state)
+
+        assert attn._conv_state.dtype == mx.float16
+        assert mx.issubdtype(output.dtype, mx.floating)
+        assert output.shape == hidden_states.shape
+
     def test_linear_attention_decode_uses_step_decode(self):
         """Single-token decode should bypass the generic GDR wrapper path."""
         config = Qwen3NextConfig(

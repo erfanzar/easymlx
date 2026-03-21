@@ -188,8 +188,8 @@ class MiniMaxSparseMoeBlock(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, orig_shape[-1])
 
-        gates = self.gate(hidden_states.astype(mx.float32))
-        scores = mx.sigmoid(gates)
+        gates = self.gate(hidden_states)
+        scores = mx.sigmoid(gates.astype(mx.float32))
         orig_scores = scores
         scores = scores + self.e_score_correction_bias
 
