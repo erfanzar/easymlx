@@ -57,6 +57,18 @@ from .utils import (
 )
 
 logger = get_logger("eSurge")
+_REPLACEMENT_CHARACTER = "\ufffd"
+
+
+def _strip_unstable_replacement_suffix(text: str) -> str:
+    """Drop unresolved trailing replacement characters from decoded text.
+
+    Fast tokenizers can emit ``U+FFFD`` while a multi-byte byte-fallback
+    sequence is still incomplete. Streaming those transient markers makes
+    later decodes stop sharing the previous emitted prefix, which in turn
+    causes duplicated output when consumers append deltas.
+    """
+    return text.rstrip(_REPLACEMENT_CHARACTER)
 
 
 class DistributedControllerProtocol(Protocol):
@@ -266,16 +278,25 @@ class _RuntimeRequestState:
             return time.time() - self.created_at
         return self.request.finished_at - self.created_at
 
-    def decoded_text(self, tokenizer: PreTrainedTokenizerBase) -> str:
+    def decoded_text(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        stream_safe: bool = False,
+    ) -> str:
         """Decode the generated token ids into a string.
 
         Args:
             tokenizer: The tokenizer used for decoding.
+            stream_safe: Whether to drop trailing transient replacement
+                characters that can appear while a byte-fallback sequence
+                is still incomplete.
 
         Returns:
             The decoded text with special tokens removed.
         """
-        return tokenizer.decode(self.request.generated_token_ids, skip_special_tokens=True)
+        text = tokenizer.decode(self.request.generated_token_ids, skip_special_tokens=True)
+        return _strip_unstable_replacement_suffix(text) if stream_safe else text
 
     def note_generated_tokens(self, token_ids: list["int"]) -> None:
         """Record that new tokens have been generated.
@@ -1155,7 +1176,7 @@ class eSurge:
         previous_tool_calls = state.last_emitted_tool_calls if incremental else None
         previous_seq = state.last_emitted_update_seq if incremental else 0
         parsed = self._parse_text_output(
-            state.decoded_text(self.tokenizer),
+            state.decoded_text(self.tokenizer, stream_safe=incremental),
             stop=state.stop,
             finish_reason=state.request.finished_reason,
             gen_kwargs=state.gen_kwargs,
@@ -1578,7 +1599,7 @@ class eSurge:
 
         tail_size = min(total_generated, 64)
         tail_ids = list(state.generated_token_ids[-tail_size:]) + [int(t) for t in sampled_token_ids]
-        tail_text = self.tokenizer.decode(tail_ids, skip_special_tokens=True)
+        tail_text = _strip_unstable_replacement_suffix(self.tokenizer.decode(tail_ids, skip_special_tokens=True))
 
         if has_stop_strings:
             for stop_str in state.stop:
@@ -1587,7 +1608,9 @@ class eSurge:
 
         if has_tool_parser:
             candidate_generated = list(state.generated_token_ids) + [int(t) for t in sampled_token_ids]
-            raw_text = self.tokenizer.decode(candidate_generated, skip_special_tokens=True)
+            raw_text = _strip_unstable_replacement_suffix(
+                self.tokenizer.decode(candidate_generated, skip_special_tokens=True)
+            )
             parsed = self._parse_text_output(
                 raw_text,
                 stop=state.stop,
@@ -1966,7 +1989,9 @@ class eSurge:
         if len(request.generated_token_ids) >= request.max_new_tokens:
             return FinishReason.LENGTH
         if state.stop:
-            tail_text = self.tokenizer.decode(request.generated_token_ids[-64:], skip_special_tokens=True)
+            tail_text = _strip_unstable_replacement_suffix(
+                self.tokenizer.decode(request.generated_token_ids[-64:], skip_special_tokens=True)
+            )
             for stop_str in state.stop:
                 if stop_str in tail_text:
                     return FinishReason.STOP
@@ -2221,7 +2246,7 @@ class eSurge:
             if state.tool_parser_instance is None:
                 return None
             parsed = self._parse_text_output(
-                state.decoded_text(self.tokenizer),
+                state.decoded_text(self.tokenizer, stream_safe=True),
                 stop=state.stop,
                 finish_reason=None,
                 gen_kwargs=state.gen_kwargs,

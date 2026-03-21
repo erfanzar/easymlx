@@ -109,6 +109,115 @@ def _build_tokenizer():
     )
 
 
+class PlannedPagedModel:
+    """Minimal paged model that emits a fixed token progression."""
+
+    vocab_size = 8
+
+    def init_paged_cache(self, *, num_seqs: int, max_seq_len: int = 16, page_size: int = 16, **_kwargs):
+        return [
+            PageCacheView.allocate(
+                num_seqs=num_seqs,
+                max_seq_len=max_seq_len,
+                num_kv_heads=1,
+                head_dim=4,
+                block_size=page_size,
+                dtype=mx.float16,
+            )
+        ]
+
+    def __call__(
+        self,
+        input_ids,
+        *,
+        cache_views=None,
+        cache_metadata=None,
+        query_lens=None,
+        slot_ids=None,
+        positions=None,
+        return_dict=True,
+        **_kwargs,
+    ):
+        del cache_metadata, positions
+        arr = np.array(input_ids, dtype=np.int32)
+        logits: np.ndarray
+        next_token_by_last = {
+            2: 3,
+            3: 4,
+            4: 5,
+            5: 6,
+        }
+
+        if arr.ndim == 1:
+            if query_lens and slot_ids:
+                num_seqs = len(slot_ids)
+                logits = np.full((num_seqs, self.vocab_size), -1e9, dtype=np.float32)
+                offset = 0
+                for row, (qlen, sid) in enumerate(zip(query_lens, slot_ids, strict=False)):
+                    qlen = int(qlen)
+                    last_token = int(arr[offset + qlen - 1])
+                    offset += qlen
+                    if cache_views:
+                        cache_views[0].cache.kv_lens[sid] += qlen
+                    logits[row, next_token_by_last.get(last_token, 6)] = 0.0
+            else:
+                logits = np.full((1, self.vocab_size), -1e9, dtype=np.float32)
+                logits[0, next_token_by_last.get(int(arr[-1]), 6)] = 0.0
+        else:
+            batch_size = arr.shape[0]
+            logits = np.full((batch_size, self.vocab_size), -1e9, dtype=np.float32)
+            for row in range(batch_size):
+                qlen = int(query_lens[row]) if query_lens else arr.shape[1]
+                last_token = int(arr[row, qlen - 1])
+                if cache_views and slot_ids:
+                    cache_views[0].cache.kv_lens[int(slot_ids[row])] += qlen
+                logits[row, next_token_by_last.get(last_token, 6)] = 0.0
+
+        if return_dict:
+            return type("DummyOutput", (), {"logits": logits})()
+        return logits
+
+
+def _build_partial_decode_tokenizer():
+    vocab = {
+        "<pad>": 0,
+        "<eos>": 1,
+        "hello": 2,
+        "alpha": 3,
+        "dino": 4,
+        "beta": 5,
+        "robot": 6,
+        "<unk>": 7,
+    }
+    tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
+    tok.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tok,
+        pad_token="<pad>",
+        eos_token="<eos>",
+        unk_token="<unk>",
+    )
+    original_decode = tokenizer.decode
+    partial_decodes = {
+        (3,): "alpha\ufffd",
+        (3, 4): "alpha🦕",
+        (3, 4, 5): "alpha🦕beta\ufffd",
+        (3, 4, 5, 6): "alpha🦕beta🤖",
+    }
+
+    def fake_decode(token_ids, skip_special_tokens=True, **kwargs):
+        ids = tuple(int(token_id) for token_id in token_ids)
+        if skip_special_tokens:
+            special_ids = {tokenizer.pad_token_id, tokenizer.eos_token_id}
+            ids = tuple(token_id for token_id in ids if token_id not in special_ids)
+        if ids in partial_decodes:
+            return partial_decodes[ids]
+        return original_decode(list(ids), skip_special_tokens=False, **kwargs)
+
+    tokenizer.decode = fake_decode
+    return tokenizer
+
+
 def test_esurge_generate_basic():
     engine = eSurge(DummyPagedModel(), tokenizer=_build_tokenizer(), max_model_len=16, reserve_tokens=2, max_num_seqs=4)
     outputs = engine.generate("hello world", SamplingParams(max_tokens=2))
@@ -151,4 +260,29 @@ def test_esurge_paged_stream_is_incremental():
     outputs = list(engine.stream("hello", SamplingParams(max_tokens=2)))
     assert len(outputs) >= 1
     assert outputs[0].delta_text.strip() == "foo"
+    assert outputs[-1].finished is True
+
+
+def test_esurge_stream_ignores_transient_replacement_suffixes():
+    engine = eSurge(
+        PlannedPagedModel(),
+        tokenizer=_build_partial_decode_tokenizer(),
+        max_model_len=16,
+        reserve_tokens=2,
+        max_num_seqs=4,
+    )
+
+    outputs = list(engine.stream("hello", SamplingParams(max_tokens=4)))
+
+    assert [chunk.delta_text for chunk in outputs] == ["alpha", "🦕", "beta", "🤖"]
+    assert [chunk.accumulated_text for chunk in outputs] == [
+        "alpha",
+        "alpha🦕",
+        "alpha🦕beta",
+        "alpha🦕beta🤖",
+    ]
+    reconstructed = ""
+    for chunk in outputs:
+        reconstructed += chunk.delta_text
+        assert chunk.accumulated_text == reconstructed
     assert outputs[-1].finished is True
