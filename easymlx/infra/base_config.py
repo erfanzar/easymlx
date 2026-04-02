@@ -33,6 +33,11 @@ from .errors import EasyMLXConfigError
 from .etils import DEFAULT_ATTENTION_MECHANISM, AttentionMechanism
 
 
+def _is_turboquant_cache_dtype(cache_dtype: str | None) -> bool:
+    cache_dtype = str(cache_dtype or "auto").lower()
+    return cache_dtype.startswith("turboquant") or cache_dtype.startswith("tq")
+
+
 class EasyMLXBaseConfig(PretrainedConfig):
     """Base configuration class for all easymlx models.
 
@@ -48,7 +53,10 @@ class EasyMLXBaseConfig(PretrainedConfig):
             ``"float16"``, ``"bfloat16"``, ``"float32"``).
         cache_dtype: Data type for KV cache storage. ``"auto"`` uses the
             model's dtype. ``"fp8"`` uses FP8 E4M3 quantization stored
-            as ``uint8`` for ~50% KV cache memory reduction.
+            as ``uint8`` for ~50% KV cache memory reduction. ``"turboquant"``
+            enables TurboQuant-compressed paged KV caches.
+        cache_bits: TurboQuant bit-width when ``cache_dtype`` selects
+            TurboQuant. Supported values: ``2``, ``3``, or ``4``.
 
     Example::
 
@@ -64,6 +72,7 @@ class EasyMLXBaseConfig(PretrainedConfig):
         attn_mechanism: AttentionMechanism = DEFAULT_ATTENTION_MECHANISM,
         dtype: str = "float16",
         cache_dtype: str = "auto",
+        cache_bits: int = 3,
         **kwargs,
     ):
         """Initialize the base configuration.
@@ -78,9 +87,12 @@ class EasyMLXBaseConfig(PretrainedConfig):
                 Defaults to ``"float16"``.
             cache_dtype: Data type for KV cache storage. ``"auto"`` uses
                 the model dtype. ``"fp8"`` uses FP8 E4M3 quantization
-                (uint8 storage). Supported: ``"auto"``, ``"float16"``,
-                ``"bfloat16"``, ``"float32"``, ``"fp8"``.
+                (uint8 storage). ``"turboquant"`` enables TurboQuant
+                paged KV compression. Supported: ``"auto"``, ``"float16"``,
+                ``"bfloat16"``, ``"float32"``, ``"fp8"``, ``"turboquant"``.
                 Defaults to ``"auto"``.
+            cache_bits: TurboQuant bit-width when ``cache_dtype`` selects
+                TurboQuant. Supported: ``2``, ``3``, ``4``. Defaults to ``3``.
             **kwargs: Additional keyword arguments forwarded to
                 ``PretrainedConfig.__init__``.
 
@@ -92,6 +104,7 @@ class EasyMLXBaseConfig(PretrainedConfig):
         self.attn_mechanism = attn_mechanism
         self.dtype = dtype
         self.cache_dtype = cache_dtype
+        self.cache_bits = int(cache_bits)
         self._validate()
 
     def _validate(self) -> None:
@@ -105,8 +118,12 @@ class EasyMLXBaseConfig(PretrainedConfig):
         if self.attn_mechanism not in ("auto", "vanilla", "sdpa", "paged"):
             raise EasyMLXConfigError(f"Unsupported attn_mechanism={self.attn_mechanism!r}")
         valid_cache_dtypes = ("auto", "float16", "bfloat16", "float32", "fp8")
-        if self.cache_dtype not in valid_cache_dtypes:
-            raise EasyMLXConfigError(f"Unsupported cache_dtype={self.cache_dtype!r}; supported: {valid_cache_dtypes}")
+        if self.cache_dtype not in valid_cache_dtypes and not _is_turboquant_cache_dtype(self.cache_dtype):
+            raise EasyMLXConfigError(
+                f"Unsupported cache_dtype={self.cache_dtype!r}; supported: {(*valid_cache_dtypes, 'turboquant')}"
+            )
+        if _is_turboquant_cache_dtype(self.cache_dtype) and self.cache_bits not in (2, 3, 4):
+            raise EasyMLXConfigError("TurboQuant cache_bits must be 2, 3, or 4.")
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
@@ -140,6 +157,11 @@ class EasyMLXBaseConfig(PretrainedConfig):
         return str(getattr(self, "cache_dtype", "auto")).lower() == "fp8"
 
     @property
+    def is_turboquant_cache(self) -> bool:
+        """Return ``True`` when the KV cache uses TurboQuant compression."""
+        return _is_turboquant_cache_dtype(getattr(self, "cache_dtype", "auto"))
+
+    @property
     def cache_mlx_dtype(self) -> mx.Dtype:
         """Resolve the KV cache storage dtype.
 
@@ -154,6 +176,8 @@ class EasyMLXBaseConfig(PretrainedConfig):
             return self.mlx_dtype
         if cd == "fp8":
             return mx.uint8
+        if _is_turboquant_cache_dtype(cd):
+            return mx.uint32
         mapping = {
             "float16": mx.float16,
             "bfloat16": mx.bfloat16,

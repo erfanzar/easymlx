@@ -226,6 +226,69 @@ def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch)
     np.testing.assert_array_equal(np.asarray(cache.kv_lens), np.array([2, 2], dtype=np.int32))
 
 
+def test_model_runner_skips_compiled_forward_for_turboquant_cache() -> None:
+    from easymlx.inference.esurge.runners import model_runner as model_runner_module
+    cache_module = pytest.importorskip("easymlx.caching")
+    PageCacheView = cache_module.PageCacheView
+
+    cache = PageCacheView.allocate(
+        num_seqs=2,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=8,
+        block_size=2,
+        dtype=mx.float32,
+        cache_dtype="turboquant",
+        cache_bits=3,
+    )
+    runner = model_runner_module.ModelRunner(
+        DummyCompiledPagedModel(vocab_size=6),
+        kv_caches=[cache],
+        seed=0,
+        use_compiled_forward=True,
+    )
+
+    compiled_entry = runner._get_compiled_forward([0, 1], [1, 1])
+
+    assert compiled_entry is None
+    assert len(runner._compiled_forwards) == 0
+
+
+def test_model_runner_zero_pages_clears_turboquant_aux_state() -> None:
+    cache_module = pytest.importorskip("easymlx.caching")
+    PageCacheView = cache_module.PageCacheView
+
+    cache = PageCacheView.allocate(
+        num_seqs=1,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=8,
+        block_size=2,
+        dtype=mx.float32,
+        cache_dtype="turboquant",
+        cache_bits=3,
+    )
+    cache.key_cache[0] = 1
+    cache.value_cache[0] = 2
+    cache.key_norms[0] = 3
+    cache.key_residual_norms[0] = 4
+    cache.key_qjl_signs[0] = 5
+    cache.value_norms[0] = 6
+
+    runner = ModelRunner(DummyPagedModel(vocab_size=5), kv_caches=[cache], seed=0)
+    runner._zero_pages([0])
+
+    for array in (
+        cache.key_cache[0],
+        cache.value_cache[0],
+        cache.key_norms[0],
+        cache.key_residual_norms[0],
+        cache.key_qjl_signs[0],
+        cache.value_norms[0],
+    ):
+        np.testing.assert_array_equal(np.asarray(array), np.zeros_like(np.asarray(array)))
+
+
 def test_model_runner_prefers_decode_step_for_single_token_paged_decode() -> None:
     cache_module = pytest.importorskip("easymlx.caching")
     PageCacheView = cache_module.PageCacheView

@@ -95,12 +95,30 @@ model = AutoEasyMLXModelForCausalLM.from_pretrained(
 )
 
 # Or with explicit config
-from easymlx.modules.auto import QuantizationConfig
+from easymlx import QuantizationConfig
 
 model = AutoEasyMLXModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.2-1B-Instruct",
     dtype=mx.float16,
     quantization=QuantizationConfig(mode="affine", bits=4, group_size=64),
+)
+
+# Or with ordered regex rules
+from easymlx import LayerwiseQuantizationConfig, QuantizationRule
+
+model = AutoEasyMLXModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B-Instruct",
+    dtype=mx.float16,
+    quantization=LayerwiseQuantizationConfig(
+        default=QuantizationConfig(mode="affine", bits=4, group_size=64),
+        rules=[
+            QuantizationRule(
+                pattern=r"^model\\.embed_tokens$",
+                config=QuantizationConfig(mode="affine", bits=8, group_size=64),
+            ),
+            QuantizationRule(pattern=r"^lm_head$", config=None),
+        ],
+    ),
 )
 ```
 

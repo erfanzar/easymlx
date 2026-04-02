@@ -703,6 +703,7 @@ class PageCacheView:
         block_size: int = 16,
         dtype: mx.Dtype | type | str = mx.float16,
         cache_dtype: str | None = None,
+        cache_bits: int | None = None,
     ) -> PageCacheView:
         """Allocate a new zero-initialized ragged pages cache view.
 
@@ -719,12 +720,31 @@ class PageCacheView:
                 ``cache_dtype`` is ``None`` or ``"auto"``).
             cache_dtype: Override for cache storage dtype. ``"fp8"``
                 allocates uint8 caches with per-block float32 scales
-                for FP8 E4M3 quantization. ``None`` or ``"auto"``
-                falls through to *dtype*.
+                for FP8 E4M3 quantization. ``"turboquant"`` (or
+                ``"turboquant2"``/``"turboquant3"``/``"turboquant4"``)
+                allocates a TurboQuant-compressed cache. ``None`` or
+                ``"auto"`` falls through to *dtype*.
+            cache_bits: Optional TurboQuant bit-width override. Ignored
+                unless *cache_dtype* selects TurboQuant.
 
         Returns:
             A freshly allocated :class:`PageCacheView`.
         """
+        from .turboquant import TurboQuantPageCacheView, resolve_turboquant_bits
+
+        turboquant_bits = resolve_turboquant_bits(cache_dtype, cache_bits)
+        if turboquant_bits is not None:
+            return TurboQuantPageCacheView.init(
+                num_seqs=num_seqs,
+                max_seq_len=max_seq_len,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                dtype=dtype,
+                cache_dtype=cache_dtype,
+                cache_bits=turboquant_bits,
+            )
+
         _DTYPE_MAP = {
             "float16": mx.float16,
             "float32": mx.float32,
@@ -772,13 +792,20 @@ class PageCacheView:
             k_scales = mx.zeros((num_blocks,), dtype=mx.float32)
             v_scales = mx.zeros((num_blocks,), dtype=mx.float32)
 
-        # Page caches (packed layout for Metal PageAttention kernel) always
-        # use the model's float dtype, not uint8.  The standard 4D caches
-        # store FP8 data as uint8, and the Metal kernels have native FP8
-        # dequantization support using per-block k_scales/v_scales.
-        page_vec_size = 0
-        page_key_cache = None
-        page_value_cache = None
+        # Packed page-attention views always use the model dtype rather than
+        # the raw KV storage dtype. For FP8 caches the dense block tables keep
+        # uint8 data plus scales, while the packed layout stores float values
+        # ready for the dedicated page-attention kernels.
+        page_vec_size = cls._page_vec_size(dtype, head_dim)
+        num_vecs = head_dim // page_vec_size
+        page_key_cache = mx.zeros(
+            (num_blocks, num_kv_heads, num_vecs, block_size, page_vec_size),
+            dtype=dtype,
+        )
+        page_value_cache = mx.zeros(
+            (num_blocks, num_kv_heads, head_dim, block_size),
+            dtype=dtype,
+        )
         kv_lens = mx.zeros((num_seqs,), dtype=mx.int32)
 
         return cls(
@@ -1286,9 +1313,11 @@ class PageCacheConfig:
         dtype: Data type for cache tensors.
         cache_dtype: Override for cache storage dtype. ``"fp8"`` enables
             FP8 E4M3 quantized KV cache. ``None`` or ``"auto"`` uses *dtype*.
+        cache_bits: Optional TurboQuant bit-width override.
     """
 
     __slots__ = (
+        "cache_bits",
         "cache_dtype",
         "dtype",
         "head_dim",
@@ -1312,6 +1341,7 @@ class PageCacheConfig:
         memory_utilization: float = 0.85,
         dtype: mx.Dtype = mx.float16,
         cache_dtype: str | None = None,
+        cache_bits: int | None = None,
     ) -> None:
         self.num_hidden_layers = int(num_hidden_layers)
         self.num_kv_heads = int(num_kv_heads)
@@ -1322,6 +1352,7 @@ class PageCacheConfig:
         self.memory_utilization = float(memory_utilization)
         self.dtype = dtype
         self.cache_dtype = cache_dtype
+        self.cache_bits = int(cache_bits) if cache_bits is not None else None
 
     @property
     def num_pages(self) -> int:
@@ -1383,6 +1414,7 @@ class PageCache:
                 block_size=config.page_size,
                 dtype=config.dtype,
                 cache_dtype=config.cache_dtype,
+                cache_bits=config.cache_bits,
             )
             for _ in range(config.num_hidden_layers)
         ]

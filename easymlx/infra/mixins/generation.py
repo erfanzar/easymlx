@@ -220,6 +220,7 @@ class EasyGenerationMixin:
 
         if recommended == "paged":
             model_cache_dtype = getattr(config, "cache_dtype", None)
+            model_cache_bits = getattr(config, "cache_bits", None)
             ragged_cfg = PageCacheConfig(
                 num_hidden_layers=num_hidden_layers,
                 num_kv_heads=num_kv_heads or num_heads,
@@ -229,6 +230,7 @@ class EasyGenerationMixin:
                 max_model_length=max_length,
                 dtype=dtype,
                 cache_dtype=model_cache_dtype,
+                cache_bits=model_cache_bits,
             )
             ragged_cache = PageCache.init_cache(ragged_cfg)
 
@@ -250,6 +252,7 @@ class EasyGenerationMixin:
                             block_size=page_size,
                             dtype=dtype,
                             cache_dtype=model_cache_dtype,
+                            cache_bits=model_cache_bits,
                         )
             return ragged_cache
 

@@ -29,11 +29,12 @@ from functools import lru_cache
 import numpy as np
 from mlx import core as mx
 
-from easymlx.caching import PageCacheView, PageMetadata
-
 from .._attention_outputs import AttentionOutput
 from .._base_operation import BaseOperation, OperationRegistry
 from ..requirements import ExecutionMode, MetadataField, RequirementsBuilder
+
+if tp.TYPE_CHECKING:
+    from easymlx.caching.paged.cache import PageCacheView, PageMetadata
 
 _DEFAULT_USE_METAL = True
 _DEFAULT_USE_MISTRAL = True
@@ -2515,6 +2516,8 @@ class PageAttention(BaseOperation):
 
     @classmethod
     def get_requirements(cls, mode: ExecutionMode = ExecutionMode.MIXED):
+        from easymlx.caching.paged.cache import PageCacheView
+
         return (
             RequirementsBuilder("page_attention")
             .require_metadata(
@@ -2562,6 +2565,8 @@ class PageAttention(BaseOperation):
         """
         if cache_metadata is None:
             raise ValueError("PageAttention requires cache_metadata.")
+        from easymlx.caching.paged.cache import PageMetadata
+
         if isinstance(cache_metadata, PageMetadata):
             if (
                 cache_metadata.block_tables is None
@@ -2577,6 +2582,22 @@ class PageAttention(BaseOperation):
                 sliding_window=cache_metadata.sliding_window,
                 is_single_token_decode=cache_metadata.is_single_token_decode,
             )
+
+        if cache_view is not None and getattr(cache_view, "cache_dtype_is_turboquant", False):
+            outputs = cache_view.turboquant_attention(
+                query,
+                PageMetadata(
+                    query_start_loc=cache_metadata.query_start_loc,
+                    block_tables=cache_metadata.block_tables,
+                    kv_lens=cache_metadata.kv_lens,
+                    block_size=cache_metadata.block_size,
+                    sliding_window=cache_metadata.sliding_window,
+                    is_single_token_decode=cache_metadata.is_single_token_decode,
+                ),
+                softmax_scale=scale,
+                use_metal=use_metal,
+            )
+            return AttentionOutput(attention_outputs=outputs, cache_view=cache_view)
 
         runtime_key_cache = key
         runtime_value_cache = value
@@ -2612,6 +2633,19 @@ class PageAttention(BaseOperation):
                 runtime_k_scale = None
                 runtime_v_scale = None
 
+        paged_kwargs: dict[str, tp.Any] = {
+            "softmax_scale": scale,
+            "sliding_window": cache_metadata.sliding_window,
+            "use_metal": use_metal,
+            "single_token_decode": cache_metadata.is_single_token_decode,
+            "threadgroup_size": threadgroup_size,
+            "partition_size": self.partition_size,
+            "v2_min_context": self.v2_min_context,
+        }
+        if runtime_k_scale is not None and runtime_v_scale is not None:
+            paged_kwargs["k_scale"] = runtime_k_scale
+            paged_kwargs["v_scale"] = runtime_v_scale
+
         outputs = paged_attention(
             query,
             runtime_key_cache,
@@ -2619,15 +2653,7 @@ class PageAttention(BaseOperation):
             cache_metadata.block_tables,
             cache_metadata.kv_lens,
             cache_metadata.query_start_loc,
-            softmax_scale=scale,
-            sliding_window=cache_metadata.sliding_window,
-            use_metal=use_metal,
-            single_token_decode=cache_metadata.is_single_token_decode,
-            threadgroup_size=threadgroup_size,
-            partition_size=self.partition_size,
-            v2_min_context=self.v2_min_context,
-            k_scale=runtime_k_scale,
-            v_scale=runtime_v_scale,
+            **paged_kwargs,
         )
         return AttentionOutput(attention_outputs=outputs, cache_view=cache_view)
 

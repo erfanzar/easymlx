@@ -25,6 +25,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
 
+from easymlx import LayerwiseQuantizationConfig, QuantizationConfig, QuantizationRule
 from easymlx.inference.esurge import SamplingParams, eSurge
 from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 
@@ -134,3 +135,48 @@ def test_llama_from_pretrained_auto_convert_feeds_esurge_without_tokenizer(tmp_p
 
     assert len(outputs) == 1
     assert outputs[0].finished is True
+
+
+def test_llama_from_pretrained_supports_layerwise_quantization_rules(tmp_path: Path):
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = LlamaForCausalLM(config)
+    mx.eval(model.parameters())
+    source_dir = tmp_path / "layerwise-quant"
+    source_dir.mkdir()
+
+    model.config.save_pretrained(str(source_dir))
+    mx.save_safetensors(str(source_dir / "model.safetensors"), _flatten_params(model))
+
+    loaded = LlamaForCausalLM.from_pretrained(
+        source_dir,
+        quantization=LayerwiseQuantizationConfig(
+            default=QuantizationConfig(mode="affine", bits=4, group_size=32),
+            rules=[
+                QuantizationRule(
+                    pattern=r"^model\.embed_tokens$",
+                    config=QuantizationConfig(mode="affine", bits=8, group_size=32),
+                ),
+                QuantizationRule(
+                    pattern=r"^model\.layers\.0\.mlp\.down_proj$",
+                    config=None,
+                ),
+            ],
+        ),
+    )
+
+    params = _flatten_params(loaded)
+    assert "model.embed_tokens.scales" in params
+    assert "model.layers.0.self_attn.q_proj.scales" in params
+    assert "model.layers.0.mlp.down_proj.scales" not in params
+    assert "model.layers.0.mlp.down_proj.weight" in params
+
+    assert getattr(loaded.model.embed_tokens, "bits") == 8
+    assert getattr(loaded.model.layers[0].self_attn.q_proj, "bits") == 4

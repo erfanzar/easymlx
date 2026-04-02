@@ -32,8 +32,10 @@ import hashlib
 import json
 import mmap
 import os
+import re
 import shutil
 import struct
+import typing as tp
 from pathlib import Path
 
 import mlx.core as mx
@@ -41,7 +43,14 @@ from mlx.utils import tree_flatten
 
 from ..base_config import EasyMLXBaseConfig
 from ..errors import EasyMLXRuntimeError
-from ..etils import MODEL_WEIGHTS_GLOB, MODEL_WEIGHTS_NAME, QuantizationConfig, QuantizationMode
+from ..etils import (
+    MODEL_WEIGHTS_GLOB,
+    MODEL_WEIGHTS_NAME,
+    LayerwiseQuantizationConfig,
+    QuantizationConfig,
+    QuantizationMode,
+    QuantizationSpec,
+)
 
 _HF_SUPPORT_FILES = (
     "generation_config.json",
@@ -95,7 +104,7 @@ _QUANT_MODE_DEFAULTS: dict[str, dict[str, int]] = {
 
 def _parse_quantization_config(
     quantization: QuantizationConfig | QuantizationMode,
-) -> dict:
+) -> dict[str, int | str]:
     """Parse a quantization spec into a validated kwargs dict.
 
     Args:
@@ -123,16 +132,144 @@ def _parse_quantization_config(
     }
 
 
-def _validate_quantization_kernel(quant_kwargs: dict) -> None:
+def _is_layerwise_quantization_config(quantization: object) -> tp.TypeGuard[LayerwiseQuantizationConfig]:
+    """Return ``True`` when *quantization* uses regex-based rule matching."""
+    return isinstance(quantization, dict) and ("default" in quantization or "rules" in quantization)
+
+
+def _maybe_parse_quantization_config(
+    quantization: QuantizationConfig | QuantizationMode | None,
+) -> dict[str, int | str] | None:
+    """Parse a quantization config, treating ``None`` / ``""`` as disabled."""
+    if quantization is None or quantization == "":
+        return None
+    return _parse_quantization_config(quantization)
+
+
+def _quantization_config_key(quant_kwargs: dict[str, int | str]) -> tuple[str, int, int]:
+    """Return a hashable key for de-duplicating quantization configs."""
+    return (
+        str(quant_kwargs["mode"]),
+        int(quant_kwargs["bits"]),
+        int(quant_kwargs["group_size"]),
+    )
+
+
+def _format_quantization_config(quant_kwargs: dict[str, int | str]) -> str:
+    """Format a quantization config for logs and error messages."""
+    return "mode={mode}, bits={bits}, group_size={group_size}".format(**quant_kwargs)
+
+
+class _PreparedQuantizationPlan(tp.NamedTuple):
+    """Normalized quantization plan shared by load-time and in-place flows."""
+
+    nn_quantize_kwargs: dict[str, tp.Any]
+    fixed_quant_kwargs: dict[str, int | str] | None
+    weight_quantization_map: dict[str, dict[str, int | str]]
+    unique_quant_configs: tuple[dict[str, int | str], ...]
+    summary: str
+
+
+def _prepare_quantization_plan(
+    quantization: QuantizationSpec | None,
+) -> _PreparedQuantizationPlan | None:
+    """Normalize a quantization spec into MLX kwargs and per-weight metadata."""
+    if quantization is None or quantization == "":
+        return None
+
+    if not _is_layerwise_quantization_config(quantization):
+        quant_kwargs = _parse_quantization_config(quantization)
+        return _PreparedQuantizationPlan(
+            nn_quantize_kwargs=dict(quant_kwargs),
+            fixed_quant_kwargs=dict(quant_kwargs),
+            weight_quantization_map={},
+            unique_quant_configs=(dict(quant_kwargs),),
+            summary=_format_quantization_config(quant_kwargs),
+        )
+
+    default_quant_kwargs = _maybe_parse_quantization_config(quantization.get("default"))
+    raw_rules = quantization.get("rules", [])
+
+    unique_quant_configs: list[dict[str, int | str]] = []
+    unique_quant_config_keys: set[tuple[str, int, int]] = set()
+
+    def _add_unique_quant_config(quant_kwargs: dict[str, int | str] | None) -> None:
+        if quant_kwargs is None:
+            return
+        key = _quantization_config_key(quant_kwargs)
+        if key not in unique_quant_config_keys:
+            unique_quant_config_keys.add(key)
+            unique_quant_configs.append(dict(quant_kwargs))
+
+    _add_unique_quant_config(default_quant_kwargs)
+
+    compiled_rules: list[tuple[re.Pattern[str], dict[str, int | str] | None]] = []
+    for rule_index, rule in enumerate(raw_rules):
+        if "pattern" not in rule:
+            raise ValueError(f"Quantization rule at index {rule_index} is missing required key 'pattern'.")
+        pattern = rule["pattern"]
+        try:
+            compiled_pattern = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"Invalid quantization regex at rules[{rule_index}]: {pattern!r}") from exc
+
+        rule_quant_kwargs = _maybe_parse_quantization_config(rule.get("config"))
+        _add_unique_quant_config(rule_quant_kwargs)
+        compiled_rules.append((compiled_pattern, rule_quant_kwargs))
+
+    if not compiled_rules and default_quant_kwargs is not None:
+        return _PreparedQuantizationPlan(
+            nn_quantize_kwargs=dict(default_quant_kwargs),
+            fixed_quant_kwargs=dict(default_quant_kwargs),
+            weight_quantization_map={},
+            unique_quant_configs=tuple(unique_quant_configs),
+            summary=_format_quantization_config(default_quant_kwargs),
+        )
+
+    planned_weight_quantization_map: dict[str, dict[str, int | str]] = {}
+
+    def class_predicate(path: str, module: object) -> bool | dict[str, int | str]:
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        quant_kwargs = default_quant_kwargs
+        for compiled_pattern, rule_quant_kwargs in compiled_rules:
+            if compiled_pattern.search(path):
+                quant_kwargs = rule_quant_kwargs
+                break
+
+        if quant_kwargs is None:
+            return False
+
+        weight_key = f"{path}.weight" if path else "weight"
+        planned_weight_quantization_map[weight_key] = dict(quant_kwargs)
+        return dict(quant_kwargs)
+
+    summary_parts = [f"rules={len(compiled_rules)}", f"configs={len(unique_quant_configs)}"]
+    if default_quant_kwargs is not None:
+        summary_parts.insert(0, f"default[{_format_quantization_config(default_quant_kwargs)}]")
+    else:
+        summary_parts.insert(0, "default[disabled]")
+
+    return _PreparedQuantizationPlan(
+        nn_quantize_kwargs={"class_predicate": class_predicate},
+        fixed_quant_kwargs=None,
+        weight_quantization_map=planned_weight_quantization_map,
+        unique_quant_configs=tuple(unique_quant_configs),
+        summary=", ".join(summary_parts),
+    )
+
+
+def _validate_quantization_kernel(quant_kwargs: dict[str, int | str]) -> None:
     """Run a tiny dummy quantize+matmul to verify the Metal kernel loads.
 
     Raises:
         RuntimeError: With a user-friendly message if the kernel is
             unavailable on the current device.
     """
-    gs = quant_kwargs["group_size"]
-    bits = quant_kwargs["bits"]
-    mode = quant_kwargs["mode"]
+    gs = int(quant_kwargs["group_size"])
+    bits = int(quant_kwargs["bits"])
+    mode = str(quant_kwargs["mode"])
     try:
         dummy_w = mx.ones((gs, gs))
         quant_result = mx.quantize(dummy_w, gs, bits, mode=mode)
@@ -165,36 +302,33 @@ def _validate_quantization_kernel(quant_kwargs: dict) -> None:
 
 def _quantize_weights(
     weights: dict[str, mx.array],
-    quantized_weight_keys: frozenset[str],
-    quant_kwargs: dict,
+    weight_quantization_map: dict[str, dict[str, int | str]],
 ) -> dict[str, mx.array]:
     """Quantize full-precision weights that belong to quantized modules.
 
-    For every key in *weights* that appears in *quantized_weight_keys*
+    For every key in *weights* that appears in *weight_quantization_map*
     **and** has a floating-point dtype, the value is replaced with the
-    three arrays produced by :func:`mx.quantize` (packed weight, scales,
-    biases).  All other entries pass through unchanged.
+    arrays produced by :func:`mx.quantize` using that weight's assigned
+    quantization config. All other entries pass through unchanged.
 
     This lets us quantize weights while streaming shards, so full-precision
     data for the whole model never needs to live in memory at once.
 
     Args:
         weights: Flat weight dictionary (already sanitized / cast).
-        quantized_weight_keys: Set of ``"prefix.weight"`` keys whose
-            corresponding module was converted to ``QuantizedLinear``
-            (or ``QuantizedEmbedding``).
-        quant_kwargs: ``dict(mode=..., bits=..., group_size=...)``.
+        weight_quantization_map: Mapping from ``"prefix.weight"`` keys
+            to ``dict(mode=..., bits=..., group_size=...)``.
 
     Returns:
         A new dictionary with quantized entries replacing the originals.
     """
-    group_size = quant_kwargs["group_size"]
-    bits = quant_kwargs["bits"]
-    mode = quant_kwargs["mode"]
-
     out: dict[str, mx.array] = {}
     for key, value in weights.items():
-        if key in quantized_weight_keys and mx.issubdtype(value.dtype, mx.floating):
+        quant_kwargs = weight_quantization_map.get(key)
+        if quant_kwargs is not None and mx.issubdtype(value.dtype, mx.floating):
+            group_size = int(quant_kwargs["group_size"])
+            bits = int(quant_kwargs["bits"])
+            mode = str(quant_kwargs["mode"])
             quant_result = mx.quantize(value, group_size, bits, mode=mode)
             # key is already "prefix.weight"; reuse it directly.
             out[key] = quant_result[0]
@@ -207,9 +341,21 @@ def _quantize_weights(
     return out
 
 
+def _collect_quantized_weight_map(
+    model: EasyBridgeMixin,
+    quant_kwargs: dict[str, int | str],
+) -> dict[str, dict[str, int | str]]:
+    """Collect the quantized weight keys currently expected by *model*."""
+    return {
+        key.rsplit(".scales", 1)[0] + ".weight": dict(quant_kwargs)
+        for key, _ in tree_flatten(model.parameters())
+        if key.endswith(".scales")
+    }
+
+
 def _apply_quantization(
     model: EasyBridgeMixin,
-    quantization: QuantizationConfig | QuantizationMode | None,
+    quantization: QuantizationSpec | None,
 ) -> None:
     """Parse, validate, and apply quantization to a model in-place.
 
@@ -219,26 +365,23 @@ def _apply_quantization(
 
     Args:
         model: The model to quantize.
-        quantization: Mode string or :class:`QuantizationConfig` dict.
-            ``None`` / ``""`` is a no-op.
+        quantization: Mode string, :class:`QuantizationConfig`, or
+            :class:`LayerwiseQuantizationConfig`. ``None`` / ``""`` is
+            a no-op.
     """
     import logging
 
     import mlx.nn as nn
 
-    if quantization is None or quantization == "":
+    quantization_plan = _prepare_quantization_plan(quantization)
+    if quantization_plan is None:
         return
 
-    quant_kwargs = _parse_quantization_config(quantization)
     logger = logging.getLogger("easymlx.quantization")
-    logger.info(
-        "Quantizing model: mode=%s, bits=%d, group_size=%d",
-        quant_kwargs["mode"],
-        quant_kwargs["bits"],
-        quant_kwargs["group_size"],
-    )
-    _validate_quantization_kernel(quant_kwargs)
-    nn.quantize(model, **quant_kwargs)
+    logger.info("Quantizing model: %s", quantization_plan.summary)
+    for quant_kwargs in quantization_plan.unique_quant_configs:
+        _validate_quantization_kernel(quant_kwargs)
+    nn.quantize(model, **quantization_plan.nn_quantize_kwargs)
     logger.info("Quantization complete")
 
 
@@ -382,9 +525,7 @@ def _load_safetensors_file(path: Path) -> dict[str, mx.array]:
                     np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
                     arr = mx.array(np_arr).view(mlx_dtype)
             else:
-                raise EasyMLXRuntimeError(
-                    f"Unsupported safetensors dtype {dtype_str!r} for tensor {key!r} in {path!s}."
-                )
+                raise EasyMLXRuntimeError(f"Unsupported safetensors dtype {dtype_str!r} for tensor {key!r} in {path!s}.")
             weights[key] = arr
 
         mm.close()
@@ -702,7 +843,7 @@ class EasyBridgeMixin:
         converted_cache_dir: str | os.PathLike | None = None,
         force_conversion: bool = False,
         copy_support_files: bool = True,
-        quantization: QuantizationConfig | QuantizationMode | None = None,
+        quantization: QuantizationSpec | None = None,
     ):
         """Load a pretrained model from a local directory or Hub ID.
 
@@ -736,6 +877,10 @@ class EasyBridgeMixin:
                 conversion exists.
             copy_support_files: If ``True``, copy tokenizer files
                 during conversion.
+            quantization: Optional quantization spec. Accepts a mode
+                string, a :class:`QuantizationConfig`, or a
+                :class:`LayerwiseQuantizationConfig` with ordered regex
+                rules.
 
         Returns:
             An instance of this class with weights loaded.
@@ -807,35 +952,28 @@ class EasyBridgeMixin:
         # in.  This way full-precision data only exists for one shard at a
         # time → peak memory ≈ quantized-model + one-fp-shard.
         # ------------------------------------------------------------------
-        quant_kwargs: dict | None = None
-        quantized_weight_keys: frozenset[str] = frozenset()
+        weight_quantization_map: dict[str, dict[str, int | str]] = {}
 
-        if quantization is not None:
+        quantization_plan = _prepare_quantization_plan(quantization)
+        if quantization_plan is not None:
             import logging
 
             import mlx.nn as nn
 
-            quant_kwargs = _parse_quantization_config(quantization)
-            _validate_quantization_kernel(quant_kwargs)
-
             logger = logging.getLogger("easymlx.quantization")
-            logger.info(
-                "Quantizing model: mode=%s, bits=%d, group_size=%d",
-                quant_kwargs["mode"],
-                quant_kwargs["bits"],
-                quant_kwargs["group_size"],
-            )
+            logger.info("Quantizing model: %s", quantization_plan.summary)
+            for quant_kwargs in quantization_plan.unique_quant_configs:
+                _validate_quantization_kernel(quant_kwargs)
 
             # Set up QuantizedLinear / QuantizedEmbedding structure.
-            nn.quantize(model, **quant_kwargs)
+            nn.quantize(model, **quantization_plan.nn_quantize_kwargs)
 
             # Collect the weight keys the model now expects in quantized
             # form so we can transform each shard to match.
-            quantized_weight_keys = frozenset(
-                k.rsplit(".scales", 1)[0] + ".weight"
-                for k, _ in tree_flatten(model.parameters())
-                if k.endswith(".scales")
-            )
+            if quantization_plan.fixed_quant_kwargs is not None:
+                weight_quantization_map = _collect_quantized_weight_map(model, quantization_plan.fixed_quant_kwargs)
+            else:
+                weight_quantization_map = dict(quantization_plan.weight_quantization_map)
 
         # ------------------------------------------------------------------
         # Stream weights shard-by-shard.  After loading each shard we
@@ -854,8 +992,8 @@ class EasyBridgeMixin:
                     shard = sanitized
             shard = _cast_weights(shard, dtype=cast_dtype)
 
-            if quant_kwargs is not None:
-                shard = _quantize_weights(shard, quantized_weight_keys, quant_kwargs)
+            if weight_quantization_map:
+                shard = _quantize_weights(shard, weight_quantization_map)
 
             shard_items = list(shard.items())
             loaded_keys.update(k for k, _ in shard_items)

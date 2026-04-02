@@ -27,6 +27,8 @@ Key classes:
 
 from __future__ import annotations
 
+from easymlx.infra.etils import LayerwiseQuantizationConfig, QuantizationConfig, QuantizationRule, QuantizationSpec
+
 from .auto_configuration import (
     AutoEasyMLXConfig,
     get_modules_by_type,
@@ -56,6 +58,10 @@ __all__ = (
     "AutoEasyMLXModelForSequenceClassification",
     "AutoEasyMLXModelForTokenClassification",
     "BaseAutoEasyModel",
+    "LayerwiseQuantizationConfig",
+    "QuantizationConfig",
+    "QuantizationRule",
+    "QuantizationSpec",
     "get_modules_by_type",
     "infer_task_from_hf_config",
     "normalize_task",

@@ -43,6 +43,7 @@ from .paged import (
     PageCacheConfig,
     PageCacheView,
     PageMetadata,
+    TurboQuantPageCacheView,
     build_query_start_loc,
 )
 from .recurrent import RecurrentCache, RecurrentCacheConfig, RecurrentCacheView
@@ -76,5 +77,6 @@ __all__ = (
     "TransformerCache",
     "TransformerCacheConfig",
     "TransformerCacheView",
+    "TurboQuantPageCacheView",
     "build_query_start_loc",
 )

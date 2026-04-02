@@ -519,7 +519,8 @@ class Gemma3NAltUp(nn.Module):
                 self.prediction_coefs,
                 modalities,
                 clip=self.config.altup_coef_clip,
-            ).astype(mx.float32)
+            )
+            .astype(mx.float32)
             .reshape(
                 *modalities.shape[:-1],
                 self.config.altup_num_inputs,
@@ -551,11 +552,14 @@ class Gemma3NAltUp(nn.Module):
             Corrected predictions of the same shape as ``predictions``.
         """
         modalities = self.compute_router_modalities(activated)
-        all_coefs = self._project_coefficients(
-            self.correction_coefs,
-            modalities,
-            clip=self.config.altup_coef_clip,
-        ).astype(mx.float32) + 1.0
+        all_coefs = (
+            self._project_coefficients(
+                self.correction_coefs,
+                modalities,
+                clip=self.config.altup_coef_clip,
+            ).astype(mx.float32)
+            + 1.0
+        )
         active_x = predictions[self.config.altup_active_idx]
         innovation = activated - active_x
         all_coefs = all_coefs.moveaxis(2, 0)

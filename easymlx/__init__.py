@@ -52,8 +52,11 @@ _import_structure = {
         "EasyMLXTimerError",
     ],
     "infra.etils": [
+        "LayerwiseQuantizationConfig",
         "QuantizationConfig",
         "QuantizationMode",
+        "QuantizationRule",
+        "QuantizationSpec",
     ],
     "infra.factory": [
         "ConfigType",
@@ -358,7 +361,13 @@ if _tp.TYPE_CHECKING:
     from .inference import SamplingParams, eSurge, eSurgeApiServer
     from .infra import EasyMLXBaseConfig, EasyMLXBaseModule
     from .infra.errors import EasyMLXRuntimeError, EasyMLXSyntaxRuntimeError, EasyMLXTimerError
-    from .infra.etils import QuantizationConfig, QuantizationMode
+    from .infra.etils import (
+        LayerwiseQuantizationConfig,
+        QuantizationConfig,
+        QuantizationMode,
+        QuantizationRule,
+        QuantizationSpec,
+    )
     from .infra.factory import ConfigType, TaskType, register_config, register_module
     from .infra.modeling_outputs import (
         BaseModelOutput,

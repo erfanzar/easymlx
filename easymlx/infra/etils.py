@@ -76,3 +76,56 @@ class QuantizationConfig(tp.TypedDict, total=False):
     mode: QuantizationMode
     bits: int
     group_size: int
+
+
+class QuantizationRule(tp.TypedDict, total=False):
+    """Ordered regex rule for layer-wise quantization.
+
+    Attributes:
+        pattern: Regular expression matched against the MLX module path
+            (for example ``"model.embed_tokens"`` or
+            ``"model.layers.0.self_attn.q_proj"``).
+        config: Quantization config to apply when *pattern* matches.
+            Use ``None`` to explicitly skip quantization for matching
+            modules.
+
+    Example:
+        >>> QuantizationRule(pattern=r"^model\\.embed_tokens$", config=QuantizationConfig(bits=8))
+        >>> QuantizationRule(pattern=r"^model\\.layers\\.0\\.mlp\\.down_proj$", config=None)
+    """
+
+    pattern: str
+    config: QuantizationConfig | QuantizationMode | None
+
+
+class LayerwiseQuantizationConfig(tp.TypedDict, total=False):
+    """Regex-driven layer-wise quantization specification.
+
+    Rules are evaluated in order and the first matching rule wins. If no
+    rule matches, the optional ``default`` config is used. If ``default``
+    is omitted or ``None``, unmatched quantizable modules stay in full
+    precision.
+
+    Attributes:
+        default: Fallback quantization config applied to quantizable
+            modules that do not match any rule.
+        rules: Ordered regex rules matched against module paths.
+
+    Example:
+        >>> LayerwiseQuantizationConfig(
+        ...     default=QuantizationConfig(mode="affine", bits=4, group_size=64),
+        ...     rules=[
+        ...         QuantizationRule(
+        ...             pattern=r"^model\\.embed_tokens$",
+        ...             config=QuantizationConfig(mode="affine", bits=8, group_size=64),
+        ...         ),
+        ...         QuantizationRule(pattern=r"^lm_head$", config=None),
+        ...     ],
+        ... )
+    """
+
+    default: QuantizationConfig | QuantizationMode | None
+    rules: list[QuantizationRule]
+
+
+QuantizationSpec = QuantizationConfig | QuantizationMode | LayerwiseQuantizationConfig

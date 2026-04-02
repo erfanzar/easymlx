@@ -33,12 +33,40 @@ This applies 4-bit affine quantization with the default group size of 64.
 For fine-grained control, pass a `QuantizationConfig` dictionary:
 
 ```python
-from easymlx.modules.auto import QuantizationConfig
-from easymlx import AutoEasyMLXModelForCausalLM
+from easymlx import AutoEasyMLXModelForCausalLM, QuantizationConfig
 
 model = AutoEasyMLXModelForCausalLM.from_pretrained(
     "Qwen/Qwen3-0.6B",
     quantization=QuantizationConfig(mode="affine", bits=4, group_size=64),
+)
+```
+
+### LayerwiseQuantizationConfig
+
+For regex-based per-layer control, pass an ordered rule list. The first
+matching rule wins, and ``config=None`` skips quantization for that
+module path:
+
+```python
+from easymlx import (
+    AutoEasyMLXModelForCausalLM,
+    LayerwiseQuantizationConfig,
+    QuantizationConfig,
+    QuantizationRule,
+)
+
+model = AutoEasyMLXModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-0.6B",
+    quantization=LayerwiseQuantizationConfig(
+        default=QuantizationConfig(mode="affine", bits=4, group_size=64),
+        rules=[
+            QuantizationRule(
+                pattern=r"^model\\.embed_tokens$",
+                config=QuantizationConfig(mode="affine", bits=8, group_size=64),
+            ),
+            QuantizationRule(pattern=r"^lm_head$", config=None),
+        ],
+    ),
 )
 ```
 
@@ -119,3 +147,22 @@ Quantization trades off model quality for speed and memory:
 - **4-bit affine** typically reduces memory by ~4x compared to float16 with minimal quality loss for most tasks.
 - **mxfp4/nvfp4** can offer better quality than affine at the same bit width due to their floating-point representation.
 - **mxfp8** provides a middle ground -- lower memory than float16 with quality close to the original.
+
+## KV Cache Compression
+
+EasyMLX also supports compressed paged KV caches independently from weight quantization:
+
+```python
+from easymlx.modules.llama import LlamaConfig
+
+config = LlamaConfig(
+    cache_dtype="turboquant",
+    cache_bits=3,
+)
+```
+
+- `cache_dtype="fp8"` stores paged KV caches in FP8 E4M3.
+- `cache_dtype="turboquant"` enables TurboQuant KV compression for paged attention.
+- `cache_bits` controls the TurboQuant rate and supports `2`, `3`, or `4` bits.
+
+TurboQuant currently uses a correctness-first paged attention path in Python/NumPy rather than the Metal kernels, so it prioritizes memory reduction and integration over peak decode throughput.

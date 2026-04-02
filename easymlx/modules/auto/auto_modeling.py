@@ -30,7 +30,7 @@ import mlx.core as mx
 
 from easymlx.infra.base_config import EasyMLXBaseConfig
 from easymlx.infra.base_module import EasyMLXBaseModule
-from easymlx.infra.etils import QuantizationConfig, QuantizationMode
+from easymlx.infra.etils import QuantizationSpec
 from easymlx.infra.factory import TaskType, registry
 
 
@@ -42,11 +42,15 @@ class ConfigOverrides(TypedDict, total=False):
             loaded from the pretrained config.
         cache_dtype: Data type for KV cache storage. ``"auto"`` uses the
             model dtype, ``"fp8"`` uses FP8 E4M3 quantization (uint8
-            storage) for ~50% KV cache memory reduction.
+            storage) for ~50% KV cache memory reduction, and
+            ``"turboquant"`` enables TurboQuant paged KV compression.
+        cache_bits: TurboQuant bit-width when ``cache_dtype`` selects
+            TurboQuant.
     """
 
     attn_mechanism: Literal["auto", "vanilla", "sdpa", "paged", "unified"]
-    cache_dtype: Literal["auto", "float16", "bfloat16", "float32", "fp8"]
+    cache_dtype: Literal["auto", "float16", "bfloat16", "float32", "fp8", "turboquant"]
+    cache_bits: int
 
 
 class FromPretrainedKwargs(TypedDict, total=False):
@@ -71,7 +75,9 @@ class FromPretrainedKwargs(TypedDict, total=False):
         quantization: Quantization config. Can be a mode string
             (``"affine"``, ``"mxfp4"``, ``"mxfp8"``, ``"nvfp4"``) or a
             :class:`QuantizationConfig` dict with ``mode``, ``bits``,
-            ``group_size``.
+            ``group_size``. For regex-based per-layer control, pass a
+            :class:`LayerwiseQuantizationConfig` dict with ``default``
+            and ordered ``rules`` entries.
     """
 
     config: ConfigOverrides | None
@@ -86,7 +92,7 @@ class FromPretrainedKwargs(TypedDict, total=False):
     converted_cache_dir: str | os.PathLike | None
     force_conversion: bool
     copy_support_files: bool
-    quantization: QuantizationConfig | QuantizationMode | None
+    quantization: QuantizationSpec | None
 
 
 class BaseAutoEasyModel:

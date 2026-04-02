@@ -665,6 +665,8 @@ class ModelRunner:
             return None
         if not self.use_compiled_forward:
             return None
+        if any(getattr(cache, "cache_dtype_is_turboquant", False) for cache in self.kv_caches):
+            return None
 
         page_cache_view_cls, page_metadata_cls, _ = self._ensure_paged_helpers()
 
@@ -866,7 +868,7 @@ class ModelRunner:
         if not valid_ids:
             return
         mx.array(valid_ids, dtype=mx.int32)
-        touched_caches: list[mx.array] = []
+        touched_arrays: list[mx.array] = []
         for cache in self.kv_caches:
             key_cache = getattr(cache, "key_cache", None)
             value_cache = getattr(cache, "value_cache", None)
@@ -878,15 +880,22 @@ class ModelRunner:
                 continue
             key_cache[filtered] = 0
             value_cache[filtered] = 0
+            touched_arrays.extend([key_cache, value_cache])
             page_key_cache = getattr(cache, "page_key_cache", None)
             page_value_cache = getattr(cache, "page_value_cache", None)
             if page_key_cache is not None:
                 page_key_cache[filtered] = 0
+                touched_arrays.append(page_key_cache)
             if page_value_cache is not None:
                 page_value_cache[filtered] = 0
-            touched_caches.append(key_cache)
-        if touched_caches:
-            _safe_eval(*touched_caches)
+                touched_arrays.append(page_value_cache)
+            for attr_name in ("key_norms", "key_residual_norms", "key_qjl_signs", "value_norms"):
+                aux_array = getattr(cache, attr_name, None)
+                if aux_array is not None:
+                    aux_array[filtered] = 0
+                    touched_arrays.append(aux_array)
+        if touched_arrays:
+            _safe_eval(*touched_arrays)
 
     def _assign_row_mapping(
         self,

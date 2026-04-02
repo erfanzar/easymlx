@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged KV cache for serving and unified attention.
-
-Re-exports :class:`PageMetadata`, :class:`PageCacheView`,
-and the :func:`build_query_start_loc` helper from the implementation modules.
-"""
+"""Paged KV cache for serving and unified attention."""
 
 from .cache import PageCache, PageCacheConfig, PageCacheView, PageMetadata, build_query_start_loc
+from .turboquant import TurboQuantPageCacheView
 
 __all__ = (
     "PageCache",
     "PageCacheConfig",
     "PageCacheView",
     "PageMetadata",
+    "TurboQuantPageCacheView",
     "build_query_start_loc",
 )
