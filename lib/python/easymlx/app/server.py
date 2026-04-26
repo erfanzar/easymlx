@@ -37,6 +37,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+import easymlx.modules  # noqa: F401  (registers @register_module model classes)
 from easymlx import __version__
 from easymlx.inference.esurge import eSurge
 from easymlx.inference.esurge.server.api_server import eSurgeApiServer
