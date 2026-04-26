@@ -15,9 +15,8 @@
 """Tests for the Llama4 text-only model family."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.modules.llama4_text import Llama4TextConfig, Llama4TextForCausalLM
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

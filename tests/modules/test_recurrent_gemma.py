@@ -15,14 +15,13 @@
 """Tests for RecurrentGemma model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.recurrent_gemma import (
     RecurrentGemmaConfig,
     RecurrentGemmaForCausalLM,
     RecurrentGemmaModel,
 )
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -51,12 +50,8 @@ class TestRecurrentGemma:
         )
 
     def test_registry(self):
-        base_registration = registry.get_module_registration(
-            TaskType.BASE_MODULE, "recurrent_gemma"
-        )
-        lm_registration = registry.get_module_registration(
-            TaskType.CAUSAL_LM, "recurrent_gemma"
-        )
+        base_registration = registry.get_module_registration(TaskType.BASE_MODULE, "recurrent_gemma")
+        lm_registration = registry.get_module_registration(TaskType.CAUSAL_LM, "recurrent_gemma")
 
         assert base_registration.module is RecurrentGemmaModel
         assert base_registration.config is RecurrentGemmaConfig
@@ -71,9 +66,7 @@ class TestRecurrentGemma:
             config=recurrent_gemma_config,
             small_model_config=small_model_config,
         )
-        assert result.success, (
-            f"RecurrentGemma CAUSAL_LM failed: {result.error_message}"
-        )
+        assert result.success, f"RecurrentGemma CAUSAL_LM failed: {result.error_message}"
 
     def test_logit_soft_cap(self, recurrent_gemma_config):
         """Verify logit soft capping is configured."""
@@ -88,12 +81,10 @@ class TestRecurrentGemma:
         ]
 
     def test_sanitize(self, recurrent_gemma_config):
-        import mlx.core as mx
 
         model = RecurrentGemmaForCausalLM(recurrent_gemma_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
 
-        # Simulate upstream conv_1d weight format
         upstream_weights = dict(local_weights)
         for k, v in upstream_weights.items():
             if "conv_1d.weight" in k and v.ndim == 3:
@@ -102,6 +93,4 @@ class TestRecurrentGemma:
         sanitized = model.sanitize(upstream_weights)
         for k, v in sanitized.items():
             if "conv_1d.weight" in k and v.ndim == 3:
-                assert v.shape[-1] == 1, (
-                    f"conv_1d weight {k} not transposed correctly"
-                )
+                assert v.shape[-1] == 1, f"conv_1d weight {k} not transposed correctly"

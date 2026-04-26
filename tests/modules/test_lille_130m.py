@@ -15,10 +15,9 @@
 """Tests for Lille-130M model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.lille_130m import Lille130mConfig, Lille130mForCausalLM, Lille130mModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

@@ -14,7 +14,6 @@
 
 import mlx.core as mx
 import numpy as np
-
 from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 from easymlx.layers.rotary import get_rope
 from easymlx.operations.kernels.unified_attention import paged_attention

@@ -18,12 +18,13 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-
 from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 from easymlx.layers.attention import FlexibleAttentionModule, scaled_dot_product_attention
 from easymlx.operations import OperationRegistry, page_attention, paged_attention
 
-_METAL_KERNEL_DIR = Path(__file__).resolve().parents[2] / "easymlx" / "operations" / "kernels" / "metal" / "page_attention"
+_METAL_KERNEL_DIR = (
+    Path(__file__).resolve().parents[2] / "easymlx" / "operations" / "kernels" / "metal" / "page_attention"
+)
 _HAS_PAGE_ATTENTION_METAL = _METAL_KERNEL_DIR.is_dir()
 
 
@@ -309,7 +310,8 @@ def test_flexible_attention_dense_routes_to_sdpa(monkeypatch):
     assert calls == {"sdpa": 1, "paged": 0}
 
 
-def test_flexible_attention_paged_routes_to_unified(monkeypatch):
+@pytest.mark.parametrize("mechanism", ["auto", "paged", "unified", "unified_attention"])
+def test_flexible_attention_paged_routes_to_unified(monkeypatch, mechanism):
     calls: dict[str, int] = {"sdpa": 0, "paged": 0}
 
     def fake_sdpa(*args, **kwargs):
@@ -353,14 +355,17 @@ def test_flexible_attention_paged_routes_to_unified(monkeypatch):
         block_size=4,
         dtype=mx.float32,
     )
-    q = mx.zeros((2, 2, 4), dtype=mx.float32)
-    k = mx.zeros((2, 1, 4), dtype=mx.float32)
-    v = mx.zeros((2, 1, 4), dtype=mx.float32)
+    q = mx.zeros((1, 2, 4), dtype=mx.float32)
+    k = mx.zeros((1, 1, 4), dtype=mx.float32)
+    v = mx.zeros((1, 1, 4), dtype=mx.float32)
     _, key_cache, value_cache, metadata = cache.concatenate_to_cache(
         q,
         k,
         v,
-        cache_metadata=PageMetadata(query_start_loc=build_query_start_loc([2])),
+        cache_metadata=PageMetadata(
+            query_start_loc=build_query_start_loc([1]),
+            is_single_token_decode=True,
+        ),
         slot_ids=[0],
     )
 
@@ -372,7 +377,7 @@ def test_flexible_attention_paged_routes_to_unified(monkeypatch):
         cache_view=cache,
         scale=0.5,
         mask=None,
-        paged_attention_mechanism="unified_attention",
+        paged_attention_mechanism=mechanism,
     )
     assert out.shape == q.shape
     assert calls == {"sdpa": 0, "paged": 1}

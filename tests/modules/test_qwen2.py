@@ -15,7 +15,6 @@
 """Tests for Qwen2 model."""
 
 import pytest
-
 from easymlx.modules.qwen2 import Qwen2Config, Qwen2ForCausalLM
 
 from .test_utils import CausalLMTester

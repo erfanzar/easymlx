@@ -31,8 +31,8 @@ EasyMLX uses:
 
 Run linting::
 
-    ruff check easymlx/
-    ruff format --check easymlx/
+    ruff check lib/python/easymlx/
+    ruff format --check lib/python/easymlx/
 
 Running Tests
 -------------

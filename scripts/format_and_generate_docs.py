@@ -30,7 +30,9 @@ from pathlib import Path
 PROJECT_NAME = "easymlx"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PYTHON_SOURCE_ROOT = PROJECT_ROOT / "lib" / "python"
 DOCS_API_DIR = PROJECT_ROOT / "docs" / "api_docs"
+PACKAGE_DIR = PYTHON_SOURCE_ROOT / PROJECT_NAME
 
 
 def _strip_prefix(module_path: str) -> str:
@@ -102,18 +104,15 @@ def generate_api_docs(clean: bool = True) -> bool:
     """
     print("Generating API documentation...")
 
-    # Clean output dir completely to avoid stale files and empty dirs
     if clean and DOCS_API_DIR.exists():
         shutil.rmtree(DOCS_API_DIR)
     DOCS_API_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Discover modules (full import paths, e.g., easymlx.kernels.foo.bar)
     modules = sorted(discover_modules(PROJECT_NAME))
     if not modules:
         print("No modules found to document")
         return False
 
-    # Build package tree: packages set and a children map for toctrees
     packages: set[str] = set()
     children_map: defaultdict[str, set[str]] = defaultdict(set)
 
@@ -122,32 +121,26 @@ def generate_api_docs(clean: bool = True) -> bool:
         parts = short.split(".")
         children_map[""].add(parts[0])
 
-        # Register all ancestor packages
         for i in range(1, len(parts)):
             pkg = "/".join(parts[:i])
             packages.add(pkg)
 
-        # Link package -> subpackage chain
         for i in range(1, len(parts) - 1):
             parent_pkg = "/".join(parts[:i])
             child_pkg = "/".join(parts[: i + 1])
             children_map[parent_pkg].add(child_pkg)
 
-        # Add module as a child of its immediate package (or root if top-level)
         parent_pkg = "/".join(parts[:-1]) if len(parts) > 1 else ""
         mod_doc = "/".join(parts)
         children_map[parent_pkg].add(mod_doc)
 
-    # Write module pages
     for module_path in modules:
-        create_rst_file(module_path, module_path, DOCS_API_DIR)  # title = full import path
+        create_rst_file(module_path, module_path, DOCS_API_DIR)
 
-    # Write per-package index pages
     for pkg_docname in sorted(packages):
         children = list(children_map.get(pkg_docname, []))
         _write_package_index(pkg_docname, children, packages)
 
-    # Write top-level index
     _write_package_index("", list(children_map[""]), packages)
 
     print(f"✓ Generated documentation for {len(modules)} modules")
@@ -176,7 +169,7 @@ def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProce
         return e
 
 
-def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
+def format_code(directory: str = str(PACKAGE_DIR), fix: bool = True) -> bool:
     """
     Format Python code using ruff.
 
@@ -189,7 +182,6 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
     """
     print(f"Formatting code in {directory}/...")
 
-    # Get all Python files
     python_files = list(Path(directory).rglob("*.py"))
 
     if not python_files:
@@ -198,7 +190,6 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
 
     success = True
 
-    # Run ruff check with optional fixes
     if fix:
         print("Running ruff check with fixes...")
         result = run_command(
@@ -209,7 +200,6 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
             print(f"Ruff check found issues (exit code: {result.returncode})")
             success = False
 
-    # Run ruff format
     print("Running ruff format...")
     result = run_command(["ruff", "format", "--config", "pyproject.toml"] + [str(f) for f in python_files], check=False)
     if result.returncode != 0:
@@ -225,7 +215,7 @@ def format_code(directory: str = PROJECT_NAME, fix: bool = True) -> bool:
 
 
 def discover_modules(project_name: str) -> list[str]:
-    base_dir = (PROJECT_ROOT / project_name).resolve()
+    base_dir = (PYTHON_SOURCE_ROOT / project_name).resolve()
     if not base_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {base_dir}")
 
@@ -233,7 +223,7 @@ def discover_modules(project_name: str) -> list[str]:
     for py_file in base_dir.rglob("*.py"):
         if py_file.name == "__init__.py":
             continue
-        rel = py_file.relative_to(base_dir)  # relative inside the package
+        rel = py_file.relative_to(base_dir)
         dotted = rel.with_suffix("").as_posix().replace("/", ".")
         modules.append(f"{project_name}.{dotted}")
     return sorted(set(modules))
@@ -276,14 +266,13 @@ class ScriptArgs:
         default=True,
         metadata={"help": "Clean old documentation (use --no-clean to disable)"},
     )
-    directory: str = field(default=PROJECT_NAME, metadata={"help": f"Directory to format (default: {PROJECT_NAME})"})
+    directory: str = field(default=str(PACKAGE_DIR), metadata={"help": f"Directory to format (default: {PACKAGE_DIR})"})
 
 
 def main(argv: list[str] | None = None) -> None:
-
     exit_code = 0
 
-    if not format_code("easymlx", fix=True):
+    if not format_code(str(PACKAGE_DIR), fix=True):
         exit_code = 1
 
     if not generate_api_docs(clean=True):

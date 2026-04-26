@@ -15,7 +15,6 @@
 """Tests for Qwen3-VL-MoE model."""
 
 import pytest
-
 from easymlx.modules.qwen3_vl_moe import Qwen3VLMoeConfig, Qwen3VLMoeForConditionalGeneration
 
 from .test_utils import CausalLMTester, VisionLanguageTester

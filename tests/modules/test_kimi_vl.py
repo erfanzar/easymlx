@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.kimi_vl import KimiVLConfig, KimiVLForCausalLM, KimiVLModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -90,7 +89,6 @@ class TestKimiVL:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Add fake vision weights that should be stripped
         upstream_weights["vision_tower.encoder.weight"] = mx.zeros((4, 4))
         upstream_weights["multi_modal_projector.linear.weight"] = mx.zeros((4, 4))
 

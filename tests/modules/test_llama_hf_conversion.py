@@ -19,15 +19,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import mlx.core as mx
+from easymlx import LayerwiseQuantizationConfig, QuantizationConfig, QuantizationRule
+from easymlx.inference.esurge import SamplingParams, eSurge
+from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 from mlx.utils import tree_flatten
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
-
-from easymlx import LayerwiseQuantizationConfig, QuantizationConfig, QuantizationRule
-from easymlx.inference.esurge import SamplingParams, eSurge
-from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 
 
 def _tiny_llama() -> LlamaForCausalLM:
@@ -110,6 +109,52 @@ def test_llama_from_pretrained_auto_convert_local_repo(tmp_path: Path):
     assert isinstance(loaded, LlamaForCausalLM)
 
 
+def test_llama_auto_convert_streams_multiple_source_shards(tmp_path: Path):
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = LlamaForCausalLM(config)
+    mx.eval(model.parameters())
+    source_dir = tmp_path / "raw-hf-sharded"
+    cache_dir = tmp_path / "converted-cache"
+    source_dir.mkdir()
+
+    model.config.save_pretrained(str(source_dir))
+    params = list(_flatten_params(model).items())
+    split = len(params) // 2
+    mx.save_safetensors(str(source_dir / "model-00001-of-00002.safetensors"), dict(params[:split]))
+    mx.save_safetensors(str(source_dir / "model-00002-of-00002.safetensors"), dict(params[split:]))
+
+    loaded = LlamaForCausalLM.from_pretrained(
+        source_dir,
+        auto_convert_hf=True,
+        converted_cache_dir=cache_dir,
+        quantization=QuantizationConfig(mode="affine", bits=4, group_size=32),
+    )
+
+    cache_entries = list(cache_dir.iterdir())
+    assert len(cache_entries) == 1
+    converted = cache_entries[0]
+    assert not (converted / "model.safetensors").exists()
+    converted_shards = sorted(converted.glob("model-*-of-*.safetensors"))
+    assert len(converted_shards) == 2
+    assert (converted / "easymlx_source.json").exists()
+    converted_weights = {}
+    for shard in converted_shards:
+        converted_weights.update(mx.load(str(shard)))
+    assert "model.layers.0.self_attn.q_proj.scales" in converted_weights
+
+    loaded_params = _flatten_params(loaded)
+    assert "model.layers.0.self_attn.q_proj.scales" in loaded_params
+    assert isinstance(loaded, LlamaForCausalLM)
+
+
 def test_llama_from_pretrained_auto_convert_feeds_esurge_without_tokenizer(tmp_path: Path):
     model = _tiny_llama()
     source_dir = tmp_path / "raw-hf"
@@ -178,5 +223,34 @@ def test_llama_from_pretrained_supports_layerwise_quantization_rules(tmp_path: P
     assert "model.layers.0.mlp.down_proj.scales" not in params
     assert "model.layers.0.mlp.down_proj.weight" in params
 
-    assert getattr(loaded.model.embed_tokens, "bits") == 8
-    assert getattr(loaded.model.layers[0].self_attn.q_proj, "bits") == 4
+    assert loaded.model.embed_tokens.bits == 8
+    assert loaded.model.layers[0].self_attn.q_proj.bits == 4
+
+
+def test_llama_quantization_skips_incompatible_group_shapes(tmp_path: Path):
+    config = LlamaConfig(
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=48,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=32,
+    )
+    model = LlamaForCausalLM(config)
+    mx.eval(model.parameters())
+    source_dir = tmp_path / "incompatible-quant-shape"
+    source_dir.mkdir()
+
+    model.config.save_pretrained(str(source_dir))
+    mx.save_safetensors(str(source_dir / "model.safetensors"), _flatten_params(model))
+
+    loaded = LlamaForCausalLM.from_pretrained(
+        source_dir,
+        quantization=QuantizationConfig(mode="affine", bits=4, group_size=32),
+    )
+
+    params = _flatten_params(loaded)
+    assert "model.layers.0.self_attn.q_proj.scales" in params
+    assert "model.layers.0.mlp.down_proj.scales" not in params
+    assert "model.layers.0.mlp.down_proj.weight" in params

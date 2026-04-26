@@ -15,14 +15,13 @@
 """Tests for GraniteMoeHybrid model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.granitemoehybrid import (
     GraniteMoeHybridConfig,
     GraniteMoeHybridForCausalLM,
     GraniteMoeHybridModel,
 )
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -45,7 +44,6 @@ class TestGraniteMoeHybrid:
             attention_multiplier=1.0,
             residual_multiplier=1.0,
             logits_scaling=1.0,
-            # Dense mode (no MoE) for testing
             num_local_experts=None,
             tie_word_embeddings=True,
         )

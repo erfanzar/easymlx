@@ -14,16 +14,14 @@
 
 """Tests for LongcatFlashNgram model."""
 
-import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.longcat_flash_ngram import (
     LongcatFlashNgramConfig,
     LongcatFlashNgramForCausalLM,
     LongcatFlashNgramModel,
 )
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -99,7 +97,6 @@ class TestLongcatFlashNgram:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Simulate upstream naming
         if "model.ngram_embeddings.word_embeddings.weight" in upstream_weights:
             upstream_weights["model.embed_tokens.weight"] = upstream_weights.pop(
                 "model.ngram_embeddings.word_embeddings.weight"

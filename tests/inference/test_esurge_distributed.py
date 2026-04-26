@@ -18,7 +18,6 @@ import socket
 from dataclasses import dataclass
 
 import pytest
-
 from easymlx.inference.esurge.distributed.controller import DistributedController, resolve_distributed_role
 from easymlx.inference.esurge.distributed.discovery import DiscoveryResult, discover_workers, resolve_service_hosts
 from easymlx.inference.esurge.distributed.leader_client import WorkerRpcClient
@@ -47,7 +46,7 @@ def test_resolve_service_hosts_sorts_and_deduplicates(monkeypatch: pytest.Monkey
         (socket.AF_INET, socket.SOCK_STREAM, 0, "", ("10.0.0.2", 0)),
     ]
 
-    def fake_getaddrinfo(*args, **kwargs):  # type: ignore[no-untyped-def]
+    def fake_getaddrinfo(*args, **kwargs):
         return entries
 
     monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
@@ -131,7 +130,7 @@ def test_controller_leader_start_dispatch_verify_shutdown() -> None:
         verify_sampling_digest=True,
         config_fingerprint="fp",
         resolve_hosts_fn=lambda service_name, world_size: DiscoveryResult(hosts=["10.0.0.1", "10.0.0.2"]),
-        worker_client_cls=FakeClient,  # type: ignore[arg-type]
+        worker_client_cls=FakeClient,
     )
     controller.start()
     dispatch = controller.dispatch_step({"batch": 1})
@@ -160,7 +159,7 @@ def test_controller_worker_start_and_shutdown() -> None:
     class FakeServer:
         last_instance: "FakeServer | None" = None
 
-        def __init__(self, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        def __init__(self, **kwargs) -> None:
             self.started = False
             self.stopped = False
             self.endpoint = "tcp://worker:7000"
@@ -183,7 +182,7 @@ def test_controller_worker_start_and_shutdown() -> None:
         config_fingerprint="fp",
         execute_step=lambda payload: _ModelOutput(req_ids=["r"], sampled_token_ids=[[1]]),
         resolve_hosts_fn=lambda service_name, world_size: DiscoveryResult(hosts=["10.0.0.1", "10.0.0.2"]),
-        worker_server_cls=FakeServer,  # type: ignore[arg-type]
+        worker_server_cls=FakeServer,
     )
     controller.start()
     assert FakeServer.last_instance is not None
@@ -213,7 +212,7 @@ def test_controller_handshake_mismatch_raises() -> None:
         auth_token="token",
         config_fingerprint="expected",
         resolve_hosts_fn=lambda service_name, world_size: DiscoveryResult(hosts=["10.0.0.1", "10.0.0.2"]),
-        worker_client_cls=BadClient,  # type: ignore[arg-type]
+        worker_client_cls=BadClient,
     )
     with pytest.raises(ValueError, match="config mismatch"):
         controller.start()

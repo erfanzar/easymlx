@@ -15,10 +15,9 @@
 """Tests for Cohere2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.cohere2 import Cohere2Config, Cohere2ForCausalLM, Cohere2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

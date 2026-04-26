@@ -15,10 +15,9 @@
 """Tests for Kimi K2.5 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.kimi_k25 import KimiK25Config, KimiK25ForCausalLM, KimiK25Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

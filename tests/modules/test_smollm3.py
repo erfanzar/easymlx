@@ -15,10 +15,9 @@
 """Tests for SmolLM-3 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.smollm3 import SmolLM3Config, SmolLM3ForCausalLM, SmolLM3Model, SmolLM3NoPE
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -85,10 +84,7 @@ class TestSmolLM3:
     def test_sanitize_maps_upstream_checkpoint_keys(self, smollm3_config):
         model = SmolLM3ForCausalLM(smollm3_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
-        upstream_weights = {
-            key.replace("model.model.", "model.", 1): value
-            for key, value in local_weights.items()
-        }
+        upstream_weights = {key.replace("model.model.", "model.", 1): value for key, value in local_weights.items()}
 
         sanitized = model.sanitize(upstream_weights)
 

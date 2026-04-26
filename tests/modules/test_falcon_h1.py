@@ -15,10 +15,9 @@
 """Tests for Falcon-H1 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.falcon_h1 import FalconH1Config, FalconH1ForCausalLM, FalconH1Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

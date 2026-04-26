@@ -15,14 +15,13 @@
 """Tests for Bailing MoE Linear model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.bailing_moe_linear import (
     BailingMoeLinearConfig,
     BailingMoeLinearForCausalLM,
     BailingMoeLinearModel,
 )
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

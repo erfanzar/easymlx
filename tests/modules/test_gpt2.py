@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.gpt2 import GPT2Config, GPT2ForCausalLM, GPT2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -73,17 +72,16 @@ class TestGPT2:
         model = GPT2ForCausalLM(gpt2_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
 
-        # Build upstream weights: strip "model." prefix, add Conv1D transposed weights
-        # and attn.bias buffers.
         upstream_weights: dict[str, mx.array] = {}
         for key, value in local_weights.items():
             raw_key = key.removeprefix("model.")
-            if raw_key.endswith((".attn.c_attn.weight", ".attn.c_proj.weight", ".mlp.c_fc.weight", ".mlp.c_proj.weight")):
+            if raw_key.endswith(
+                (".attn.c_attn.weight", ".attn.c_proj.weight", ".mlp.c_fc.weight", ".mlp.c_proj.weight")
+            ):
                 upstream_weights[raw_key] = value.transpose(1, 0)
             else:
                 upstream_weights[raw_key] = value
 
-        # Add buffer keys that should be stripped.
         upstream_weights["h.0.attn.bias"] = mx.zeros((1,))
         upstream_weights["h.0.attn.masked_bias"] = mx.zeros((1,))
 

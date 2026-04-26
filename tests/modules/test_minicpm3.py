@@ -15,10 +15,9 @@
 """Tests for MiniCPM3 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.minicpm3 import MiniCPM3Config, MiniCPM3ForCausalLM, MiniCPM3Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

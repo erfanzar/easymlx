@@ -15,10 +15,9 @@
 """Tests for DeepSeek model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.deepseek import DeepseekConfig, DeepseekForCausalLM, DeepseekModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

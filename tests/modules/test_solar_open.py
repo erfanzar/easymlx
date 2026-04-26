@@ -14,12 +14,10 @@
 
 """Tests for Solar Open model."""
 
-import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.solar_open import SolarOpenConfig, SolarOpenForCausalLM, SolarOpenModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -85,7 +83,6 @@ class TestSolarOpen:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Mimic upstream shard names by using individual expert tensors.
         prefix = "model.layers.1"
         for suffix in ["weight", "scales", "biases"]:
             for dst in ["gate_proj", "down_proj", "up_proj"]:

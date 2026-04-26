@@ -15,7 +15,6 @@
 """Tests for Qwen3 Omni MoE model."""
 
 import pytest
-
 from easymlx.modules.qwen3_omni_moe import Qwen3OmniMoeConfig, Qwen3OmniMoeForConditionalGeneration
 
 from .test_utils import EasyMLXOnlyTester

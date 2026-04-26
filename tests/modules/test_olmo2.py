@@ -15,10 +15,9 @@
 """Tests for OLMo2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.olmo2 import Olmo2Config, Olmo2ForCausalLM, Olmo2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

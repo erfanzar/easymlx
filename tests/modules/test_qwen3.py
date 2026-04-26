@@ -15,7 +15,6 @@
 """Tests for Qwen3 model."""
 
 import pytest
-
 from easymlx.modules.qwen3 import Qwen3Config, Qwen3ForCausalLM
 
 from .test_utils import CausalLMTester
@@ -60,3 +59,9 @@ class TestQwen3:
             max_new_tokens=8,
         )
         assert result.success, f"Qwen3 generation failed: {result.error_message}"
+
+    def test_config_accepts_null_sliding_window(self):
+        """HF Qwen3 configs may set `sliding_window` to null."""
+        config = Qwen3Config(use_sliding_window=False, sliding_window=None)
+
+        assert config.sliding_window is None

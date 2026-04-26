@@ -20,11 +20,10 @@ from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
-from PIL import Image
-
 from easymlx.inference.esurge.multimodal.cache import VisionEncoderCache
 from easymlx.inference.esurge.multimodal.manager import MultimodalManager
 from easymlx.inference.esurge.multimodal.types import BatchedMultiModalInputs, MultimodalInput
+from PIL import Image
 
 
 @dataclass

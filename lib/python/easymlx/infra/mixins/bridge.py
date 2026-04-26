@@ -1,0 +1,1335 @@
+# Copyright 2026 The EASYDEL / EASYMLX Author @erfanzar (Erfan Zare Chavoshi).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Model I/O helpers for easymlx.
+
+This mixin intentionally targets MLX-native weights (typically ``model*.safetensors``)
+and HuggingFace-compatible ``config.json``.
+
+It provides three main capabilities:
+
+1. **Saving** -- :meth:`EasyBridgeMixin.save_pretrained`
+2. **HuggingFace conversion** -- :meth:`EasyBridgeMixin.convert_hf_checkpoint`
+3. **Loading** -- :meth:`EasyBridgeMixin.from_pretrained`
+"""
+
+from __future__ import annotations
+
+import contextlib
+import copy
+import glob
+import hashlib
+import json
+import mmap
+import os
+import re
+import shutil
+import struct
+import typing as tp
+from pathlib import Path
+
+import mlx.core as mx
+from mlx.utils import tree_flatten
+
+from ...utils.hf_composite import resolve_hf_composite_repo, resolve_local_hf_path
+from ..base_config import EasyMLXBaseConfig
+from ..errors import EasyMLXRuntimeError
+from ..etils import (
+    MODEL_WEIGHTS_GLOB,
+    MODEL_WEIGHTS_NAME,
+    LayerwiseQuantizationConfig,
+    QuantizationConfig,
+    QuantizationMode,
+    QuantizationSpec,
+)
+
+_HF_SUPPORT_FILES = (
+    "generation_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer_config.json",
+    "chat_template.jinja",
+    "merges.txt",
+    "vocab.json",
+)
+_CONVERTED_SOURCE_METADATA = "easymlx_source.json"
+_EXTRA_MODEL_WEIGHTS_GLOBS = ("diffusion_pytorch_model*.safetensors",)
+
+
+@contextlib.contextmanager
+def _no_weight_init():
+    """Suppress random weight initialisation during model construction.
+
+    MLX modules (``nn.Linear``, ``nn.Embedding``, …) allocate random
+    weights in ``__init__``.  When we are about to overwrite every
+    parameter with pretrained weights, building the random computation
+    graph is wasted work.  This context manager temporarily replaces
+    ``mx.random.uniform`` and ``mx.random.normal`` with zero-returning
+    stubs so that model construction is essentially free.
+    """
+    orig_uniform = mx.random.uniform
+    orig_normal = mx.random.normal
+
+    def _zero_uniform(*_a, shape=(), dtype=mx.float32, **_kw):
+        return mx.zeros(shape, dtype=dtype)
+
+    def _zero_normal(*_a, shape=(), dtype=mx.float32, **_kw):
+        return mx.zeros(shape, dtype=dtype)
+
+    mx.random.uniform = _zero_uniform
+    mx.random.normal = _zero_normal
+    try:
+        yield
+    finally:
+        mx.random.uniform = orig_uniform
+        mx.random.normal = orig_normal
+
+
+_QUANT_MODE_DEFAULTS: dict[str, dict[str, int]] = {
+    "affine": {"bits": 4, "group_size": 64},
+    "mxfp4": {"bits": 4, "group_size": 32},
+    "mxfp8": {"bits": 8, "group_size": 32},
+    "nvfp4": {"bits": 4, "group_size": 16},
+}
+
+
+def _parse_quantization_config(
+    quantization: QuantizationConfig | QuantizationMode,
+) -> dict[str, int | str]:
+    """Parse a quantization spec into a validated kwargs dict.
+
+    Args:
+        quantization: A mode string or a :class:`QuantizationConfig` dict.
+
+    Returns:
+        A dict with ``mode``, ``bits``, ``group_size`` ready for
+        :func:`mlx.nn.quantize` / :func:`mx.quantize`.
+
+    Raises:
+        ValueError: If the mode is not recognised.
+    """
+    if isinstance(quantization, str):
+        quantization = QuantizationConfig(mode=quantization)
+
+    mode = quantization.get("mode", "affine")
+    if mode not in _QUANT_MODE_DEFAULTS:
+        raise ValueError(f"Unknown quantization mode '{mode}'. Supported: {tuple(_QUANT_MODE_DEFAULTS)}")
+
+    defaults = _QUANT_MODE_DEFAULTS[mode]
+    return {
+        "mode": mode,
+        "bits": quantization.get("bits", defaults["bits"]),
+        "group_size": quantization.get("group_size", defaults["group_size"]),
+    }
+
+
+def _is_layerwise_quantization_config(quantization: object) -> tp.TypeGuard[LayerwiseQuantizationConfig]:
+    """Return ``True`` when *quantization* uses regex-based rule matching."""
+    return isinstance(quantization, dict) and ("default" in quantization or "rules" in quantization)
+
+
+def _maybe_parse_quantization_config(
+    quantization: QuantizationConfig | QuantizationMode | None,
+) -> dict[str, int | str] | None:
+    """Parse a quantization config, treating ``None`` / ``""`` as disabled."""
+    if quantization is None or quantization == "":
+        return None
+    return _parse_quantization_config(quantization)
+
+
+def _quantization_config_key(quant_kwargs: dict[str, int | str]) -> tuple[str, int, int]:
+    """Return a hashable key for de-duplicating quantization configs."""
+    return (
+        str(quant_kwargs["mode"]),
+        int(quant_kwargs["bits"]),
+        int(quant_kwargs["group_size"]),
+    )
+
+
+def _format_quantization_config(quant_kwargs: dict[str, int | str]) -> str:
+    """Format a quantization config for logs and error messages."""
+    return "mode={mode}, bits={bits}, group_size={group_size}".format(**quant_kwargs)
+
+
+def _module_supports_quantization_config(module: object, quant_kwargs: dict[str, int | str]) -> bool:
+    """Return whether a module's weight shape can use ``quant_kwargs``."""
+    if not hasattr(module, "to_quantized"):
+        return False
+    weight = getattr(module, "weight", None)
+    shape = getattr(weight, "shape", None)
+    if not shape:
+        return False
+    return int(shape[-1]) % int(quant_kwargs["group_size"]) == 0
+
+
+def _fixed_quantization_class_predicate(
+    quant_kwargs: dict[str, int | str],
+) -> tp.Callable[[str, object], bool | dict[str, int | str]]:
+    """Build a safe predicate for uniform quantization."""
+
+    def class_predicate(_path: str, module: object) -> bool | dict[str, int | str]:
+        if not _module_supports_quantization_config(module, quant_kwargs):
+            return False
+        return dict(quant_kwargs)
+
+    return class_predicate
+
+
+class _PreparedQuantizationPlan(tp.NamedTuple):
+    """Normalized quantization plan shared by load-time and in-place flows."""
+
+    nn_quantize_kwargs: dict[str, tp.Any]
+    fixed_quant_kwargs: dict[str, int | str] | None
+    weight_quantization_map: dict[str, dict[str, int | str]]
+    unique_quant_configs: tuple[dict[str, int | str], ...]
+    summary: str
+
+
+def _prepare_quantization_plan(
+    quantization: QuantizationSpec | None,
+) -> _PreparedQuantizationPlan | None:
+    """Normalize a quantization spec into MLX kwargs and per-weight metadata."""
+    if quantization is None or quantization == "":
+        return None
+
+    if not _is_layerwise_quantization_config(quantization):
+        quant_kwargs = _parse_quantization_config(quantization)
+        return _PreparedQuantizationPlan(
+            nn_quantize_kwargs={"class_predicate": _fixed_quantization_class_predicate(quant_kwargs)},
+            fixed_quant_kwargs=dict(quant_kwargs),
+            weight_quantization_map={},
+            unique_quant_configs=(dict(quant_kwargs),),
+            summary=_format_quantization_config(quant_kwargs),
+        )
+
+    default_quant_kwargs = _maybe_parse_quantization_config(quantization.get("default"))
+    raw_rules = quantization.get("rules", [])
+
+    unique_quant_configs: list[dict[str, int | str]] = []
+    unique_quant_config_keys: set[tuple[str, int, int]] = set()
+
+    def _add_unique_quant_config(quant_kwargs: dict[str, int | str] | None) -> None:
+        if quant_kwargs is None:
+            return
+        key = _quantization_config_key(quant_kwargs)
+        if key not in unique_quant_config_keys:
+            unique_quant_config_keys.add(key)
+            unique_quant_configs.append(dict(quant_kwargs))
+
+    _add_unique_quant_config(default_quant_kwargs)
+
+    compiled_rules: list[tuple[re.Pattern[str], dict[str, int | str] | None]] = []
+    for rule_index, rule in enumerate(raw_rules):
+        if "pattern" not in rule:
+            raise ValueError(f"Quantization rule at index {rule_index} is missing required key 'pattern'.")
+        pattern = rule["pattern"]
+        try:
+            compiled_pattern = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"Invalid quantization regex at rules[{rule_index}]: {pattern!r}") from exc
+
+        rule_quant_kwargs = _maybe_parse_quantization_config(rule.get("config"))
+        _add_unique_quant_config(rule_quant_kwargs)
+        compiled_rules.append((compiled_pattern, rule_quant_kwargs))
+
+    if not compiled_rules and default_quant_kwargs is not None:
+        return _PreparedQuantizationPlan(
+            nn_quantize_kwargs={"class_predicate": _fixed_quantization_class_predicate(default_quant_kwargs)},
+            fixed_quant_kwargs=dict(default_quant_kwargs),
+            weight_quantization_map={},
+            unique_quant_configs=tuple(unique_quant_configs),
+            summary=_format_quantization_config(default_quant_kwargs),
+        )
+
+    planned_weight_quantization_map: dict[str, dict[str, int | str]] = {}
+
+    def class_predicate(path: str, module: object) -> bool | dict[str, int | str]:
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        quant_kwargs = default_quant_kwargs
+        for compiled_pattern, rule_quant_kwargs in compiled_rules:
+            if compiled_pattern.search(path):
+                quant_kwargs = rule_quant_kwargs
+                break
+
+        if quant_kwargs is None:
+            return False
+        if not _module_supports_quantization_config(module, quant_kwargs):
+            return False
+
+        weight_key = f"{path}.weight" if path else "weight"
+        planned_weight_quantization_map[weight_key] = dict(quant_kwargs)
+        return dict(quant_kwargs)
+
+    summary_parts = [f"rules={len(compiled_rules)}", f"configs={len(unique_quant_configs)}"]
+    if default_quant_kwargs is not None:
+        summary_parts.insert(0, f"default[{_format_quantization_config(default_quant_kwargs)}]")
+    else:
+        summary_parts.insert(0, "default[disabled]")
+
+    return _PreparedQuantizationPlan(
+        nn_quantize_kwargs={"class_predicate": class_predicate},
+        fixed_quant_kwargs=None,
+        weight_quantization_map=planned_weight_quantization_map,
+        unique_quant_configs=tuple(unique_quant_configs),
+        summary=", ".join(summary_parts),
+    )
+
+
+def _validate_quantization_kernel(quant_kwargs: dict[str, int | str]) -> None:
+    """Run a tiny dummy quantize+matmul to verify the Metal kernel loads.
+
+    Raises:
+        RuntimeError: With a user-friendly message if the kernel is
+            unavailable on the current device.
+    """
+    gs = int(quant_kwargs["group_size"])
+    bits = int(quant_kwargs["bits"])
+    mode = str(quant_kwargs["mode"])
+    try:
+        dummy_w = mx.ones((gs, gs))
+        quant_result = mx.quantize(dummy_w, gs, bits, mode=mode)
+        q, scales = quant_result[0], quant_result[1]
+        biases = quant_result[2] if len(quant_result) > 2 else None
+        out = mx.quantized_matmul(
+            mx.ones((1, gs)),
+            q,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=gs,
+            bits=bits,
+            mode=mode,
+        )
+        mx.eval(out)
+    except RuntimeError as exc:
+        if "Unable to load kernel" in str(exc):
+            device_info = mx.metal.device_info()
+            device_name = device_info.get("device_name", "unknown")
+            raise RuntimeError(
+                f"Quantization mode '{mode}' is not supported on {device_name} "
+                f"(arch={device_info.get('architecture', '?')}). "
+                f"The required Metal kernel is not available in MLX {mx.__version__}. "
+                f"Try mode='affine' (bits=4, group_size=64) which works on all Apple Silicon, "
+                f"or upgrade MLX: pip install -U mlx"
+            ) from exc
+        raise
+
+
+def _quantize_weights(
+    weights: dict[str, mx.array],
+    weight_quantization_map: dict[str, dict[str, int | str]],
+) -> dict[str, mx.array]:
+    """Quantize full-precision weights that belong to quantized modules.
+
+    For every key in *weights* that appears in *weight_quantization_map*
+    **and** has a floating-point dtype, the value is replaced with the
+    arrays produced by :func:`mx.quantize` using that weight's assigned
+    quantization config. All other entries pass through unchanged.
+
+    This lets us quantize weights while streaming shards, so full-precision
+    data for the whole model never needs to live in memory at once.
+
+    Args:
+        weights: Flat weight dictionary (already sanitized / cast).
+        weight_quantization_map: Mapping from ``"prefix.weight"`` keys
+            to ``dict(mode=..., bits=..., group_size=...)``.
+
+    Returns:
+        A new dictionary with quantized entries replacing the originals.
+    """
+    out: dict[str, mx.array] = {}
+    for key, value in weights.items():
+        quant_kwargs = weight_quantization_map.get(key)
+        if quant_kwargs is not None and mx.issubdtype(value.dtype, mx.floating):
+            group_size = int(quant_kwargs["group_size"])
+            bits = int(quant_kwargs["bits"])
+            mode = str(quant_kwargs["mode"])
+            quant_result = mx.quantize(value, group_size, bits, mode=mode)
+
+            out[key] = quant_result[0]
+            prefix = key[: -len(".weight")]
+            out[f"{prefix}.scales"] = quant_result[1]
+            if len(quant_result) > 2:
+                out[f"{prefix}.biases"] = quant_result[2]
+        else:
+            out[key] = value
+    return out
+
+
+def _collect_quantized_weight_map(
+    model: EasyBridgeMixin,
+    quant_kwargs: dict[str, int | str],
+) -> dict[str, dict[str, int | str]]:
+    """Collect the quantized weight keys currently expected by *model*."""
+    return {
+        key.rsplit(".scales", 1)[0] + ".weight": dict(quant_kwargs)
+        for key, _ in tree_flatten(model.parameters())
+        if key.endswith(".scales")
+    }
+
+
+def _detect_uniform_quantization(model: EasyBridgeMixin) -> dict[str, int | str] | None:
+    """Return a uniform quantization config for *model* when one exists."""
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return None
+
+    quant_configs: set[tuple[str, int, int]] = set()
+    for _, module in named_modules():
+        mode = getattr(module, "mode", None)
+        bits = getattr(module, "bits", None)
+        group_size = getattr(module, "group_size", None)
+        if mode is None or bits is None or group_size is None:
+            continue
+        quant_configs.add((str(mode), int(bits), int(group_size)))
+
+    if len(quant_configs) != 1:
+        return None
+
+    mode, bits, group_size = next(iter(quant_configs))
+    return {
+        "mode": mode,
+        "bits": bits,
+        "group_size": group_size,
+    }
+
+
+def _apply_quantization(
+    model: EasyBridgeMixin,
+    quantization: QuantizationSpec | None,
+) -> None:
+    """Parse, validate, and apply quantization to a model in-place.
+
+    Convenience wrapper used by external callers (e.g. auto-model classes).
+    ``from_pretrained`` uses the lower-level helpers directly so it can
+    quantize per-shard for better memory behaviour.
+
+    Args:
+        model: The model to quantize.
+        quantization: Mode string, :class:`QuantizationConfig`, or
+            :class:`LayerwiseQuantizationConfig`. ``None`` / ``""`` is
+            a no-op.
+    """
+    import logging
+
+    import mlx.nn as nn
+
+    quantization_plan = _prepare_quantization_plan(quantization)
+    if quantization_plan is None:
+        return
+
+    logger = logging.getLogger("easymlx.quantization")
+    logger.info("Quantizing model: %s", quantization_plan.summary)
+    for quant_kwargs in quantization_plan.unique_quant_configs:
+        _validate_quantization_kernel(quant_kwargs)
+    nn.quantize(model, **quantization_plan.nn_quantize_kwargs)
+    logger.info("Quantization complete")
+
+
+def _resolve_model_path(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    revision: str | None = None,
+    local_files_only: bool = False,
+    subfolder: str | None = None,
+) -> Path:
+    """Resolve a model identifier to a local directory path.
+
+    If the path already exists locally it is returned directly. Otherwise
+    the model is downloaded via ``huggingface_hub.snapshot_download``.
+
+    Args:
+        pretrained_model_name_or_path: A local filesystem path or a
+            HuggingFace Hub repository ID (e.g.
+            ``"meta-llama/Llama-3-8B"``).
+        revision: Optional git revision (branch, tag, or commit SHA) for
+            the Hub download.
+        local_files_only: If ``True``, never attempt a network download.
+
+    Returns:
+        A :class:`Path` pointing to the local model directory.
+
+    Raises:
+        EasyMLXRuntimeError: If the path does not exist locally and the
+            ``huggingface_hub`` package is not available.
+    """
+    raw_path = Path(pretrained_model_name_or_path).expanduser()
+    if raw_path.exists():
+        path = resolve_local_hf_path(pretrained_model_name_or_path)
+        resolved_path = path / subfolder if subfolder else path
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Resolved model path does not exist: {resolved_path!s}")
+        return resolved_path
+
+    if local_files_only:
+        cached_path = resolve_local_hf_path(pretrained_model_name_or_path)
+        if cached_path.exists():
+            resolved_path = cached_path / subfolder if subfolder else cached_path
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Resolved model path does not exist: {resolved_path!s}")
+            return resolved_path
+
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as exc:
+        raise EasyMLXRuntimeError(
+            f"Could not resolve {pretrained_model_name_or_path!r} as a local path, and huggingface_hub is unavailable."
+        ) from exc
+
+    allow_patterns: list[str] | None = None
+    if subfolder is not None:
+        allow_patterns = [
+            f"{subfolder}/**",
+            "tokenizer/**",
+            "tokenizer_2/**",
+        ]
+
+    resolved_root = Path(
+        snapshot_download(
+            repo_id=str(pretrained_model_name_or_path),
+            revision=revision,
+            local_files_only=local_files_only,
+            allow_patterns=allow_patterns,
+        )
+    )
+    resolved_path = resolved_root / subfolder if subfolder else resolved_root
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Resolved model path does not exist: {resolved_path!s}")
+    return resolved_path
+
+
+def _resolve_weight_files(model_path: Path, *, weights_name: str | None = None) -> list[Path]:
+    """Locate weight files inside a model directory.
+
+    Args:
+        model_path: The model directory to search.
+        weights_name: If provided, return exactly this filename under
+            *model_path* without searching.
+
+    Returns:
+        A sorted list of :class:`Path` objects pointing to the
+        discovered weight files. May be empty if nothing matches.
+    """
+    if weights_name is not None:
+        return [model_path / weights_name]
+
+    weight_files = [Path(path) for path in sorted(glob.glob(str(model_path / MODEL_WEIGHTS_GLOB)))]
+    if weight_files:
+        return weight_files
+
+    for pattern in _EXTRA_MODEL_WEIGHTS_GLOBS:
+        weight_files = [Path(path) for path in sorted(glob.glob(str(model_path / pattern)))]
+        if weight_files:
+            return weight_files
+
+    sharded_weight_files = [Path(path) for path in sorted(glob.glob(str(model_path / "*-of-*.safetensors")))]
+    if sharded_weight_files:
+        return sharded_weight_files
+
+    fallback = model_path / "weights.safetensors"
+    return [fallback] if fallback.exists() else []
+
+
+def _converted_weight_file_names(weights_name: str, num_files: int) -> list[str]:
+    """Return output weight filenames for a streamed conversion."""
+    if num_files <= 1:
+        return [weights_name]
+
+    suffix = ".safetensors"
+    base_name = Path(weights_name).name
+    if base_name.endswith(suffix):
+        base_name = base_name[: -len(suffix)]
+    if not base_name:
+        base_name = Path(MODEL_WEIGHTS_NAME).stem
+    return [f"{base_name}-{idx + 1:05d}-of-{num_files:05d}{suffix}" for idx in range(num_files)]
+
+
+def _remove_converted_weight_files(path: Path, *, weights_name: str) -> None:
+    """Remove stale converted weight files before writing a new conversion."""
+    patterns = {weights_name, MODEL_WEIGHTS_GLOB, "*-of-*.safetensors", "weights.safetensors"}
+    for pattern in patterns:
+        for weight_file in path.glob(pattern):
+            if weight_file.is_file():
+                weight_file.unlink()
+
+
+_SAFETENSORS_DTYPE_MAP: dict[str, tuple[mx.Dtype, int]] = {
+    "BOOL": (mx.bool_, 1),
+    "U8": (mx.uint8, 1),
+    "I8": (mx.int8, 1),
+    "U16": (mx.uint16, 2),
+    "I16": (mx.int16, 2),
+    "U32": (mx.uint32, 4),
+    "I32": (mx.int32, 4),
+    "U64": (mx.uint64, 8),
+    "I64": (mx.int64, 8),
+    "F16": (mx.float16, 2),
+    "BF16": (mx.bfloat16, 2),
+    "F32": (mx.float32, 4),
+    "F64": (mx.float64, 8),
+}
+
+
+def _load_safetensors_file(path: Path) -> dict[str, mx.array]:
+    """Load a safetensors file by parsing the binary format directly.
+
+    Handles dtypes that ``mx.load`` or numpy cannot read natively,
+    including ``BF16`` and ``F8_E5M2``/``F8_E4M3``.
+
+    Args:
+        path: Path to a ``.safetensors`` file.
+
+    Returns:
+        A dictionary mapping parameter names to MLX arrays.
+    """
+    import numpy as np
+
+    weights: dict[str, mx.array] = {}
+    with open(path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        header_size = struct.unpack("<Q", mm[:8])[0]
+        header = json.loads(mm[8 : 8 + header_size])
+        data_offset = 8 + header_size
+
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            dtype_str: str = meta["dtype"]
+            shape: list[int] = meta["shape"]
+            start, end = meta["data_offsets"]
+            raw = mm[data_offset + start : data_offset + end]
+
+            if dtype_str in ("F8_E5M2", "F8_E4M3FN", "F8_E4M3"):
+                u8 = np.frombuffer(raw, dtype=np.uint8).astype(np.uint16)
+                if dtype_str == "F8_E5M2":
+                    f16_bits = u8 << 8
+                else:
+                    sign = (u8 >> 7) & 1
+                    exp = (u8 >> 3) & 0xF
+                    man = u8 & 0x7
+
+                    new_exp = np.where(exp == 0, np.uint16(0), exp.astype(np.uint16) - 7 + 15)
+                    f16_bits = (sign << 15) | (new_exp << 10) | (man.astype(np.uint16) << 7)
+                arr = mx.array(f16_bits.reshape(shape)).view(mx.float16)
+            elif dtype_str in _SAFETENSORS_DTYPE_MAP:
+                mlx_dtype, itemsize = _SAFETENSORS_DTYPE_MAP[dtype_str]
+                if dtype_str == "BF16":
+                    np_arr = np.frombuffer(raw, dtype=np.uint16).reshape(shape)
+                    arr = mx.array(np_arr).view(mx.bfloat16)
+                else:
+                    np_dtype = {1: np.uint8, 2: np.uint16, 4: np.uint32, 8: np.uint64}[itemsize]
+                    np_arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
+                    arr = mx.array(np_arr).view(mlx_dtype)
+            else:
+                raise EasyMLXRuntimeError(f"Unsupported safetensors dtype {dtype_str!r} for tensor {key!r} in {path!s}.")
+            weights[key] = arr
+
+        mm.close()
+    return weights
+
+
+def _load_torch_file(path: Path) -> dict[str, mx.array]:
+    """Load a PyTorch checkpoint file and convert tensors to MLX arrays.
+
+    Args:
+        path: Path to a ``.bin``, ``.pt``, or ``.pth`` file.
+
+    Returns:
+        A dictionary mapping parameter names to MLX arrays.
+
+    Raises:
+        EasyMLXRuntimeError: If the ``torch`` package is not installed.
+    """
+    try:
+        import torch
+    except Exception as exc:
+        raise EasyMLXRuntimeError(
+            f"Could not load raw Hugging Face torch checkpoint from {path!s}; install `torch`."
+        ) from exc
+
+    try:
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        state_dict = torch.load(path, map_location="cpu")
+
+    weights: dict[str, mx.array] = {}
+    for key, tensor in state_dict.items():
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach().cpu().numpy()
+        weights[key] = mx.array(tensor)
+    return weights
+
+
+def _load_weights_file(path: Path) -> dict[str, mx.array]:
+    """Load weights from a file, trying MLX native format first.
+
+    Falls back to :func:`_load_safetensors_file` for ``.safetensors``
+    files and :func:`_load_torch_file` for ``.bin``/``.pt``/``.pth``
+    files when native loading fails.
+
+    Args:
+        path: Path to the weight file.
+
+    Returns:
+        A dictionary mapping parameter names to MLX arrays.
+
+    Raises:
+        Exception: Re-raises the original exception if the file format
+            is not recognized by any loader.
+    """
+    try:
+        return mx.load(str(path))
+    except Exception:
+        if path.suffix == ".safetensors":
+            return _load_safetensors_file(path)
+        if path.suffix in {".bin", ".pt", ".pth"}:
+            return _load_torch_file(path)
+        raise
+
+
+def _copy_hf_support_files(source_dir: Path, target_dir: Path) -> None:
+    """Copy HuggingFace tokenizer and generation support files.
+
+    Copies files like ``tokenizer.json``, ``tokenizer_config.json``,
+    ``generation_config.json``, etc. from *source_dir* to *target_dir*
+    if they exist.
+
+    Args:
+        source_dir: Source directory containing the support files.
+        target_dir: Destination directory to copy files into.
+    """
+    for filename in _HF_SUPPORT_FILES:
+        src = source_dir / filename
+        if src.exists():
+            shutil.copy2(src, target_dir / filename)
+
+
+def _cast_weights(
+    weights: dict[str, mx.array],
+    *,
+    dtype: mx.Dtype | None,
+) -> dict[str, mx.array]:
+    """Cast floating-point weights to a target dtype.
+
+    Non-floating-point arrays (e.g. integer embeddings) and arrays
+    that already match the target dtype are left unchanged.
+
+    Args:
+        weights: Dictionary of parameter name to MLX array.
+        dtype: Target dtype. If ``None``, the weights are returned
+            unmodified.
+
+    Returns:
+        A new dictionary with the same keys, where floating-point
+        values have been cast to *dtype*.
+    """
+    if dtype is None:
+        return weights
+
+    casted: dict[str, mx.array] = {}
+    for key, value in weights.items():
+        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != dtype:
+            casted[key] = value.astype(dtype)
+        else:
+            casted[key] = value
+    return casted
+
+
+def _dtype_config_name(dtype: mx.Dtype | None) -> str | None:
+    if dtype is None:
+        return None
+    if dtype == mx.float16:
+        return "float16"
+    if dtype == mx.bfloat16:
+        return "bfloat16"
+    if dtype == mx.float32:
+        return "float32"
+    return None
+
+
+def _apply_config_dtype_override(config: object, dtype: mx.Dtype | None) -> None:
+    dtype_name = _dtype_config_name(dtype)
+    if dtype_name is None:
+        return
+
+    seen: set[int] = set()
+
+    def apply(owner: object) -> None:
+        owner_id = id(owner)
+        if owner_id in seen:
+            return
+        seen.add(owner_id)
+
+        try:
+            owner.dtype = dtype_name
+        except Exception:
+            pass
+        cache_dtype = getattr(owner, "cache_dtype", None)
+        if cache_dtype is None or str(cache_dtype).lower() in {"auto", "float16", "bfloat16", "float32"}:
+            try:
+                owner.cache_dtype = dtype_name
+            except Exception:
+                pass
+
+        for attr_name in (
+            "text_config",
+            "language_config",
+            "llm_config",
+            "decoder_config",
+            "model_config",
+            "vision_config",
+        ):
+            child = getattr(owner, attr_name, None)
+            if child is not None and child is not owner:
+                apply(child)
+
+    apply(config)
+
+
+def _default_converted_cache_root() -> Path:
+    """Return the default cache root for converted checkpoints.
+
+    Returns:
+        A :class:`Path` to ``~/.cache/easymlx/converted``.
+    """
+    return Path.home() / ".cache" / "easymlx" / "converted"
+
+
+def _conversion_cache_path(
+    pretrained_model_name_or_path: str | os.PathLike,
+    *,
+    revision: str | None = None,
+    converted_cache_dir: str | os.PathLike | None = None,
+    subfolder: str | None = None,
+    cache_variant: str | None = None,
+) -> Path:
+    """Compute the cache directory path for a converted checkpoint.
+
+    The path is deterministic and based on a SHA-1 digest of the source
+    identifier and revision.
+
+    Args:
+        pretrained_model_name_or_path: Original model path or Hub ID.
+        revision: Git revision string. Defaults to ``"main"`` for
+            digest computation.
+        converted_cache_dir: Override for the cache root directory.
+            If ``None``, :func:`_default_converted_cache_root` is used.
+
+    Returns:
+        A :class:`Path` for the conversion cache directory.
+    """
+    source = str(pretrained_model_name_or_path)
+    slug = Path(source.rstrip("/")).name or "model"
+    suffix = f"-{Path(subfolder).name}" if subfolder else ""
+    if cache_variant:
+        suffix = f"{suffix}-{cache_variant}"
+    digest = hashlib.sha1(f"{source}@{revision or 'main'}#{subfolder or ''}#{cache_variant or ''}".encode()).hexdigest()[
+        :12
+    ]
+    root = Path(converted_cache_dir) if converted_cache_dir is not None else _default_converted_cache_root()
+    return root / f"{slug}{suffix}-{digest}"
+
+
+def _quantization_cache_variant(quantization: QuantizationSpec | None) -> str | None:
+    """Return a stable cache suffix for explicitly quantized conversions."""
+    if quantization is None or quantization == "":
+        return None
+    payload = json.dumps(quantization, sort_keys=True, default=str)
+    digest = hashlib.sha1(payload.encode()).hexdigest()[:8]
+    mode = quantization if isinstance(quantization, str) else quantization.get("mode", "layerwise")
+    mode_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(mode)).strip("-") or "quant"
+    return f"{mode_name}-{digest}"
+
+
+def _has_converted_checkpoint(path: Path, *, weights_name: str) -> bool:
+    """Check whether a converted checkpoint already exists at *path*.
+
+    Args:
+        path: Directory to check.
+        weights_name: Expected weight file name.
+
+    Returns:
+        ``True`` if both ``config.json`` and the weight file exist.
+    """
+    if not (path / "config.json").exists():
+        return False
+    if (path / weights_name).exists():
+        return True
+
+    metadata_path = path / _CONVERTED_SOURCE_METADATA
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    converted_weight_files = metadata.get("converted_weight_files")
+    if not isinstance(converted_weight_files, list) or not converted_weight_files:
+        return False
+    return all((path / str(weight_file)).exists() for weight_file in converted_weight_files)
+
+
+def _resolve_config(
+    cls: type,
+    config: EasyMLXBaseConfig | dict | str | os.PathLike | None,
+    model_path: Path,
+) -> EasyMLXBaseConfig:
+    """Resolve a config argument into an ``EasyMLXBaseConfig`` instance."""
+    config_class = getattr(cls, "config_class", None) or EasyMLXBaseConfig
+    if config is None:
+        return config_class.from_pretrained(str(model_path))
+    if isinstance(config, (str, os.PathLike)):
+        return config_class.from_pretrained(str(config))
+    if isinstance(config, dict):
+        return config_class(**config)
+    if not isinstance(config, config_class):
+        raise TypeError(f"Unsupported config type: {type(config)}")
+    return config
+
+
+def _coerce_easymlx_quantization(value: object) -> QuantizationSpec | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and any(key in value for key in ("mode", "default", "rules")):
+        return tp.cast(QuantizationSpec, value)
+    return None
+
+
+def _resolve_config_quantization(config: EasyMLXBaseConfig, model_path: Path) -> QuantizationSpec | None:
+    """Resolve easymlx quantization metadata from config objects or config.json."""
+    for attr_name in ("easymlx_quantization", "quantization", "quantization_config"):
+        quantization = _coerce_easymlx_quantization(getattr(config, attr_name, None))
+        if quantization is not None:
+            return quantization
+
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return None
+    try:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw_config, dict):
+        return None
+    for key in ("easymlx_quantization", "quantization", "quantization_config"):
+        quantization = _coerce_easymlx_quantization(raw_config.get(key))
+        if quantization is not None:
+            return quantization
+    return None
+
+
+def _infer_quantization_from_path(model_path: Path) -> QuantizationSpec | None:
+    """Infer pre-quantized checkpoint metadata from common local directory names."""
+    name = str(model_path).lower()
+    for mode in ("mxfp4", "mxfp8", "nvfp4"):
+        if mode in name:
+            return mode
+    if re.search(r"(?:^|[-_/])(affine4|q4|4bit)(?:$|[-_/])", name):
+        return QuantizationConfig(mode="affine", bits=4, group_size=64)
+    return None
+
+
+class EasyBridgeMixin:
+    """Mixin providing model saving, loading, and HuggingFace conversion.
+
+    This mixin is designed to be composed into
+    :class:`~easymlx.infra.base_module.EasyMLXBaseModule`. It adds
+    :meth:`save_pretrained`, :meth:`from_pretrained`, and
+    :meth:`convert_hf_checkpoint` class/instance methods.
+
+    Attributes:
+        config: The active model configuration.
+        config_class: The configuration class to use for loading.
+    """
+
+    config: EasyMLXBaseConfig
+    config_class: type[EasyMLXBaseConfig] | None = None
+
+    def save_pretrained(
+        self,
+        save_directory: str | os.PathLike,
+        *,
+        weights_name: str = MODEL_WEIGHTS_NAME,
+    ) -> None:
+        """Save the model configuration and weights to a directory.
+
+        Args:
+            save_directory: Destination directory. Created if it does
+                not exist.
+            weights_name: Filename for the safetensors weight file.
+                Defaults to ``"model.safetensors"``.
+        """
+        path = Path(save_directory)
+        path.mkdir(parents=True, exist_ok=True)
+
+        if getattr(self, "config", None) is not None:
+            config_to_save = copy.deepcopy(self.config)
+            quantization_config = _detect_uniform_quantization(self)
+            if quantization_config is None:
+                if hasattr(config_to_save, "easymlx_quantization"):
+                    delattr(config_to_save, "easymlx_quantization")
+            else:
+                config_to_save.easymlx_quantization = quantization_config
+            config_to_save.save_pretrained(str(path))
+        weights = dict(tree_flatten(self.parameters()))
+        mx.save_safetensors(str(path / weights_name), weights)
+
+    @classmethod
+    def convert_hf_checkpoint(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        *,
+        save_directory: str | os.PathLike,
+        config: EasyMLXBaseConfig | dict | str | os.PathLike | None = None,
+        revision: str | None = None,
+        local_files_only: bool = False,
+        weights_name: str = MODEL_WEIGHTS_NAME,
+        copy_support_files: bool = True,
+        quantization: QuantizationSpec | None = None,
+        subfolder: str | None = None,
+    ) -> Path:
+        """Convert a HuggingFace checkpoint to easymlx format.
+
+        Downloads (if necessary) the source checkpoint, instantiates
+        the model to obtain the ``sanitize`` mapping, casts weights to
+        the configured dtype, and writes the result to *save_directory*.
+
+        Args:
+            pretrained_model_name_or_path: Local path or HuggingFace
+                Hub repository ID.
+            save_directory: Where to write the converted checkpoint.
+            config: Configuration to use. Accepts an
+                ``EasyMLXBaseConfig`` instance, a ``dict`` of kwargs, a
+                path to a ``config.json`` file, or ``None`` to auto-load
+                from the source checkpoint.
+            revision: Git revision for Hub downloads.
+            local_files_only: Disable network access.
+            weights_name: Filename for the output safetensors file.
+            copy_support_files: If ``True``, copy tokenizer and other
+                HuggingFace support files alongside the weights.
+            quantization: Optional quantization spec. When provided, the
+                converted checkpoint is written already quantized, shard by
+                shard, so full-precision converted weights are never cached.
+
+        Returns:
+            The :class:`Path` to *save_directory* after writing.
+
+        Raises:
+            FileNotFoundError: If no weight files are found in the
+                source checkpoint.
+            TypeError: If *config* is an unsupported type.
+        """
+        resolved_repo = resolve_hf_composite_repo(
+            pretrained_model_name_or_path,
+            task_type=getattr(cls, "_model_task", None),
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if subfolder is None:
+            subfolder = resolved_repo.model_subfolder
+
+        model_path = _resolve_model_path(
+            pretrained_model_name_or_path,
+            revision=revision,
+            local_files_only=local_files_only,
+            subfolder=subfolder,
+        )
+
+        config = _resolve_config(cls, config, model_path)
+
+        with _no_weight_init():
+            model = cls(config)
+        weight_files = _resolve_weight_files(model_path)
+        if not weight_files:
+            raise FileNotFoundError(f"No weights found under {model_path!s}. Expected {MODEL_WEIGHTS_GLOB!r}.")
+
+        sanitize = getattr(model, "sanitize", None)
+        if not callable(sanitize):
+            sanitize = None
+
+        conversion_quantization = quantization
+        if conversion_quantization is None:
+            conversion_quantization = _resolve_config_quantization(config, model_path)
+
+        weight_quantization_map: dict[str, dict[str, int | str]] = {}
+        quantization_plan = _prepare_quantization_plan(conversion_quantization)
+        if quantization_plan is not None:
+            import logging
+
+            import mlx.nn as nn
+
+            logger = logging.getLogger("easymlx.quantization")
+            logger.info("Quantizing converted checkpoint: %s", quantization_plan.summary)
+            for quant_kwargs in quantization_plan.unique_quant_configs:
+                _validate_quantization_kernel(quant_kwargs)
+
+            nn.quantize(model, **quantization_plan.nn_quantize_kwargs)
+            if quantization_plan.fixed_quant_kwargs is not None:
+                weight_quantization_map = _collect_quantized_weight_map(model, quantization_plan.fixed_quant_kwargs)
+            else:
+                weight_quantization_map = dict(quantization_plan.weight_quantization_map)
+            config.easymlx_quantization = conversion_quantization
+
+        save_path = Path(save_directory)
+        save_path.mkdir(parents=True, exist_ok=True)
+        _remove_converted_weight_files(save_path, weights_name=weights_name)
+        config.save_pretrained(str(save_path))
+
+        converted_weight_files = _converted_weight_file_names(weights_name, len(weight_files))
+        for weight_file, converted_name in zip(weight_files, converted_weight_files, strict=True):
+            shard = _load_weights_file(weight_file)
+            if sanitize is not None:
+                sanitized = sanitize(shard)
+                if sanitized is not None:
+                    shard = sanitized
+            shard = _cast_weights(shard, dtype=getattr(config, "mlx_dtype", None))
+            if weight_quantization_map:
+                shard = _quantize_weights(shard, weight_quantization_map)
+            mx.save_safetensors(str(save_path / converted_name), shard)
+            del shard
+            mx.clear_cache()
+
+        if copy_support_files:
+            _copy_hf_support_files(model_path, save_path)
+            tokenizer_subfolder = resolved_repo.tokenizer_subfolder
+            if subfolder and tokenizer_subfolder and (model_path.parent / tokenizer_subfolder).is_dir():
+                _copy_hf_support_files(model_path.parent / tokenizer_subfolder, save_path)
+        metadata = {
+            "source": str(pretrained_model_name_or_path),
+            "resolved_path": str(model_path),
+            "revision": revision,
+            "weights_name": weights_name,
+            "converted_weight_files": converted_weight_files,
+            "source_weight_files": [weight_file.name for weight_file in weight_files],
+            "quantization": conversion_quantization,
+            "subfolder": subfolder,
+        }
+        (save_path / _CONVERTED_SOURCE_METADATA).write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        return save_path
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike,
+        *,
+        config: EasyMLXBaseConfig | dict | str | os.PathLike | None = None,
+        dtype: mx.Dtype | None = None,
+        device: mx.Device | None = None,
+        revision: str | None = None,
+        local_files_only: bool = False,
+        weights_name: str | None = None,
+        strict: bool = True,
+        lazy: bool = False,
+        auto_convert_hf: bool | None = None,
+        converted_cache_dir: str | os.PathLike | None = None,
+        force_conversion: bool = False,
+        copy_support_files: bool = True,
+        quantization: QuantizationSpec | None = None,
+        subfolder: str | None = None,
+    ):
+        """Load a pretrained model from a local directory or Hub ID.
+
+        If the source is a HuggingFace checkpoint (not already in
+        easymlx format) and ``auto_convert_hf`` is enabled, the
+        checkpoint is automatically converted and cached before loading.
+
+        Args:
+            pretrained_model_name_or_path: Local path or HuggingFace
+                Hub repository ID.
+            config: Configuration override. See
+                :meth:`convert_hf_checkpoint` for accepted types.
+            dtype: Override the dtype for all floating-point weights.
+                If ``None``, the config's ``mlx_dtype`` is used.
+            device: If provided, sets the MLX default device before
+                loading weights.
+            revision: Git revision for Hub downloads.
+            local_files_only: Disable network access.
+            weights_name: Explicit weight file name. If ``None``,
+                auto-discovered via glob.
+            strict: If ``True``, all weight keys must match the model
+                parameters exactly.
+            lazy: If ``True``, skip eager evaluation of parameters
+                after loading.
+            auto_convert_hf: Whether to auto-convert HuggingFace
+                checkpoints. Defaults to ``True`` for Hub IDs and
+                ``False`` for local paths.
+            converted_cache_dir: Override directory for the conversion
+                cache.
+            force_conversion: If ``True``, re-convert even if a cached
+                conversion exists.
+            copy_support_files: If ``True``, copy tokenizer files
+                during conversion.
+            quantization: Optional quantization spec. Accepts a mode
+                string, a :class:`QuantizationConfig`, or a
+                :class:`LayerwiseQuantizationConfig` with ordered regex
+                rules.
+
+        Returns:
+            An instance of this class with weights loaded.
+
+        Raises:
+            FileNotFoundError: If no weight files are found.
+            TypeError: If *config* is an unsupported type.
+        """
+        resolved_repo = resolve_hf_composite_repo(
+            pretrained_model_name_or_path,
+            task_type=getattr(cls, "_model_task", None),
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        if subfolder is None:
+            subfolder = resolved_repo.model_subfolder
+
+        source_is_local = Path(pretrained_model_name_or_path).expanduser().exists()
+        if auto_convert_hf is None:
+            auto_convert_hf = not source_is_local
+
+        resolved_weights_name = weights_name or MODEL_WEIGHTS_NAME
+        if auto_convert_hf:
+            cache_path = _conversion_cache_path(
+                pretrained_model_name_or_path,
+                revision=revision,
+                converted_cache_dir=converted_cache_dir,
+                subfolder=subfolder,
+                cache_variant=_quantization_cache_variant(quantization),
+            )
+            if force_conversion or not _has_converted_checkpoint(cache_path, weights_name=resolved_weights_name):
+                cls.convert_hf_checkpoint(
+                    pretrained_model_name_or_path,
+                    save_directory=cache_path,
+                    config=config,
+                    revision=revision,
+                    local_files_only=local_files_only,
+                    weights_name=resolved_weights_name,
+                    copy_support_files=copy_support_files,
+                    quantization=quantization,
+                    subfolder=subfolder,
+                )
+            model_path = cache_path
+            config = None
+            revision = None
+            local_files_only = True
+            weights_name = resolved_weights_name if (cache_path / resolved_weights_name).exists() else None
+        else:
+            model_path = _resolve_model_path(
+                pretrained_model_name_or_path,
+                revision=revision,
+                local_files_only=local_files_only,
+                subfolder=subfolder,
+            )
+
+        config = _resolve_config(cls, config, model_path)
+        _apply_config_dtype_override(config, dtype)
+        if quantization is None:
+            quantization = _resolve_config_quantization(config, model_path)
+        if quantization is None:
+            quantization = _infer_quantization_from_path(model_path)
+
+        with _no_weight_init():
+            model = cls(config)
+
+        weight_files = _resolve_weight_files(model_path, weights_name=weights_name)
+
+        if not weight_files:
+            raise FileNotFoundError(
+                f"No weights found under {model_path!s}. Expected {MODEL_WEIGHTS_GLOB!r} (or pass weights_name=...)."
+            )
+
+        sanitize_fn = getattr(model, "sanitize", None)
+        if not callable(sanitize_fn):
+            sanitize_fn = None
+
+        cast_dtype = dtype or config.mlx_dtype
+
+        if device is not None:
+            mx.set_default_device(device)
+
+        weight_quantization_map: dict[str, dict[str, int | str]] = {}
+
+        quantization_plan = _prepare_quantization_plan(quantization)
+        if quantization_plan is not None:
+            import logging
+
+            import mlx.nn as nn
+
+            logger = logging.getLogger("easymlx.quantization")
+            logger.info("Quantizing model: %s", quantization_plan.summary)
+            for quant_kwargs in quantization_plan.unique_quant_configs:
+                _validate_quantization_kernel(quant_kwargs)
+
+            nn.quantize(model, **quantization_plan.nn_quantize_kwargs)
+
+            if quantization_plan.fixed_quant_kwargs is not None:
+                weight_quantization_map = _collect_quantized_weight_map(model, quantization_plan.fixed_quant_kwargs)
+            else:
+                weight_quantization_map = dict(quantization_plan.weight_quantization_map)
+
+        loaded_keys: set[str] = set()
+        for weight_file in weight_files:
+            shard = _load_weights_file(weight_file)
+            if sanitize_fn is not None:
+                sanitized = sanitize_fn(shard)
+                if sanitized is not None:
+                    shard = sanitized
+            shard = _cast_weights(shard, dtype=cast_dtype)
+
+            if weight_quantization_map:
+                shard = _quantize_weights(shard, weight_quantization_map)
+
+            shard_items = list(shard.items())
+            loaded_keys.update(k for k, _ in shard_items)
+            model.load_weights(shard_items, strict=False)
+
+            if not lazy:
+                mx.eval([v for _, v in shard_items])
+
+            del shard, shard_items
+
+        if strict:
+            model_keys = {k for k, _ in tree_flatten(model.parameters())}
+            missing = model_keys - loaded_keys
+            extra = loaded_keys - model_keys
+            if missing or extra:
+                parts: list[str] = []
+                if missing:
+                    parts.append(f"Missing keys in checkpoint: {missing}")
+                if extra:
+                    parts.append(f"Unexpected keys in checkpoint: {extra}")
+                raise ValueError(". ".join(parts))
+
+        if not lazy:
+            mx.eval(model.parameters())
+        model.eval()
+        model.name_or_path = str(model_path)
+
+        if model.config is None:
+            model.config = config
+        try:
+            model.config.name_or_path = str(model_path)
+        except Exception:
+            pass
+        tokenizer_subfolder = resolved_repo.tokenizer_subfolder
+        if subfolder and tokenizer_subfolder and (model_path.parent / tokenizer_subfolder).is_dir():
+            tokenizer_path = model_path.parent / tokenizer_subfolder
+            model.tokenizer_name_or_path = str(tokenizer_path)
+            try:
+                model.config.tokenizer_name_or_path = str(tokenizer_path)
+            except Exception:
+                pass
+        return model

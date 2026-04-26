@@ -163,8 +163,12 @@ def test_scheduler_determinism_for_identical_inputs() -> None:
         _request("c", [6, 7, 8], max_tokens=2, priority=1),
     ]
     for request in requests:
-        scheduler_a.add_request(_request(request.request_id, request.prompt_token_ids, max_tokens=2, priority=request.priority))
-        scheduler_b.add_request(_request(request.request_id, request.prompt_token_ids, max_tokens=2, priority=request.priority))
+        scheduler_a.add_request(
+            _request(request.request_id, request.prompt_token_ids, max_tokens=2, priority=request.priority)
+        )
+        scheduler_b.add_request(
+            _request(request.request_id, request.prompt_token_ids, max_tokens=2, priority=request.priority)
+        )
 
     out_a = scheduler_a.schedule()
     out_b = scheduler_b.schedule()

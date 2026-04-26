@@ -15,10 +15,9 @@
 """Tests for MiMo-V2-Flash model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.mimo_v2_flash import MiMoV2FlashConfig, MiMoV2FlashForCausalLM, MiMoV2FlashModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

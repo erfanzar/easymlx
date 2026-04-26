@@ -15,7 +15,6 @@
 """Tests for Ministral3 model."""
 
 import pytest
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.ministral3 import Ministral3Config, Ministral3ForCausalLM, Ministral3Model
 

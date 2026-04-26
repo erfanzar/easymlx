@@ -14,13 +14,11 @@
 
 """Tests for Phixtral model."""
 
-import pytest
-
 import mlx.core as mx
-from mlx.utils import tree_flatten
-
+import pytest
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.phixtral import PhixtralConfig, PhixtralForCausalLM, PhixtralModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

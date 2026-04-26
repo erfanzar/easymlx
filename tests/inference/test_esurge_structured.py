@@ -16,22 +16,22 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
 import mlx.core as mx
 import numpy as np
 import pytest
+from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
+from easymlx.inference.esurge.esurge_engine import _MemoryUtilizationSummary
+from easymlx.inference.esurge.runners.model_runner import ModelRunner
+from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 from mlx.utils import tree_flatten
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
-
-from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
-from easymlx.inference.esurge.esurge_engine import _MemoryUtilizationSummary
-from easymlx.inference.esurge.runners.model_runner import ModelRunner
-from easymlx.modules.llama import LlamaConfig, LlamaForCausalLM
 
 
 class _DummyPagedCache:
@@ -174,6 +174,9 @@ def _build_tokenizer() -> PreTrainedTokenizerFast:
         '<tool_call>{"name":"lookup","arguments":{"city":"paris"}}</tool_call>': 6,
         "tok3": 7,
         "tok4": 8,
+        "<function=lookup><parameter=count>7</parameter></function>": 9,
+        "<tool_call>": 10,
+        "</tool_call>": 11,
     }
     tok = Tokenizer(WordLevel(vocab=vocab, unk_token="<unk>"))
     tok.pre_tokenizer = Whitespace()
@@ -356,6 +359,38 @@ def test_esurge_extracts_tool_calls():
     assert output.outputs[0].tool_calls[0]["function"]["name"] == "lookup"
 
 
+def test_esurge_passes_tools_to_qwen3xml_parser():
+    tokenizer = _build_tokenizer()
+    engine = eSurge(
+        DummyModel([9]),
+        tokenizer=tokenizer,
+        max_model_len=16,
+        reserve_tokens=2,
+        enable_background=False,
+        tool_parser="qwen3_xml",
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"count": {"type": "integer"}},
+                },
+            },
+        }
+    ]
+
+    output = engine.generate("hello", SamplingParams(max_tokens=1, tools=tools))[0]
+
+    assert output.outputs[0].finish_reason == "tool_calls"
+    assert output.outputs[0].tool_calls is not None
+    arguments = json.loads(output.outputs[0].tool_calls[0]["function"]["arguments"])
+    assert arguments["count"] == 7
+    assert isinstance(arguments["count"], int)
+
+
 def test_esurge_sync_path_handles_stop_strings() -> None:
     tokenizer = _build_tokenizer()
     engine = eSurge(
@@ -525,6 +560,7 @@ def test_esurge_sync_path_wires_distributed_and_multimodal_seams() -> None:
         distributed_controller=controller,
         multimodal_preprocessor=multimodal,
         multimodal_payload={"kind": "fake"},
+        overlap_execution=False,
     )
 
     try:

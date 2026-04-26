@@ -15,10 +15,9 @@
 """Tests for Mamba2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.mamba2 import Mamba2Config, Mamba2ForCausalLM, Mamba2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -45,12 +44,8 @@ class TestMamba2:
         )
 
     def test_registry(self):
-        base_registration = registry.get_module_registration(
-            TaskType.BASE_MODULE, "mamba2"
-        )
-        lm_registration = registry.get_module_registration(
-            TaskType.CAUSAL_LM, "mamba2"
-        )
+        base_registration = registry.get_module_registration(TaskType.BASE_MODULE, "mamba2")
+        lm_registration = registry.get_module_registration(TaskType.CAUSAL_LM, "mamba2")
 
         assert base_registration.module is Mamba2Model
         assert base_registration.config is Mamba2Config
@@ -68,12 +63,10 @@ class TestMamba2:
         assert result.success, f"Mamba2 CAUSAL_LM failed: {result.error_message}"
 
     def test_sanitize(self, mamba2_config):
-        import mlx.core as mx
 
         model = Mamba2ForCausalLM(mamba2_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
 
-        # Simulate upstream conv1d weight format (transposed)
         upstream_weights = dict(local_weights)
         for k, v in upstream_weights.items():
             if "conv1d.weight" in k and v.ndim == 3:
@@ -82,6 +75,4 @@ class TestMamba2:
         sanitized = model.sanitize(upstream_weights)
         for k, v in sanitized.items():
             if "conv1d.weight" in k and v.ndim == 3:
-                assert v.shape[-1] == 1, (
-                    f"conv1d weight {k} not transposed correctly"
-                )
+                assert v.shape[-1] == 1, f"conv1d weight {k} not transposed correctly"

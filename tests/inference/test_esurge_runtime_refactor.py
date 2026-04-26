@@ -19,15 +19,16 @@ from __future__ import annotations
 import threading
 import time
 
+import mlx.core as mx
 import numpy as np
+import pytest
+from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
+from easymlx.inference.esurge.request import EngineRequest
+from easymlx.inference.esurge.runners import ModelRunner, SequenceBuffer
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import PreTrainedTokenizerFast
-
-from easymlx.inference.esurge import CacheConfig, Config, SamplingParams, SchedulerConfig, eSurge
-from easymlx.inference.esurge.request import EngineRequest
-from easymlx.inference.esurge.runners import ModelRunner, SequenceBuffer
 
 
 def _build_tokenizer() -> PreTrainedTokenizerFast:
@@ -133,6 +134,55 @@ class LoggingPagedModel:
         return logits
 
 
+class OverlapProbePagedModel(LoggingPagedModel):
+    def __init__(self, *, sleep_s: float = 0.05, fail: bool = False):
+        super().__init__(sleep_s=sleep_s)
+        self.fail = bool(fail)
+        self.in_call = threading.Event()
+        self.future_pending = threading.Event()
+        self.schedule_calls_while_running = 0
+
+    def __call__(self, *args, **kwargs):
+        self.in_call.set()
+        try:
+            if self.sleep_s > 0:
+                time.sleep(self.sleep_s)
+            if self.fail:
+                raise RuntimeError("probe failure")
+            original_sleep = self.sleep_s
+            self.sleep_s = 0.0
+            try:
+                return super().__call__(*args, **kwargs)
+            finally:
+                self.sleep_s = original_sleep
+        finally:
+            self.in_call.clear()
+
+
+class _WarmupStateModule:
+    def __init__(self) -> None:
+        self.reset_count = 0
+        self.state = 0
+
+    def reset_state(self, batch_size: int = 1) -> None:
+        del batch_size
+        self.reset_count += 1
+        self.state = 0
+
+
+class WarmupStatePagedModel(LoggingPagedModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.state_module = _WarmupStateModule()
+        self.layers = [type("Layer", (), {"linear_attn": self.state_module})()]
+
+    def __call__(self, *args, **kwargs):
+        self.state_module.state = 1
+        output = super().__call__(*args, **kwargs)
+        logits = mx.array(output.logits if hasattr(output, "logits") else output)
+        return type("DummyOutput", (), {"logits": logits})()
+
+
 class FakeDistributedController:
     enabled = True
 
@@ -180,6 +230,152 @@ def _engine_config(*, max_num_seqs: int = 4, prefix: bool = False) -> Config:
         ),
         cache_config=CacheConfig(num_pages=64, page_size=2, enable_prefix_caching=prefix),
     )
+
+
+def _overlap_config() -> Config:
+    return Config(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=2,
+            max_num_batched_tokens=1,
+            max_model_len=16,
+            chunked_prefill_enabled=True,
+            long_prefill_token_threshold=1,
+        ),
+        cache_config=CacheConfig(num_pages=16, page_size=2, enable_prefix_caching=False),
+    )
+
+
+def _record_schedule_during_model_call(engine: eSurge, model: OverlapProbePagedModel) -> None:
+    assert engine._scheduler is not None
+    assert engine._execution_manager is not None
+    original_schedule = engine._scheduler.schedule
+    original_execute_async = engine._execution_manager.execute_async
+    original_collect = engine._execution_manager.collect
+
+    def wrapped_execute_async(*args, **kwargs):
+        pending = original_execute_async(*args, **kwargs)
+        model.future_pending.set()
+        return pending
+
+    def wrapped_collect(*args, **kwargs):
+        try:
+            return original_collect(*args, **kwargs)
+        finally:
+            model.future_pending.clear()
+
+    def wrapped_schedule(*args, **kwargs):
+        if model.future_pending.is_set():
+            model.schedule_calls_while_running += 1
+        return original_schedule(*args, **kwargs)
+
+    engine._execution_manager.execute_async = wrapped_execute_async
+    engine._execution_manager.collect = wrapped_collect
+    engine._scheduler.schedule = wrapped_schedule
+
+
+def test_esurge_overlap_prefetches_scheduler_step_while_runner_future_is_pending() -> None:
+    tokenizer = _build_tokenizer()
+    model = OverlapProbePagedModel(sleep_s=0.05)
+    engine = eSurge(
+        model,
+        tokenizer=tokenizer,
+        config=_overlap_config(),
+        reserve_tokens=2,
+        compile_runner=False,
+    )
+    _record_schedule_during_model_call(engine, model)
+    try:
+        outputs = engine.generate(["a", "a"], SamplingParams(max_tokens=1))
+    finally:
+        engine.close()
+
+    assert len(outputs) == 2
+    assert model.schedule_calls_while_running >= 1
+
+
+def test_esurge_overlap_drains_prefetched_scheduler_state_on_runner_exception() -> None:
+    tokenizer = _build_tokenizer()
+    model = OverlapProbePagedModel(sleep_s=0.05, fail=True)
+    engine = eSurge(
+        model,
+        tokenizer=tokenizer,
+        config=_overlap_config(),
+        reserve_tokens=2,
+        compile_runner=False,
+    )
+    _record_schedule_during_model_call(engine, model)
+    try:
+        with pytest.raises(RuntimeError, match="probe failure"):
+            engine.generate(["a", "a"], SamplingParams(max_tokens=1))
+    finally:
+        engine.close()
+
+    assert model.schedule_calls_while_running >= 1
+
+
+def test_esurge_accepts_easydel_constructor_surface_as_mlx_runtime_config() -> None:
+    tokenizer = _build_tokenizer()
+    model = LoggingPagedModel()
+    engine = eSurge(
+        model,
+        tokenizer=tokenizer,
+        config=_engine_config(max_num_seqs=2),
+        reserve_tokens=2,
+        hbm_utilization=0.5,
+        min_input_pad=1,
+        min_token_pad=1,
+        async_scheduling=False,
+        overlap_execution=False,
+        compile_runner=False,
+        use_aot_forward=False,
+        bind_graphstate_for_aot=True,
+        auto_shard_model=False,
+        sharding_axis_dims=(1,),
+        sampler_metrics=True,
+        data_parallelism_axis="tp",
+        esurge_name="probe",
+    )
+    try:
+        assert engine.hbm_utilization == 0.5
+        assert engine.memory_utilization == 0.5
+        assert engine.min_input_pad == 1
+        assert engine.min_token_pad == 1
+        assert engine.async_scheduling is False
+        assert engine.overlap_execution is False
+        assert engine.compile_runner is False
+        assert engine.esurge_name == "probe"
+    finally:
+        engine.close()
+
+
+def test_esurge_resets_recurrent_state_after_compile_warmup() -> None:
+    tokenizer = _build_tokenizer()
+    model = WarmupStatePagedModel()
+    engine = eSurge(
+        model,
+        tokenizer=tokenizer,
+        config=_engine_config(max_num_seqs=2),
+        reserve_tokens=2,
+        compile_runner=True,
+    )
+    try:
+        assert model.state_module.reset_count >= 2
+        assert model.state_module.state == 0
+    finally:
+        engine.close()
+
+
+def test_esurge_rejects_overlap_execution_in_distributed_lockstep_mode() -> None:
+    tokenizer = _build_tokenizer()
+    controller = FakeDistributedController()
+    with pytest.raises(ValueError, match="overlap_execution=True"):
+        eSurge(
+            LoggingPagedModel(),
+            tokenizer=tokenizer,
+            config=_engine_config(max_num_seqs=2),
+            reserve_tokens=2,
+            distributed_controller=controller,
+        )
 
 
 def test_esurge_mixed_prefill_decode_continuous_batching() -> None:
@@ -269,6 +465,7 @@ def test_esurge_wires_distributed_and_multimodal_seams() -> None:
         reserve_tokens=2,
         distributed_controller=controller,
         multimodal_preprocessor=multimodal,
+        overlap_execution=False,
     )
     try:
         engine.generate("a", SamplingParams(max_tokens=1))
@@ -320,6 +517,27 @@ def test_model_runner_compaction_updates_cache_rows_and_bucket_selection() -> No
     assert cache.block_tables[0, 0] == 20
     assert cache.block_tables[2, 0] == -1
     assert runner.select_bucket_size(3) == 4
+
+
+def test_model_runner_bind_avoids_clearing_assigned_pages() -> None:
+    cache = TracePagedCache(num_seqs=1, blocks_per_seq=4, block_size=2)
+    cache.key_cache[1] = 7
+    cache.value_cache[1] = 9
+    runner = ModelRunner(LoggingPagedModel(), kv_caches=[cache], seed=0)
+    request = EngineRequest(
+        request_id="req-a",
+        prompt="a",
+        prompt_token_ids=[3],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    request.assign_cache_pages([1, 2])
+
+    runner.bind_request(request, row_index=0)
+
+    assert cache.block_tables[0, :2].tolist() == [1, 2]
+    assert cache.kv_lens[0] == 0
+    np.testing.assert_array_equal(cache.key_cache[1], np.full_like(cache.key_cache[1], 7))
+    np.testing.assert_array_equal(cache.value_cache[1], np.full_like(cache.value_cache[1], 9))
 
 
 def test_esurge_batched_runtime_beats_naive_sequential_baseline() -> None:

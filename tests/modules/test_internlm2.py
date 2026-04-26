@@ -15,10 +15,9 @@
 """Tests for InternLM2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.internlm2 import InternLM2Config, InternLM2ForCausalLM, InternLM2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

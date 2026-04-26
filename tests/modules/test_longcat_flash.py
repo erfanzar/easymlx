@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.longcat_flash import LongcatFlashConfig, LongcatFlashForCausalLM, LongcatFlashModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

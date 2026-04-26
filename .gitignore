@@ -1,10 +1,13 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.tsbuildinfo
 build/
 dist/
 wheels/
 *.egg-info
+node_modules/
+.desktop/
 .DS_Store
 
 # Virtual environments
@@ -16,3 +19,6 @@ exp.py
 .uv_cache
 local-models/*
 profile.gputrace
+outputs
+*.json
+benchmark_results/*

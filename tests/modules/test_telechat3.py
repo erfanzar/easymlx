@@ -15,10 +15,9 @@
 """Tests for Telechat3 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.telechat3 import Telechat3Config, Telechat3ForCausalLM, Telechat3Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

@@ -15,10 +15,9 @@
 """Tests for Phi3Small model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.phi3small import Phi3SmallConfig, Phi3SmallForCausalLM, Phi3SmallModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

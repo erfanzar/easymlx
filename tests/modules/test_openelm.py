@@ -15,10 +15,9 @@
 """Tests for OpenELM model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.openelm import OpenELMConfig, OpenELMForCausalLM, OpenELMModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

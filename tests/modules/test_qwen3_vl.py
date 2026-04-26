@@ -15,7 +15,6 @@
 """Tests for Qwen3-VL model."""
 
 import pytest
-
 from easymlx.modules.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
 from .test_utils import CausalLMTester, VisionLanguageTester

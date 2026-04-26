@@ -15,7 +15,6 @@
 """Tests for analytical FLOPs estimation."""
 
 import pytest
-
 from easymlx.infra import EasyMLXBaseModule, TaskType
 from easymlx.modules.glm4_moe_lite import Glm4MoeLiteConfig, Glm4MoeLiteForCausalLM
 from easymlx.modules.glm4v import Glm4VConfig, Glm4VForConditionalGeneration
@@ -52,11 +51,15 @@ def test_dense_llama_get_flops_matches_manual_formula():
     head_dim = 4
     vocab_size = 100
 
-    attention_proj = 2 * tokens * (
-        hidden_size * (num_heads * head_dim)
-        + hidden_size * (num_kv_heads * head_dim)
-        + hidden_size * (num_kv_heads * head_dim)
-        + (num_heads * head_dim) * hidden_size
+    attention_proj = (
+        2
+        * tokens
+        * (
+            hidden_size * (num_heads * head_dim)
+            + hidden_size * (num_kv_heads * head_dim)
+            + hidden_size * (num_kv_heads * head_dim)
+            + (num_heads * head_dim) * hidden_size
+        )
     )
     attention_matmul = 2 * batch_size * num_heads * sequence_length * sequence_length * (head_dim + head_dim)
     mlp = 6 * tokens * hidden_size * intermediate_size
@@ -119,11 +122,15 @@ def test_qwen3_next_get_flops_matches_manual_formula():
     hidden_size = config.hidden_size
     full_q_proj_dim = 2 * config.num_attention_heads * config.head_dim
     full_kv_proj_dim = config.num_key_value_heads * config.head_dim
-    full_attention_proj = 2 * tokens * (
-        hidden_size * full_q_proj_dim
-        + hidden_size * full_kv_proj_dim
-        + hidden_size * full_kv_proj_dim
-        + (config.num_attention_heads * config.head_dim) * hidden_size
+    full_attention_proj = (
+        2
+        * tokens
+        * (
+            hidden_size * full_q_proj_dim
+            + hidden_size * full_kv_proj_dim
+            + hidden_size * full_kv_proj_dim
+            + (config.num_attention_heads * config.head_dim) * hidden_size
+        )
     )
     full_attention_matmul = (
         2
@@ -136,12 +143,16 @@ def test_qwen3_next_get_flops_matches_manual_formula():
 
     linear_value_dim = config.linear_num_value_heads * config.linear_value_head_dim
     linear_inner_dim = 2 * config.linear_num_key_heads * config.linear_key_head_dim + linear_value_dim
-    linear_attention_proj = 2 * tokens * (
-        hidden_size * linear_inner_dim
-        + hidden_size * linear_value_dim
-        + hidden_size * config.linear_num_value_heads
-        + hidden_size * config.linear_num_value_heads
-        + linear_value_dim * hidden_size
+    linear_attention_proj = (
+        2
+        * tokens
+        * (
+            hidden_size * linear_inner_dim
+            + hidden_size * linear_value_dim
+            + hidden_size * config.linear_num_value_heads
+            + hidden_size * config.linear_num_value_heads
+            + linear_value_dim * hidden_size
+        )
     )
     linear_conv = 2 * batch_size * sequence_length * linear_inner_dim * config.linear_conv_kernel_dim
     linear_gdr = (

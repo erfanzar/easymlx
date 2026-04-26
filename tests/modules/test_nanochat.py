@@ -15,10 +15,9 @@
 """Tests for Nanochat model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.nanochat import NanochatConfig, NanochatForCausalLM, NanochatModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

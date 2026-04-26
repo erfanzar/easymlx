@@ -15,10 +15,9 @@
 """Tests for GraniteMoE model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.granitemoe import GraniteMoeConfig, GraniteMoeForCausalLM, GraniteMoeModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

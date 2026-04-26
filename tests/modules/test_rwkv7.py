@@ -15,10 +15,9 @@
 """Tests for RWKV7 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.rwkv7 import Rwkv7Config, Rwkv7ForCausalLM, Rwkv7Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

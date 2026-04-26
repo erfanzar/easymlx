@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.baichuan_m1 import BaichuanM1Config, BaichuanM1ForCausalLM, BaichuanM1Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -84,11 +83,10 @@ class TestBaichuanM1:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Add a rotary key that should be stripped
         upstream_weights["rotary_emb.inv_freq"] = mx.zeros((4,))
 
         sanitized = model.sanitize(upstream_weights)
 
         assert "rotary_emb.inv_freq" not in sanitized
-        # lm_head.weight should be present and normalized
+
         assert "lm_head.weight" in sanitized

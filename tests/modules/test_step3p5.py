@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.step3p5 import Step3p5Config, Step3p5ForCausalLM, Step3p5Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -90,7 +89,6 @@ class TestStep3p5:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Add a rotary key that should be stripped
         upstream_weights["model.layers.0.self_attn.rotary_emb.inv_freq"] = mx.zeros((4,))
 
         sanitized = model.sanitize(upstream_weights)

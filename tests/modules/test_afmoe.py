@@ -14,12 +14,10 @@
 
 """Tests for AFMoE model."""
 
-import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.afmoe import AfmoeConfig, AfmoeForCausalLM, AfmoeModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -89,7 +87,6 @@ class TestAfmoe:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Mimic upstream shard names for MoE layer (layer 1, since num_dense_layers=1)
         prefix = "model.layers.1"
         for dst in ["gate_proj", "down_proj", "up_proj"]:
             stacked_key = f"{prefix}.mlp.experts.{dst}.weight"

@@ -16,11 +16,11 @@
 
 import json
 
-from fastapi.testclient import TestClient
-
 from easymlx.inference.esurge import CompletionOutput, RequestOutput
+from easymlx.inference.esurge.metrics import MetricsCollector
 from easymlx.inference.esurge.server.api_models import ChatCompletionRequest, CompletionRequest, ResponsesRequest
 from easymlx.inference.esurge.server.api_server import eSurgeApiServer
+from fastapi.testclient import TestClient
 
 
 class DummyEngine:
@@ -28,6 +28,7 @@ class DummyEngine:
         self.max_model_len = 64
         self.max_num_seqs = 1
         self.last_sampling_params = None
+        self.last_chat_kwargs = None
 
     def generate(self, prompts, sampling_params):
         self.last_sampling_params = sampling_params
@@ -79,8 +80,11 @@ class DummyEngine:
     def stream(self, prompts, sampling_params):
         yield from self.generate(prompts, sampling_params)
 
-    def chat(self, messages, sampling_params=None, *, tools=None, **_kwargs):
+    def chat(self, messages, sampling_params=None, *, tools=None, stream=False, **kwargs):
         del messages, tools
+        self.last_chat_kwargs = kwargs
+        if stream:
+            return self.stream(["chat"], sampling_params)
         return self.generate(["chat"], sampling_params)[0]
 
 
@@ -152,6 +156,7 @@ def test_server_request_models_accept_penalty_fields():
         messages=[{"role": "user", "content": "Hi"}],
         presence_penalty=0.5,
         repetition_penalty=1.2,
+        stream_options={"include_usage": True},
     )
     responses = ResponsesRequest(
         model="dummy",
@@ -164,6 +169,8 @@ def test_server_request_models_accept_penalty_fields():
     assert completion.repetition_penalty == 1.4
     assert chat.presence_penalty == 0.5
     assert chat.repetition_penalty == 1.2
+    assert chat.stream_options is not None
+    assert chat.stream_options.include_usage is True
     assert responses.presence_penalty == 0.75
     assert responses.repetition_penalty == 1.1
 
@@ -216,7 +223,7 @@ def test_responses_endpoint():
     assert output_text_items[0]["text"] == "hello"
 
 
-def test_responses_endpoint_supports_previous_response_id():
+def test_responses_endpoint_rejects_previous_response_id_persistence():
     client = setup_client()
     first = client.post("/v1/responses", json={"model": "dummy", "input": "Hi"})
     assert first.status_code == 200
@@ -226,10 +233,8 @@ def test_responses_endpoint_supports_previous_response_id():
         "/v1/responses",
         json={"model": "dummy", "input": "Again", "previous_response_id": first_body["id"]},
     )
-    assert second.status_code == 200
-    second_body = second.json()
-    assert second_body["previous_response_id"] == first_body["id"]
-    assert second_body["store"] is True
+    assert second.status_code == 400
+    assert "previous_response_id persistence is not supported" in second.json()["detail"]
 
 
 def test_responses_streaming_emits_response_events():
@@ -237,9 +242,7 @@ def test_responses_streaming_emits_response_events():
     with client.stream("POST", "/v1/responses", json={"model": "dummy", "input": "Hi", "stream": True}) as resp:
         assert resp.status_code == 200
         events = [
-            json.loads(line[6:])
-            for line in resp.iter_lines()
-            if line.startswith("data: ") and line != "data: [DONE]"
+            json.loads(line[6:]) for line in resp.iter_lines() if line.startswith("data: ") and line != "data: [DONE]"
         ]
     event_types = {event["type"] for event in events}
     assert "response.created" in event_types
@@ -263,11 +266,90 @@ def test_streaming_chat_completion():
     with client.stream(
         "POST",
         "/v1/chat/completions",
-        json={"model": "dummy", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+        json={
+            "model": "dummy",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
     ) as resp:
         assert resp.status_code == 200
         data = [line[6:] for line in resp.iter_lines() if line.startswith("data: ")]
     assert data and data[-1] == "[DONE]"
+    first_payload = json.loads(data[0])
+    delta = first_payload["choices"][0]["delta"]
+    assert delta["reasoning_content"] == "plan"
+    assert delta["delta_reasoning_content"] == "plan"
+
+
+def test_chat_completion_forwards_chat_template_kwargs():
+    engine = DummyEngine()
+    client = TestClient(eSurgeApiServer({"dummy": engine}).app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_chat_kwargs == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_chat_completion_enable_thinking_alias_forwards_template_kwargs():
+    engine = DummyEngine()
+    client = TestClient(eSurgeApiServer({"dummy": engine}).app)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "dummy",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "enable_thinking": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert engine.last_chat_kwargs == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_metrics_records_live_progress_without_double_counting():
+    collector = MetricsCollector()
+    started_at = collector.start_request(endpoint="/v1/chat/completions", model="dummy")
+
+    collector.record_request_progress(started_at, prompt_tokens=4, completion_tokens=1)
+    collector.record_request_progress(started_at, prompt_tokens=4, completion_tokens=3)
+
+    live = collector.snapshot(models_loaded=1, status="ready")
+    assert live["active_requests"] == 1
+    assert live["total_tokens_generated"] == 3
+    assert live["average_tokens_per_second"] > 0
+
+    collector.finish_request(started_at, success=True, prompt_tokens=4, completion_tokens=5)
+
+    finished = collector.snapshot(models_loaded=1, status="ready")
+    assert finished["active_requests"] == 0
+    assert finished["successful_requests"] == 1
+    assert finished["total_tokens_generated"] == 5
+
+
+def test_streaming_chat_metrics_are_not_double_counted():
+    client = setup_client()
+    initial = client.get("/metrics").json()
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={"model": "dummy", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+    ) as resp:
+        assert resp.status_code == 200
+        assert any(line == "data: [DONE]" for line in resp.iter_lines())
+
+    payload = client.get("/metrics").json()
+    assert payload["total_tokens_generated"] == initial["total_tokens_generated"] + 2
 
 
 def test_metrics_route_is_registered_and_usable():
@@ -291,71 +373,12 @@ def test_metrics_route_is_registered_and_usable():
     assert payload["total_tokens_generated"] >= initial["total_tokens_generated"] + 2
 
 
-def test_tools_routes_are_registered():
+def test_tools_routes_are_not_registered():
     client = setup_client()
-    assert _route_exists(client, path="/v1/tools", method="get")
-    assert _route_exists(client, path="/v1/tools/execute", method="post")
-
-
-def test_tools_execute_endpoint_accepts_payload():
-    client = setup_client(
-        tools={
-            "lookup": {
-                "handler": lookup,
-                "description": "Find a city",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            }
-        }
-    )
-
-    response = client.post(
-        "/v1/tools/execute",
-        json={
-            "model": "dummy",
-            "tool_call": {
-                "id": "call_0",
-                "type": "function",
-                "function": {"name": "lookup", "arguments": '{"city":"paris"}'},
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["status"] == "completed"
-    assert payload["name"] == "lookup"
-    assert payload["output"] == {"city": "Paris", "country": "France"}
-
-
-def test_tools_execute_endpoint_rejects_bad_json():
-    client = setup_client(tools={"lookup": lookup})
-    response = client.post("/v1/tools/execute", json={"name": "lookup", "arguments": "{bad json"})
-    assert response.status_code == 400
-    assert "Invalid tool argument JSON" in response.json()["detail"]
-
-
-def test_tools_list_route_returns_list_payload():
-    client = setup_client(
-        tools={
-            "lookup": {
-                "handler": lookup,
-                "description": "Find a city",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-            }
-        }
-    )
-    response = client.get("/v1/tools")
-    assert response.status_code == 200
-    payload = response.json()
-
-    tool_payload = payload.get("tools")
-    assert isinstance(tool_payload, list)
-    assert tool_payload[0]["function"]["name"] == "lookup"
-    assert payload["models"]["dummy"]["tools"][0]["function"]["name"] == "lookup"
+    assert not _route_exists(client, path="/v1/tools", method="get")
+    assert not _route_exists(client, path="/v1/tools/execute", method="post")
+    assert client.get("/v1/tools").status_code == 404
+    assert client.post("/v1/tools/execute", json={"name": "lookup"}).status_code == 404
 
 
 def test_admin_routes_are_registered():

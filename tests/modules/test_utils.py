@@ -91,7 +91,7 @@ class CausalLMTester:
             if logits.shape != expected:
                 raise AssertionError(f"Unexpected logits shape {logits.shape}, expected {expected}.")
             return TestResult(success=True)
-        except Exception as exc:  # pragma: no cover - surfaced in test failures
+        except Exception as exc:
             return TestResult(success=False, error_message=str(exc))
 
     def test_generation(
@@ -118,7 +118,7 @@ class CausalLMTester:
             if generated.shape[1] < seq_len:
                 raise AssertionError("Generated sequence is shorter than input sequence.")
             return TestResult(success=True)
-        except Exception as exc:  # pragma: no cover - surfaced in test failures
+        except Exception as exc:
             return TestResult(success=False, error_message=str(exc))
 
 
@@ -169,7 +169,7 @@ class VisionLanguageTester:
             if logits.shape != expected:
                 raise AssertionError(f"Unexpected logits shape {logits.shape}, expected {expected}.")
             return TestResult(success=True)
-        except Exception as exc:  # pragma: no cover - surfaced in test failures
+        except Exception as exc:
             return TestResult(success=False, error_message=str(exc))
 
 

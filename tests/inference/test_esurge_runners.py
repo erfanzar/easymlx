@@ -19,7 +19,8 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-
+from easymlx.caching.paged.cache import _reshape_and_cache_metal
+from easymlx.inference.esurge.core.sampler import argmax_token
 from easymlx.inference.esurge.runners import (
     ExecutionManager,
     ExecutionRequest,
@@ -27,7 +28,6 @@ from easymlx.inference.esurge.runners import (
     ScheduledSequence,
     SequenceBuffer,
 )
-from easymlx.inference.esurge.core.sampler import argmax_token
 from easymlx.inference.esurge.runners.model_runner import _as_mx_logits
 from easymlx.inference.esurge.sampling_params import SamplingParams
 
@@ -88,6 +88,40 @@ class DummyDecodeStepPagedModel:
         del input_ids, cache_views, cache_metadata
         self.decode_step_count += 1
         return mx.zeros((1, self.vocab_size), dtype=mx.float32)
+
+
+class DummyStateDecodePagedModel:
+    """Model exposing explicit decode state for compiled single-token decode."""
+
+    def __init__(self, vocab_size: int = 8):
+        self.vocab_size = vocab_size
+        self.decode_step_count = 0
+        self.decode_state = {"counter": mx.zeros((1,), dtype=mx.int32)}
+
+    def __call__(self, input_ids=None, *, cache_views=None, cache_metadata=None, return_dict=True, **_kwargs):
+        del input_ids, cache_views, cache_metadata
+        logits = mx.zeros((1, self.vocab_size), dtype=mx.float32)
+        if return_dict:
+            return {"logits": logits}
+        return logits
+
+    def decode_step(self, input_ids, *, cache_views=None, cache_metadata=None):
+        del input_ids, cache_views, cache_metadata
+        self.decode_step_count += 1
+        raise AssertionError("decode_step fallback should not run when explicit-state compile succeeds")
+
+    def get_decode_state(self):
+        return self.decode_state
+
+    def set_decode_state(self, state) -> None:
+        self.decode_state = state
+
+    def decode_step_with_state(self, input_ids, *, cache_views=None, cache_metadata=None, decode_state=None):
+        del cache_views, cache_metadata
+        next_counter = decode_state["counter"] + 1
+        target = (input_ids.astype(mx.int32) + decode_state["counter"]).astype(mx.int32) % self.vocab_size
+        logits = mx.take(mx.eye(self.vocab_size, dtype=mx.float32), target, axis=0)
+        return logits, {"counter": next_counter}
 
 
 def test_sequence_buffer_row_ops_and_page_table() -> None:
@@ -189,6 +223,7 @@ def test_sampling_params_to_generation_kwargs_includes_penalties() -> None:
 
 def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch) -> None:
     from easymlx.inference.esurge.runners import model_runner as model_runner_module
+
     cache_module = pytest.importorskip("easymlx.caching")
     PageCacheView = cache_module.PageCacheView
 
@@ -228,6 +263,7 @@ def test_model_runner_uses_compiled_forward_for_stable_paged_models(monkeypatch)
 
 def test_model_runner_skips_compiled_forward_for_turboquant_cache() -> None:
     from easymlx.inference.esurge.runners import model_runner as model_runner_module
+
     cache_module = pytest.importorskip("easymlx.caching")
     PageCacheView = cache_module.PageCacheView
 
@@ -289,6 +325,70 @@ def test_model_runner_zero_pages_clears_turboquant_aux_state() -> None:
         np.testing.assert_array_equal(np.asarray(array), np.zeros_like(np.asarray(array)))
 
 
+def test_reshape_and_cache_casts_bfloat_keys_to_page_cache_dtype() -> None:
+    key = mx.ones((1, 1, 8), dtype=mx.bfloat16)
+    value = mx.ones((1, 1, 8), dtype=mx.bfloat16)
+    page_key_cache = mx.zeros((1, 1, 1, 2, 8), dtype=mx.float16)
+    page_value_cache = mx.zeros((1, 1, 8, 2), dtype=mx.float16)
+
+    out_key, out_value = _reshape_and_cache_metal(
+        key,
+        value,
+        page_key_cache,
+        page_value_cache,
+        mx.array([0], dtype=mx.int32),
+        num_kv_heads=1,
+        head_dim=8,
+        page_vec_size=8,
+        block_size=2,
+    )
+    mx.eval(out_key, out_value)
+
+    assert out_key.dtype == mx.float16
+    assert out_value.dtype == mx.float16
+    assert float(mx.sum(out_key).item()) == 8.0
+    assert float(mx.sum(out_value).item()) == 8.0
+
+
+def test_model_runner_zero_pages_uses_cache_dtype_payload() -> None:
+    cache_module = pytest.importorskip("easymlx.caching")
+    PageCacheView = cache_module.PageCacheView
+
+    cache = PageCacheView.allocate(
+        num_seqs=1,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=8,
+        block_size=2,
+        dtype=mx.float16,
+    )
+    cache.key_cache[0] = mx.ones(cache.key_cache[0].shape, dtype=mx.bfloat16)
+    cache.value_cache[0] = mx.ones(cache.value_cache[0].shape, dtype=mx.bfloat16)
+    cache.page_key_cache[0] = mx.ones(cache.page_key_cache[0].shape, dtype=mx.bfloat16)
+    cache.page_value_cache[0] = mx.ones(cache.page_value_cache[0].shape, dtype=mx.bfloat16)
+
+    runner = ModelRunner(DummyPagedModel(vocab_size=5), kv_caches=[cache], seed=0)
+    runner._zero_pages([0])
+
+    for array in (cache.key_cache[0], cache.value_cache[0], cache.page_key_cache[0], cache.page_value_cache[0]):
+        np.testing.assert_array_equal(np.asarray(array), np.zeros_like(np.asarray(array)))
+
+
+def test_model_runner_zero_pages_supports_numpy_cache_arrays() -> None:
+    class NumpyCache:
+        def __init__(self):
+            self.key_cache = np.ones((2, 2, 1, 1), dtype=np.float16)
+            self.value_cache = np.ones_like(self.key_cache)
+
+    cache = NumpyCache()
+    runner = ModelRunner(DummyPagedModel(vocab_size=5), kv_caches=[cache], seed=0)
+    runner._zero_pages([1])
+
+    np.testing.assert_array_equal(cache.key_cache[1], np.zeros_like(cache.key_cache[1]))
+    np.testing.assert_array_equal(cache.value_cache[1], np.zeros_like(cache.value_cache[1]))
+    np.testing.assert_array_equal(cache.key_cache[0], np.ones_like(cache.key_cache[0]))
+
+
 def test_model_runner_prefers_decode_step_for_single_token_paged_decode() -> None:
     cache_module = pytest.importorskip("easymlx.caching")
     PageCacheView = cache_module.PageCacheView
@@ -320,6 +420,82 @@ def test_model_runner_prefers_decode_step_for_single_token_paged_decode() -> Non
     assert model.decode_step_count == 1
     assert model.call_count == 0
     assert len(runner._compiled_forwards) == 0
+
+
+def test_model_runner_compiles_explicit_state_decode_path() -> None:
+    cache_module = pytest.importorskip("easymlx.caching")
+    PageCacheView = cache_module.PageCacheView
+
+    model = DummyStateDecodePagedModel(vocab_size=5)
+    cache = PageCacheView.allocate(
+        num_seqs=1,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=1,
+        block_size=2,
+        dtype=mx.float32,
+    )
+    runner = ModelRunner(model, kv_caches=[cache], seed=0, use_compiled_forward=True)
+    request = ExecutionRequest(
+        step_id=19,
+        sequences=[
+            ScheduledSequence(request_id="req-a", row_index=0, token_ids=[1], num_computed_tokens=1),
+        ],
+        sampling_by_request={
+            "req-a": SamplingParams(max_tokens=1, do_sample=False),
+        },
+    )
+
+    _raw_output, logits = runner._forward_step(request)
+    assert logits.shape == (1, 5)
+    assert int(mx.argmax(logits, axis=-1).item()) == 1
+    assert int(model.decode_state["counter"].item()) == 1
+    assert len(runner._compiled_forwards) == 1
+    assert next(iter(runner._compiled_forwards))[0] == "decode_state"
+    assert model.decode_step_count == 0
+
+    _raw_output, logits = runner._forward_step(request)
+    assert int(mx.argmax(logits, axis=-1).item()) == 2
+    assert int(model.decode_state["counter"].item()) == 2
+
+
+def test_model_runner_decode_step_short_circuits_compiled_forward(monkeypatch) -> None:
+    cache_module = pytest.importorskip("easymlx.caching")
+    PageCacheView = cache_module.PageCacheView
+
+    model = DummyDecodeStepPagedModel(vocab_size=4)
+    cache = PageCacheView.allocate(
+        num_seqs=1,
+        max_seq_len=8,
+        num_kv_heads=1,
+        head_dim=1,
+        block_size=2,
+        dtype=mx.float32,
+    )
+    runner = ModelRunner(model, kv_caches=[cache], seed=0, use_compiled_forward=True)
+
+    def fail_generic_compiled_forward(*_args, **kwargs):
+        if kwargs.get("prefer_decode_step"):
+            return None
+        raise AssertionError("generic compiled forward should not run when decode_step is available")
+
+    monkeypatch.setattr(runner, "_get_compiled_forward", fail_generic_compiled_forward)
+
+    request = ExecutionRequest(
+        step_id=18,
+        sequences=[
+            ScheduledSequence(request_id="req-a", row_index=0, token_ids=[1], num_computed_tokens=1),
+        ],
+        sampling_by_request={
+            "req-a": SamplingParams(max_tokens=1, do_sample=False),
+        },
+    )
+
+    _raw_output, logits = runner._forward_step(request)
+
+    assert logits.shape == (1, 4)
+    assert model.decode_step_count == 1
+    assert model.call_count == 0
 
 
 def test_model_runner_run_samples_from_mlx_logits_without_numpy_materialization() -> None:
@@ -395,6 +571,41 @@ def test_model_runner_reuses_compiled_sampler_for_same_shape_and_params(monkeypa
     runner._sample_next_tokens_mx(logits, [sampling_params])
 
     assert compile_calls == 1
+
+
+def test_model_runner_greedy_sampling_skips_compiled_sampler(monkeypatch) -> None:
+    runner = ModelRunner(DummyPagedModel(vocab_size=5), seed=0)
+    logits = mx.array([[0.5, -4.0, 10.0, 9.0, 1.0]], dtype=mx.float32)
+    sampling_params = SamplingParams(max_tokens=1, do_sample=False)
+
+    def fail_compiled_sampler(*_args, **_kwargs):
+        raise AssertionError("greedy sampling should use direct argmax")
+
+    monkeypatch.setattr(runner, "_get_compiled_sampler", fail_compiled_sampler)
+
+    sampled = runner._sample_next_tokens_mx(logits, [sampling_params])
+
+    assert sampled == [2]
+
+
+def test_model_runner_greedy_sampling_keeps_bfloat16_logits(monkeypatch) -> None:
+    runner = ModelRunner(DummyPagedModel(vocab_size=5), seed=0)
+    logits = mx.array([[0.5, -4.0, 10.0, 9.0, 1.0]], dtype=mx.bfloat16)
+    sampling_params = SamplingParams(max_tokens=1, do_sample=False)
+    original_argmax = mx.argmax
+    observed_dtype = None
+
+    def tracking_argmax(array, *args, **kwargs):
+        nonlocal observed_dtype
+        observed_dtype = array.dtype
+        return original_argmax(array, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "argmax", tracking_argmax)
+
+    sampled = runner._sample_next_tokens_mx(logits, [sampling_params])
+
+    assert sampled == [2]
+    assert observed_dtype == mx.bfloat16
 
 
 def test_model_runner_does_not_advance_rng_for_greedy_groups(monkeypatch) -> None:

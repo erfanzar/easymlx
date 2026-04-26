@@ -15,14 +15,88 @@
 import mlx.core as mx
 import numpy as np
 import pytest
-
 from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
-from easymlx.layers.attention import AttentionPerformer, prepare_paged_attention_inputs
+from easymlx.infra.base_config import EasyMLXBaseConfig
+from easymlx.infra.etils import DEFAULT_ATTENTION_MECHANISM
+from easymlx.layers.attention import (
+    AttentionPerformer,
+    prepare_paged_attention_inputs,
+    resolve_paged_attention_mechanism,
+)
 from easymlx.modules.llama.llama_configuration import LlamaConfig
-from easymlx.modules.llama.modeling_llama import LlamaAttention
+from easymlx.modules.llama.modeling_llama import LlamaAttention, LlamaForCausalLM
 from easymlx.modules.qwen2.modeling_qwen2 import Qwen2Attention
 from easymlx.modules.qwen2.qwen2_configuration import Qwen2Config
 from easymlx.operations.kernels.unified_attention import paged_attention
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("auto", "unified_attention"),
+        ("paged", "unified_attention"),
+        ("unified", "unified_attention"),
+        ("unified_attention", "unified_attention"),
+        ("page_attention", "page_attention"),
+        ("paged_attention", "page_attention"),
+        ("sdpa", None),
+        ("vanilla", None),
+    ],
+)
+def test_paged_attention_aliases_default_to_unified(value, expected):
+    assert resolve_paged_attention_mechanism(value) == expected
+
+
+def test_base_config_defaults_to_unified_attention():
+    config = EasyMLXBaseConfig()
+
+    assert DEFAULT_ATTENTION_MECHANISM == "unified"
+    assert config.attn_mechanism == "unified"
+
+
+def test_attention_performer_legacy_paged_forwards_unified(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, object] = {}
+
+    def fake_scaled_dot_product_attention(*args, **kwargs):
+        del args
+        captured.update(kwargs)
+        return mx.zeros((1, 2, 4), dtype=mx.float32)
+
+    monkeypatch.setattr(
+        "easymlx.layers.attention._performer.scaled_dot_product_attention",
+        fake_scaled_dot_product_attention,
+    )
+
+    performer = AttentionPerformer(scale=0.5, attn_mechanism="paged")
+    out = performer.forward(
+        mx.zeros((1, 2, 4), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+    )
+
+    assert out.shape == (1, 2, 4)
+    assert captured["paged_attention_mechanism"] == "unified_attention"
+
+
+@pytest.mark.parametrize("mechanism", ["paged", "unified", "unified_attention"])
+def test_unified_attention_configs_recommend_paged_cache(mechanism: str):
+    config = LlamaConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=16,
+        attn_mechanism=mechanism,
+    )
+    model = LlamaForCausalLM(config)
+    cache_info = model.get_operations_cache_info()
+
+    assert cache_info.prefill_operation == "unified_attention"
+    assert cache_info.supports_paged
+    assert not cache_info.supports_transformer_cache
+    assert cache_info.get_recommended_cache_type() == "paged"
 
 
 def _clone_cache(cache: PageCacheView) -> PageCacheView:
@@ -83,7 +157,6 @@ def test_attention_performer_paged_matches_manual_cache_update():
         use_metal=False,
     )
 
-    # Use unified __call__ with PageCacheView + PageMetadata
     cache_metadata = PageMetadata(query_start_loc=query_start_loc, slot_ids=(0, 1))
     actual = performer(
         queries,
@@ -170,7 +243,6 @@ def test_attention_modules_delegate_all_to_performer(
     attention = factory()
     head_dim = hidden_size // num_heads
 
-    # -- Dense path --
     calls: dict[str, object] = {}
 
     def fake_performer(queries, keys, values, **kwargs):
@@ -180,7 +252,7 @@ def test_attention_modules_delegate_all_to_performer(
         calls["cache_view"] = kwargs.get("cache_view")
         calls["cache_metadata"] = kwargs.get("cache_metadata")
         calls["rope"] = kwargs.get("rope")
-        # Return same shape as queries (performer contract)
+
         return mx.zeros_like(queries)
 
     monkeypatch.setattr(
@@ -190,16 +262,14 @@ def test_attention_modules_delegate_all_to_performer(
     )
     dense_out = attention(mx.zeros((1, 3, hidden_size), dtype=mx.float32), mask="causal")
 
-    # Model passes BTHD [B, L, H, D] to performer
     assert calls["queries_shape"] == (1, 3, num_heads, head_dim)
     assert calls["keys_shape"] == (1, 3, num_kv_heads, head_dim)
     assert calls["mask"] == "causal"
     assert calls["cache_view"] is None
     assert calls["cache_metadata"] is None
-    assert calls["rope"] is not None  # rope should always be passed
+    assert calls["rope"] is not None
     assert dense_out.shape == (1, 3, hidden_size)
 
-    # -- Paged path (3D input, single sequence) --
     calls.clear()
     paged_cache = PageCacheView.allocate(
         num_seqs=2,
@@ -217,14 +287,12 @@ def test_attention_modules_delegate_all_to_performer(
         cache_metadata=cache_metadata,
     )
 
-    # Model passes BTHD [1, 2, H, D] to performer — performer flattens internally
     assert calls["queries_shape"] == (1, 2, num_heads, head_dim)
     assert calls["keys_shape"] == (1, 2, num_kv_heads, head_dim)
     assert isinstance(calls["cache_view"], PageCacheView)
     assert isinstance(calls["cache_metadata"], PageMetadata)
     assert cache_out.shape == (1, 2, hidden_size)
 
-    # -- Paged path (multi-sequence, 3D input) --
     calls.clear()
     paged_cache2 = PageCacheView.allocate(
         num_seqs=2,

@@ -15,10 +15,9 @@
 """Tests for Jamba model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.jamba import JambaConfig, JambaForCausalLM, JambaModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -49,12 +48,8 @@ class TestJamba:
         )
 
     def test_registry(self):
-        base_registration = registry.get_module_registration(
-            TaskType.BASE_MODULE, "jamba"
-        )
-        lm_registration = registry.get_module_registration(
-            TaskType.CAUSAL_LM, "jamba"
-        )
+        base_registration = registry.get_module_registration(TaskType.BASE_MODULE, "jamba")
+        lm_registration = registry.get_module_registration(TaskType.CAUSAL_LM, "jamba")
 
         assert base_registration.module is JambaModel
         assert base_registration.config is JambaConfig
@@ -74,19 +69,17 @@ class TestJamba:
     def test_layer_types(self, jamba_config):
         """Verify layer type assignment matches config."""
         assert jamba_config.layers_block_type == [
-            "attention",  # layer 0: 0 % 2 == 0
-            "mamba",      # layer 1: 1 % 2 != 0
-            "attention",  # layer 2: 2 % 2 == 0
-            "mamba",      # layer 3: 3 % 2 != 0
+            "attention",
+            "mamba",
+            "attention",
+            "mamba",
         ]
 
     def test_sanitize(self, jamba_config):
-        import mlx.core as mx
 
         model = JambaForCausalLM(jamba_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
 
-        # Simulate upstream conv1d weight format
         upstream_weights = dict(local_weights)
         for k, v in upstream_weights.items():
             if "conv1d.weight" in k and v.ndim == 3:
@@ -95,6 +88,4 @@ class TestJamba:
         sanitized = model.sanitize(upstream_weights)
         for k, v in sanitized.items():
             if "conv1d.weight" in k and v.ndim == 3:
-                assert v.shape[-1] == 1, (
-                    f"conv1d weight {k} not transposed correctly"
-                )
+                assert v.shape[-1] == 1, f"conv1d weight {k} not transposed correctly"

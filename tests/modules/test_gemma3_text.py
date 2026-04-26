@@ -15,10 +15,9 @@
 """Tests for Gemma3Text model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.gemma3_text import Gemma3TextConfig, Gemma3TextForCausalLM, Gemma3TextModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

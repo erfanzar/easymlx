@@ -16,10 +16,9 @@
 
 from __future__ import annotations
 
+import easymlx
 import mlx.core as mx
 import pytest
-
-import easymlx
 from easymlx.modules.auto import AutoEasyMLXModel, AutoEasyMLXModelForCausalLM
 from easymlx.modules.cohere import CohereConfig, CohereForCausalLM, CohereModel
 from easymlx.modules.gemma import GemmaConfig, GemmaForCausalLM, GemmaModel
@@ -369,7 +368,7 @@ def test_top_level_exports_include_new_families():
     assert easymlx.SolarOpenForCausalLM is SolarOpenForCausalLM
     assert easymlx.Telechat3Config is Telechat3Config
     assert easymlx.Telechat3ForCausalLM is Telechat3ForCausalLM
-    # New families
+
     assert easymlx.GemmaConfig is GemmaConfig
     assert easymlx.GemmaForCausalLM is GemmaForCausalLM
     assert easymlx.Gemma2Config is Gemma2Config

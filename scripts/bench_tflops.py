@@ -25,11 +25,12 @@ from pathlib import Path
 
 from mlx import core as mx
 
-if str(Path(__file__).resolve().parents[1]) not in sys.path:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+python_src = Path(__file__).resolve().parents[1] / "lib" / "python"
+if str(python_src) not in sys.path:
+    sys.path.insert(0, str(python_src))
 
-import easymlx as ex
-from easymlx.infra.flops import (
+import easymlx as ex  # noqa: E402
+from easymlx.infra.flops import (  # noqa: E402
     _attention_flops,
     _attention_window_for_layer,
     _dense_intermediate_size,
@@ -59,6 +60,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling cutoff.")
     parser.add_argument("--top-k", type=int, default=20, help="Top-k sampling cutoff.")
+    parser.add_argument(
+        "--do-sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use stochastic sampling. Disable for greedy/speculative decode benchmarks.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for MLX sampling.")
     parser.add_argument(
         "--dtype",
@@ -79,17 +86,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--attn-mechanism",
-        default="paged",
+        default="unified",
         choices=("paged", "unified"),
         help="Attention/cache path to benchmark.",
     )
     parser.add_argument("--page-size", type=int, default=128, help="Paged KV page size.")
-    parser.add_argument("--max-model-len", type=int, default=8192, help="Maximum modeled context length.")
+    parser.add_argument("--max-model-len", type=int, default=4096, help="Maximum modeled context length.")
     parser.add_argument("--max-num-seqs", type=int, default=1, help="Maximum concurrent running sequences.")
     parser.add_argument(
         "--memory-utilization",
         type=float,
-        default=0.5,
+        default=0.45,
         help="Fraction of available memory the scheduler may reserve.",
     )
     parser.add_argument(
@@ -99,10 +106,35 @@ def _parse_args() -> argparse.Namespace:
         help="Whether to pass enable_thinking into the chat template.",
     )
     parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the streaming chat API. Disable to exercise eSurge blocking/speculative paths.",
+    )
+    parser.add_argument(
         "--runner-verbose",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable verbose eSurge runner logs.",
+    )
+    parser.add_argument(
+        "--compile-runner",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable eSurge runner compile/warmup.",
+    )
+    parser.add_argument("--speculative-model", default=None, help="Optional draft/EAGLE3 model for eSurge speculation.")
+    parser.add_argument("--num-speculative-tokens", type=int, default=0, help="Draft tokens proposed per round.")
+    parser.add_argument(
+        "--speculative-method",
+        default="draft",
+        choices=("draft", "dflash", "eagle3"),
+        help="Speculative decode method.",
+    )
+    parser.add_argument(
+        "--speculative-quantization",
+        default=None,
+        help="Optional quantization mode for a string-loaded speculative model.",
     )
     return parser.parse_args()
 
@@ -121,7 +153,7 @@ def _sampling_params(args: argparse.Namespace) -> ex.SamplingParams:
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
-        do_sample=True,
+        do_sample=bool(args.do_sample),
     )
 
 
@@ -131,7 +163,7 @@ def _warmup_sampling_params(args: argparse.Namespace) -> ex.SamplingParams:
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
-        do_sample=True,
+        do_sample=bool(args.do_sample),
     )
 
 
@@ -141,11 +173,22 @@ def _run_chat(
     prompt: str,
     sampling_params: ex.SamplingParams,
     enable_thinking: bool,
+    stream: bool,
 ) -> tuple[tp.Any, float, float | None, float]:
     messages = [{"role": "user", "content": prompt}]
     start = time.perf_counter()
     first_token_at = None
     final_output = None
+    if not stream:
+        final_output = engine.chat(
+            messages=messages,
+            sampling_params=sampling_params,
+            stream=False,
+            chat_template_kwargs={"enable_thinking": enable_thinking},
+        )
+        end = time.perf_counter()
+        return final_output, start, None, end
+
     for output in engine.chat(
         messages=messages,
         sampling_params=sampling_params,
@@ -359,6 +402,7 @@ def _build_result(
         "num_attention_heads": text_config.num_attention_heads,
         "num_key_value_heads": getattr(text_config, "num_key_value_heads", None),
         "full_attention_layers": full_attention_layers,
+        "metrics": output.metrics,
     }
 
 
@@ -369,6 +413,10 @@ def main() -> None:
     quantization = None
     if args.quantization is not None:
         quantization = ex.QuantizationConfig(mode=args.quantization)
+
+    speculative_model_kwargs: dict[str, tp.Any] = {}
+    if args.speculative_quantization is not None:
+        speculative_model_kwargs["quantization"] = ex.QuantizationConfig(mode=args.speculative_quantization)
 
     model = ex.AutoEasyMLXModelForCausalLM.from_pretrained(
         args.model,
@@ -388,6 +436,11 @@ def main() -> None:
         runner_verbose=args.runner_verbose,
         max_num_seqs=args.max_num_seqs,
         memory_utilization=args.memory_utilization,
+        compile_runner=bool(args.compile_runner),
+        speculative_model=args.speculative_model,
+        num_speculative_tokens=args.num_speculative_tokens,
+        speculative_method=args.speculative_method,
+        speculative_model_kwargs=speculative_model_kwargs,
     )
     text_config = model.config.text_config if hasattr(model.config, "text_config") else model.config
 
@@ -396,12 +449,14 @@ def main() -> None:
         prompt=args.prompt,
         sampling_params=_warmup_sampling_params(args),
         enable_thinking=args.enable_thinking,
+        stream=args.stream,
     )
     output, started_at, first_token_at, ended_at = _run_chat(
         engine,
         prompt=args.prompt,
         sampling_params=_sampling_params(args),
         enable_thinking=args.enable_thinking,
+        stream=args.stream,
     )
 
     result = _build_result(

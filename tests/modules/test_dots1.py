@@ -14,12 +14,10 @@
 
 """Tests for Dots1 model."""
 
-import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.dots1 import Dots1Config, Dots1ForCausalLM, Dots1Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -85,7 +83,6 @@ class TestDots1:
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
 
-        # Mimic upstream shard names for MoE layer (layer 1, since first_k_dense_replace=1)
         prefix = "model.layers.1"
         for dst in ["gate_proj", "down_proj", "up_proj"]:
             stacked_key = f"{prefix}.mlp.switch_mlp.{dst}.weight"

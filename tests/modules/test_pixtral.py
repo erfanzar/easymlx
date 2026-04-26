@@ -16,10 +16,9 @@
 
 import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.pixtral import PixtralConfig, PixtralForCausalLM, PixtralModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -88,8 +87,8 @@ class TestPixtral:
                 upstream_weights[key.replace("model.model.", "language_model.model.", 1)] = value
         upstream_weights.update(
             {
-            "vision_tower.blocks.0.weight": mx.ones((2, 2)),
-            "multi_modal_projector.weight": mx.ones((2, 2)),
+                "vision_tower.blocks.0.weight": mx.ones((2, 2)),
+                "multi_modal_projector.weight": mx.ones((2, 2)),
             }
         )
 

@@ -15,7 +15,6 @@
 """Tests for GLM-4 MoE model."""
 
 import pytest
-
 from easymlx.modules.glm4_moe import Glm4MoeConfig, Glm4MoeForCausalLM
 
 from .test_utils import CausalLMTester

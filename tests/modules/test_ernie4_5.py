@@ -15,10 +15,9 @@
 """Tests for ERNIE 4.5 dense model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.ernie4_5 import Ernie45Config, Ernie45ForCausalLM, Ernie45Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

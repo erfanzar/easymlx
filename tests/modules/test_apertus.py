@@ -15,10 +15,9 @@
 """Tests for Apertus model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.apertus import ApertusConfig, ApertusForCausalLM, ApertusModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

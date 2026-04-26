@@ -15,10 +15,9 @@
 """Tests for Gemma2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.gemma2 import Gemma2Config, Gemma2ForCausalLM, Gemma2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

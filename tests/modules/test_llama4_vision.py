@@ -15,7 +15,6 @@
 """Tests for Llama4 vision-language model."""
 
 import pytest
-
 from easymlx.modules.llama4 import Llama4Config, Llama4ForConditionalGeneration
 
 from .test_utils import CausalLMTester, VisionLanguageTester

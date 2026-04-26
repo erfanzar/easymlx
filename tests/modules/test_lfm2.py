@@ -15,10 +15,9 @@
 """Tests for LFM2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.lfm2 import Lfm2Config, Lfm2ForCausalLM, Lfm2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

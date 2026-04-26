@@ -17,12 +17,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from transformers import AutoConfig
 
-import easymlx.modules  # noqa: F401
-from easymlx.infra.factory import TaskType, registry
+python_src = Path(__file__).resolve().parents[1] / "lib" / "python"
+if str(python_src) not in sys.path:
+    sys.path.insert(0, str(python_src))
+
+from easymlx.infra.factory import TaskType, registry  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:

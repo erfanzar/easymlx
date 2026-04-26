@@ -14,13 +14,11 @@
 
 """Tests for MiniMax model."""
 
-import pytest
-
 import mlx.core as mx
-from mlx.utils import tree_flatten
-
+import pytest
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.minimax import MiniMaxConfig, MiniMaxForCausalLM, MiniMaxModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

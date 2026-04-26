@@ -1,4 +1,4 @@
-<!-- markdownlint-disable MD033 MD045 MD041 -->
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/erfanzar/easydel/main/images/easydel-logo-with-text.png" alt="EasyMLX Logo" width="300"/>
 </p>
@@ -15,7 +15,8 @@
   <a href="#supported-models">Models</a> &bull;
   <a href="#esurge-engine">eSurge</a> &bull;
   <a href="#quantization">Quantization</a> &bull;
-  <a href="#api-server">API Server</a>
+  <a href="#api-server">API Server</a> &bull;
+  <a href="#local-app">Local App</a>
 </p>
 
 ---
@@ -87,14 +88,12 @@ Quantize models at load time for faster inference and lower memory:
 ```python
 from mlx import core as mx
 
-# 4-bit affine quantization (works on all Apple Silicon)
 model = AutoEasyMLXModelForCausalLM.from_pretrained(
     "meta-llama/Llama-3.2-1B-Instruct",
     dtype=mx.float16,
-    quantization="affine",  # 4-bit, group_size=64
+    quantization="affine",
 )
 
-# Or with explicit config
 from easymlx import QuantizationConfig
 
 model = AutoEasyMLXModelForCausalLM.from_pretrained(
@@ -103,7 +102,6 @@ model = AutoEasyMLXModelForCausalLM.from_pretrained(
     quantization=QuantizationConfig(mode="affine", bits=4, group_size=64),
 )
 
-# Or with ordered regex rules
 from easymlx import LayerwiseQuantizationConfig, QuantizationRule
 
 model = AutoEasyMLXModelForCausalLM.from_pretrained(
@@ -148,16 +146,21 @@ eSurge is the high-performance inference engine, ported from EasyDeL. It provide
 engine = eSurge(
     model,
     tokenizer="meta-llama/Llama-3.2-1B-Instruct",
-    max_model_len=4096,          # Maximum sequence length
-    max_num_seqs=4,              # Maximum concurrent sequences
-    max_num_batched_tokens=2048, # Token budget per step
-    page_size=64,                # KV cache page size
-    memory_utilization=0.85,     # Fraction of GPU memory for KV cache
-    runner_verbose=True,         # Show warmup progress and step logs
-    tool_parser="llama3_json",   # Auto-detected if not set
-    reasoning_parser="auto",     # Auto-detected if not set
+    max_model_len=4096,
+    max_num_seqs=1,
+    max_num_batched_tokens=4096,
+    page_size=128,
+    hbm_utilization=0.45,
+    runner_verbose=True,
+    tool_parser="llama3_json",
+    reasoning_parser="auto",
+    # speculative_model=draft_model,  # optional smaller same-tokenizer model
+    # speculative_method="draft",      # or "eagle3" with an EAGLE3 adapter
+    # num_speculative_tokens=4,
 )
 ```
+
+`speculative_model` can be a loaded draft model, model id/path, or an EAGLE3 adapter when `speculative_method="eagle3"`. Speculative decoding is used for verified greedy single-prompt generation (`do_sample=False`); unsupported request shapes fall back to the normal eSurge scheduler. EAGLE3 adapters must expose a proposal method such as `propose_eagle3(...)` or `propose(...)`, and the target model must expose hidden-state features via `eagle3_hidden_states(...)` or `output_hidden_states=True`.
 
 ### Tool Calling
 
@@ -182,7 +185,6 @@ output = engine.chat(
     sampling_params=SamplingParams(max_tokens=256),
     tools=tools,
 )
-# output.tool_calls contains parsed tool invocations
 ```
 
 ## API Server
@@ -207,6 +209,33 @@ curl http://localhost:8000/v1/chat/completions \
     "max_tokens": 64
   }'
 ```
+
+## Local App
+
+Run it as a desktop app from the TypeScript workspace:
+
+```bash
+cd lib/typescript/easymlx-app
+bun install
+bun run app
+```
+
+The desktop app starts the Python backend on `http://127.0.0.1:8719` and opens the EasyMLX UI in an Electron window. Set `EASYMLX_DESKTOP_PORT=9000` if you want a different backend port.
+
+Run the EasyMLX control app with one command:
+
+```bash
+easymlx app --dev
+```
+
+From a source checkout without installing the package first:
+
+```bash
+PYTHONPATH=lib/python python -m easymlx.cli app --dev
+```
+
+This starts the Python backend on `http://127.0.0.1:8000` and the Bun/Vite frontend on `http://127.0.0.1:5173`. The frontend proxies `/app/api`, `/v1`, `/health`, and `/metrics` to the backend.
+Per-request access logs are off by default for the app; add `--access-log` when you want to inspect every HTTP request.
 
 ## Supported Models
 
@@ -246,28 +275,20 @@ curl http://localhost:8000/v1/chat/completions \
 EasyMLX mirrors EasyDeL's architecture, adapted for MLX:
 
 ```md
-easymlx/
-├── caching/           # KV cache implementations
-│   ├── paged/         #   PageCacheView, PageCacheView, PageMetadata
-│   ├── transformer/   #   TransformerCache (dense attention)
-│   ├── recurrent/     #   RecurrentCache (Mamba/SSM)
-│   └── hybrid/        #   HybridCache (mixed attention + SSM)
-├── inference/
-│   └── esurge/        # eSurge inference engine
-│       ├── engine.py          # Core engine with paged runtime
-│       ├── runners/           # Model runner, execution manager
-│       ├── scheduler/         # Continuous batching scheduler
-│       ├── server/            # OpenAI-compatible API server
-│       ├── mixins/            # Chat, lifecycle, monitoring mixins
-│       └── distributed/       # Multi-worker support
-├── infra/             # Base config, module, factory, bridge
-├── layers/            # Attention, RoPE, MoE, embeddings, linears
-├── modules/           # Model implementations
-│   ├── _base/         #   Task-specific base classes (CausalLM, VLM, etc.)
-│   ├── auto/          #   Auto classes (from_pretrained)
-│   └── <model>/       #   Per-model config + modeling
-├── operations/        # Attention kernels (SDPA, paged, vanilla)
-└── workers/           # Server auth, logging, response store
+lib/
+├── python/
+│   └── easymlx/
+│       ├── app/               # Local FastAPI app and built web assets
+│       ├── caching/           # KV cache implementations
+│       ├── inference/
+│       │   └── esurge/        # eSurge inference engine and API server
+│       ├── infra/             # Base config, module, factory, bridge
+│       ├── layers/            # Attention, RoPE, MoE, embeddings, linears
+│       ├── modules/           # Model implementations
+│       ├── operations/        # Attention kernels (SDPA, paged, vanilla)
+│       └── workers/           # Server auth, logging, response store
+└── typescript/
+    └── easymlx-app/           # Bun + React + TypeScript + Electron app
 ```
 
 ### Key Differences from EasyDeL

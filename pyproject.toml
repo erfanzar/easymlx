@@ -11,6 +11,7 @@ dependencies = [
     "partial-json-parser>=0.2.1.1.post7",
     "pydantic>=2.12.5",
     "transformers>=5.3.0",
+    "uvicorn>=0.30.0",
 ]
 
 
@@ -18,18 +19,23 @@ dependencies = [
 server = ["fastapi>=0.100.0"]
 tests = ["fastapi>=0.100.0"]
 
+[project.scripts]
+easymlx = "easymlx.cli:main"
+easymlx-app = "easymlx.app.cli:main"
+
 [tool.uv.build-backend]
 module-name = "easymlx"
-module-root = "."
+module-root = "lib/python"
 
 [tool.setuptools]
-package-dir = { "" = "." }
+package-dir = { "" = "lib/python" }
 
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["lib/python"]
 
 [tool.setuptools.package-data]
 "easymlx" = ["py.typed"]
+"easymlx.app" = ["static/*", "static/assets/*"]
 
 
 [tool.black]
@@ -43,16 +49,9 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["A", "B", "E", "F", "I", "NPY", "RUF", "UP", "W"]
-ignore = [
-    "F722",   # Forward annotations needed for jaxtyping
-    "B008",   # Do not perform function calls in argument defaults
-    "UP015",  # Unnecessary open mode
-    "A005",   # Module-level shadowing
-    "UP037",  # Remove quotes from type annotation - needed for jaxtyping string literals
-    "E501",   # Line too long (handled by formatter)
-    "RUF001", # Ruff's own complexity check - handled by other tools
-    "RUF002", # Ruff's own complexity check - handled by other tools
-]
+
+ignore = ["F722", "B008", "UP015", "A005", "UP037", "E501", "RUF001", "RUF002"]
+
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["E402", "F401"]
@@ -61,7 +60,7 @@ ignore = [
 [tool.mypy]
 python_version = "3.13"
 ignore_missing_imports = true
-exclude = ["easymlx/"]
+exclude = ["lib/python/easymlx/"]
 
 [tool.basedpyright]
 reportAssignmentType = "none"
@@ -102,4 +101,5 @@ reportUnusedParameter = "none"
 [tool.pytest.ini_options]
 markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
 testpaths = ["tests"]
+pythonpath = ["lib/python"]
 filterwarnings = ["ignore::DeprecationWarning"]

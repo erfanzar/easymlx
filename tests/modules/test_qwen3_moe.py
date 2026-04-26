@@ -15,7 +15,6 @@
 """Tests for Qwen3 MoE model."""
 
 import pytest
-
 from easymlx.modules.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 from .test_utils import CausalLMTester

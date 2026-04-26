@@ -15,10 +15,9 @@
 """Tests for Starcoder2 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.starcoder2 import Starcoder2Config, Starcoder2ForCausalLM, Starcoder2Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

@@ -16,7 +16,6 @@
 
 import mlx.core as mx
 import pytest
-
 from easymlx.modules.glm4v import Glm4VConfig, Glm4VForConditionalGeneration
 
 from .test_utils import CausalLMTester

@@ -17,7 +17,6 @@ import math
 import mlx.core as mx
 import numpy as np
 import pytest
-
 from easymlx.caching import PageCacheView, PageMetadata, build_query_start_loc
 from easymlx.caching.paged import turboquant as turboquant_module
 from easymlx.caching.paged.turboquant import get_turboquant_params
@@ -70,7 +69,11 @@ def test_turboquant_page_cache_uses_packed_storage():
         np.asarray(cache.key_cache).size * 32
         + np.asarray(cache.value_cache).size * 32
         + np.asarray(cache.key_qjl_signs).size * 32
-        + (np.asarray(cache.key_norms).size + np.asarray(cache.key_residual_norms).size + np.asarray(cache.value_norms).size)
+        + (
+            np.asarray(cache.key_norms).size
+            + np.asarray(cache.key_residual_norms).size
+            + np.asarray(cache.value_norms).size
+        )
         * 16
     )
     fp16_bits = num_seqs * math.ceil(max_seq_len / block_size) * block_size * num_kv_heads * head_dim * 2 * 16

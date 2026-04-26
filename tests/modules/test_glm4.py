@@ -15,7 +15,6 @@
 """Tests for GLM-4 model."""
 
 import pytest
-
 from easymlx.modules.glm4 import Glm4Config, Glm4ForCausalLM
 
 from .test_utils import CausalLMTester

@@ -15,10 +15,9 @@
 """Tests for Exaone4 model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.exaone4 import Exaone4Config, Exaone4ForCausalLM, Exaone4Model
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

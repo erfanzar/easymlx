@@ -15,10 +15,9 @@
 """Tests for LFM2-MoE model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.lfm2_moe import Lfm2MoeConfig, Lfm2MoeForCausalLM, Lfm2MoeModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 

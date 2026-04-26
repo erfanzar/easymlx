@@ -15,10 +15,9 @@
 """Tests for MiMo model."""
 
 import pytest
-from mlx.utils import tree_flatten
-
 from easymlx.infra.factory import TaskType, registry
 from easymlx.modules.mimo import MiMoConfig, MiMoForCausalLM, MiMoModel
+from mlx.utils import tree_flatten
 
 from .test_utils import CausalLMTester
 
@@ -73,9 +72,7 @@ class TestMiMo:
         model = MiMoForCausalLM(mimo_config)
         local_weights = dict(tree_flatten(model.parameters(), destination={}))
         upstream_weights = dict(local_weights)
-        upstream_weights["model.layers.0.self_attn.rotary_emb.inv_freq"] = local_weights[
-            "model.embed_tokens.weight"
-        ]
+        upstream_weights["model.layers.0.self_attn.rotary_emb.inv_freq"] = local_weights["model.embed_tokens.weight"]
         upstream_weights["model.mtp_layers.0.weight"] = local_weights["model.embed_tokens.weight"]
 
         sanitized = model.sanitize(upstream_weights)
